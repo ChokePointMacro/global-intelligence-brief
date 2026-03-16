@@ -27,17 +27,28 @@ export async function generateWeeklyReport(type: string = 'global'): Promise<Wee
   let topicFocus = "Global macro shifts, geopolitical events, and major economic trends";
   let reportTitle = "Global Pulse";
   let isConspiracyReport = false;
+  let timeframe = "last 90 days";
+  let timeframeDescriptor = "from the last 90 days";
 
   if (type === 'crypto') {
     topicFocus = "Cryptocurrency industry ONLY. Focus on Bitcoin, Ethereum, Altcoins, DeFi, Blockchain technology, Crypto regulation, and significant Web3 industry events. Omit non-crypto news.";
     reportTitle = "Crypto Industry Pulse";
+    timeframe = "last 7 days";
+    timeframeDescriptor = "from the last 7 days";
   } else if (type === 'equities') {
     topicFocus = "S&P 500 Equities ONLY. Focus on the top 500 US stocks, significant news, headlines, and price movements for companies within the S&P 500. Omit all other macro news, geopolitics, or non-S&P 500 stocks.";
     reportTitle = "S&P 500 Momentum Report";
+    timeframe = "last 7 days";
+    timeframeDescriptor = "from the last 7 days";
   } else if (type === 'conspiracies') {
-    topicFocus = "Trending topics, viral claims, and widespread discussions from X (Twitter), TikTok, Facebook, and Google that have been reported but have LOW VERIFICATION STATUS. Focus ONLY on topics with below 50% confidence levels - claims that are heavily discussed but highly questionable.";
+    topicFocus = "Trending topics, viral claims, and widespread discussions from X (Twitter), TikTok, Facebook, and Google that have been reported but have LOW VERIFICATION STATUS. Focus ONLY on topics with below 50% confidence levels - claims that are heavily discussed but highly questionable. Include historical context from the last 20 years, but prioritize recent developments from the last 30 days.";
     reportTitle = "The Conspiracy Pulse";
     isConspiracyReport = true;
+    timeframe = "last 30 days (with 20-year historical context)";
+    timeframeDescriptor = "from the last 30 days";
+  } else {
+    timeframe = "last 3 days";
+    timeframeDescriptor = "from the last 3 days";
   }
 
   const currentDate = new Date().toLocaleDateString('en-US', { 
@@ -48,15 +59,27 @@ export async function generateWeeklyReport(type: string = 'global'): Promise<Wee
   });
 
   const conspiracyPromptAddition = isConspiracyReport ? `
-    CONSPIRACY REPORT: Focus on trending topics with LOW credibility from the last 7 days.
+    CONSPIRACY REPORT: Focus on trending topics with LOW credibility from the last 30 days.
+    Include historical context from the last 20 years to show patterns and recurring themes.
     ` : '';
 
-  const prompt = `You are a factual intelligence analyst. Today is ${currentDate}. STRICT NEUTRALITY - Report only verified facts from major news sources (Reuters, AP, Bloomberg, BBC, etc). No speculation, opinion, or political bias.
+  const prompt = `You are a factual intelligence analyst. Today is ${currentDate}. STRICT NEUTRALITY - Report only verified facts from major news sources (Reuters, AP, Bloomberg, BBC, CNN, Al Jazeera, etc). No speculation, opinion, or political bias.
 
-TASK: Generate exactly 20 headlines of MAJOR REAL GEOPOLITICAL CONFLICTS AND STRATEGIC TENSIONS from the last 90 days, prioritizing ongoing critical issues:
+TASK: Generate exactly 20 headlines of MAJOR news events and strategic developments ${timeframeDescriptor}, prioritizing critical issues:
 ${topicFocus}
 
-FOCUS ON: Real conflicts, military tensions, strategic developments, diplomatic crises that are documented by major international news outlets. Trending topics are those that are REAL and significant to international stability.
+${type === 'global' ? `CRITICAL: For global geopolitics, MUST INCLUDE coverage of:
+- Iran-Israel tensions and military developments
+- Ukraine-Russia conflict
+- Taiwan-China strategic tensions
+- Middle East conflicts
+- Other major geopolitical crises
+
+RECENCY CRITICAL: Focus on developments from the LAST 3 DAYS. Only include breaking news and recent escalations, not older developments.` : ''}
+
+${type === 'conspiracies' ? `HISTORICAL CONTEXT: Include patterns that have been ongoing for years or decades, but prioritize what's trending RIGHT NOW in the last 30 days.` : ''}
+
+FOCUS ON: Real events, developments, and trends that are documented by major sources. For ${type}, prioritize ${timeframe}.
 
 ${conspiracyPromptAddition}
 
@@ -71,11 +94,13 @@ Then create analysis section with:
 - performanceRanking: 3-5 critical developments by strategic importance (250+ words)
 - verificationScore: 1-100 (major news source confirmation)
 - integrityScore: 1-100 (situation stability)
-- overallSummary: 350+ words factual assessment of global tensions
+- overallSummary: 350+ words factual assessment of trends
 - globalSocialPost: 280 character summary
 
-STRICT RULE: No summary under 280 words. Expand details, add context, and explain implications. Summaries must be comprehensive and substantive.
-Return ONLY valid JSON. No markdown, no code blocks.`;
+STRICT RULES: 
+1. No summary under 280 words. Expand details, add context, and explain implications. Summaries must be comprehensive and substantive.
+2. Every headline MUST have a full, substantive summary - NEVER skip summaries.
+3. Return ONLY valid JSON. No markdown, no code blocks.`;
 
   try {
     console.log(`[generateWeeklyReport] Generating ${type} report...`);
@@ -94,10 +119,35 @@ Return ONLY valid JSON. No markdown, no code blocks.`;
       throw new Error("No analysis in response");
     }
 
+    // Validate all headlines have proper summaries
+    function countWords(text: string): number {
+      return text.trim().split(/\s+/).filter(w => w.length > 0).length;
+    }
+
+    const invalidHeadlines: string[] = [];
+    for (let i = 0; i < parsed.headlines.length; i++) {
+      const headline = parsed.headlines[i];
+      const summaryWords = countWords(headline.summary || "");
+      
+      if (!headline.summary || summaryWords < 280) {
+        invalidHeadlines.push(`Headline ${i + 1} "${headline.title}": ${summaryWords} words (needs ≥280)`);
+        console.warn(`[generateWeeklyReport] ⚠️  Short summary for headline ${i + 1}: "${headline.title}" - only ${summaryWords} words`);
+      }
+    }
+    
+    if (invalidHeadlines.length > 0) {
+      const issues = invalidHeadlines.join("\n");
+      console.error(`[generateWeeklyReport] ⚠️  Found ${invalidHeadlines.length} headlines with incomplete summaries:\n${issues}`);
+      throw new Error(`Quality check failed: ${invalidHeadlines.length} headlines have incomplete summaries. AI returned insufficient detail. Please regenerate.`);
+    }
+
     console.log(`[generateWeeklyReport] ✓ Successfully generated ${parsed.headlines.length} headlines for ${reportTitle}`);
     return parsed;
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
+    console.error(`[generateWeeklyReport] ✗ Failed to generate ${reportTitle}:`, errorMsg);
+    throw new Error(`Failed to generate report: ${errorMsg}`);
+  }
     console.error(`[generateWeeklyReport] ✗ Failed to generate ${reportTitle}:`, errorMsg);
     throw new Error(`Failed to generate report: ${errorMsg}`);
   }
