@@ -378,13 +378,29 @@ app.post("/api/reports", (req, res) => {
 });
 
 app.delete("/api/reports", (req, res) => {
-  db.prepare("DELETE FROM reports").run();
-  res.json({ success: true });
+  try {
+    console.log("Clearing all reports...");
+    db.prepare("DELETE FROM reports").run();
+    console.log("Reports cleared successfully");
+    res.json({ success: true });
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    console.error("Error clearing reports:", errorMsg);
+    res.status(500).json({ error: errorMsg });
+  }
 });
 
 app.delete("/api/reports/:id", (req, res) => {
-  db.prepare("DELETE FROM reports WHERE id = ?").run(req.params.id);
-  res.json({ success: true });
+  try {
+    console.log("Deleting report:", req.params.id);
+    db.prepare("DELETE FROM reports WHERE id = ?").run(req.params.id);
+    console.log("Report deleted successfully");
+    res.json({ success: true });
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    console.error("Error deleting report:", errorMsg);
+    res.status(500).json({ error: errorMsg });
+  }
 });
 
 // Helper to refresh X access token

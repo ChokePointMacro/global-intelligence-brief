@@ -334,13 +334,28 @@ const Dashboard = ({ user }: { user: UserData | null }) => {
     if (!confirm("Are you sure you want to delete all reports in the archive?")) return;
     try {
       const res = await apiFetch('/api/reports', { method: 'DELETE' });
+      console.log("Clear archive response:", res.status, res.statusText);
+      
       if (res.ok) {
         setReports([]);
         setActiveReportId(null);
         alert("Archive cleared successfully!");
       } else {
-        const error = await res.json();
-        alert(`Error clearing archive: ${error.error || 'Unknown error'}`);
+        // Try to parse error as JSON, fall back to text if not JSON
+        let errorMsg = `Server error: ${res.status}`;
+        try {
+          const contentType = res.headers.get('content-type');
+          if (contentType && contentType.includes('application/json')) {
+            const error = await res.json();
+            errorMsg = error.error || error.message || errorMsg;
+          } else {
+            const text = await res.text();
+            errorMsg = text || errorMsg;
+          }
+        } catch (parseErr) {
+          console.error("Error parsing response:", parseErr);
+        }
+        alert(`Error clearing archive: ${errorMsg}`);
       }
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
