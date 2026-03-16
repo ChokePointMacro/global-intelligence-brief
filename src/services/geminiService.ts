@@ -8,6 +8,8 @@ export interface Headline {
   socialPost: string;
   confidence?: number;
   trendScore?: number;
+  insufficientDetail?: boolean;
+  wordCount?: number;
 }
 
 export interface Analysis {
@@ -124,24 +126,36 @@ STRICT RULES:
       return text.trim().split(/\s+/).filter(w => w.length > 0).length;
     }
 
-    const invalidHeadlines: string[] = [];
+    const insufficientDetailHeadlines: any[] = [];
     let hasInsufficientDetail = false;
     for (let i = 0; i < parsed.headlines.length; i++) {
       const headline = parsed.headlines[i];
       const summaryWords = countWords(headline.summary || "");
       
+      // Mark headlines with insufficient detail
       if (!headline.summary || summaryWords < 280) {
-        invalidHeadlines.push(`Headline ${i + 1} "${headline.title}": ${summaryWords} words`);
+        headline.insufficientDetail = true;
+        headline.wordCount = summaryWords;
+        insufficientDetailHeadlines.push({
+          index: i + 1,
+          title: headline.title,
+          wordCount: summaryWords,
+          category: headline.category
+        });
         console.warn(`[generateWeeklyReport] ⚠️  Short summary for headline ${i + 1}: "${headline.title}" - only ${summaryWords} words`);
         hasInsufficientDetail = true;
+      } else {
+        headline.insufficientDetail = false;
+        headline.wordCount = summaryWords;
       }
     }
     
     if (hasInsufficientDetail) {
-      const issues = invalidHeadlines.join("\n");
-      console.warn(`[generateWeeklyReport] ⚠️  Found ${invalidHeadlines.length} headlines with insufficient detail:\n${issues}`);
-      // Add disclaimer to the analysis
+      console.warn(`[generateWeeklyReport] ⚠️  Found ${insufficientDetailHeadlines.length} headlines with insufficient detail`);
+      // Add disclaimer and error report to the analysis
       parsed.analysis.overallSummary += "\n\n⚠️ **DISCLAIMER**: Some headlines in this report contain insufficient context. For complete analysis, refer to the detailed summaries or original sources.";
+      // Store the error parameters for refinement
+      parsed.analysis.globalSocialPost += ` [${insufficientDetailHeadlines.length} headlines need more context]`;
     }
 
     console.log(`[generateWeeklyReport] ✓ Successfully generated ${parsed.headlines.length} headlines for ${reportTitle}`);

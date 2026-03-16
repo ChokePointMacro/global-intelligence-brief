@@ -757,7 +757,12 @@ const Dashboard = ({ user }: { user: UserData | null }) => {
                       </div>
                       <div className="space-y-1.5">
                         <div className="flex items-center justify-between gap-1">
-                          <span className="text-[9px] font-mono uppercase tracking-widest px-2 py-1 bg-btc-orange/10 text-btc-orange border border-btc-orange/20 rounded-sm whitespace-nowrap">{h.category}</span>
+                          <div className="flex items-center gap-1">
+                            <span className="text-[9px] font-mono uppercase tracking-widest px-2 py-1 bg-btc-orange/10 text-btc-orange border border-btc-orange/20 rounded-sm whitespace-nowrap">{h.category}</span>
+                            {h.insufficientDetail && (
+                              <span className="text-[8px] font-mono uppercase tracking-widest px-2 py-1 bg-yellow-500/10 text-yellow-400 border border-yellow-500/20 rounded-sm whitespace-nowrap">⚠️ Limited</span>
+                            )}
+                          </div>
                           <a href={h.url} target="_blank" rel="noopener noreferrer" className="text-btc-orange opacity-40 hover:opacity-100 transition-opacity p-1.5 hover:bg-btc-orange/5 rounded-sm flex-shrink-0">
                             <ExternalLink size={14} />
                           </a>
@@ -765,6 +770,9 @@ const Dashboard = ({ user }: { user: UserData | null }) => {
                         <h4 className="text-sm font-serif font-medium leading-tight group-hover:italic transition-all text-white">{h.title}</h4>
                         <div className="prose prose-invert prose-sm max-w-none font-sans leading-tight text-gray-300">
                           <p className="text-[11px] leading-snug">{h.summary}</p>
+                          {h.insufficientDetail && h.wordCount && (
+                            <p className="text-[10px] text-yellow-600 mt-1">📌 Note: {h.wordCount} words of context available</p>
+                          )}
                         </div>
                       </div>
 
