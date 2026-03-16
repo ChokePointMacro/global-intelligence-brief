@@ -332,10 +332,20 @@ const Dashboard = ({ user }: { user: UserData | null }) => {
 
   const clearArchive = async () => {
     if (!confirm("Are you sure you want to delete all reports in the archive?")) return;
-    const res = await apiFetch('/api/reports', { method: 'DELETE' });
-    if (res.ok) {
-      setReports([]);
-      setActiveReportId(null);
+    try {
+      const res = await apiFetch('/api/reports', { method: 'DELETE' });
+      if (res.ok) {
+        setReports([]);
+        setActiveReportId(null);
+        alert("Archive cleared successfully!");
+      } else {
+        const error = await res.json();
+        alert(`Error clearing archive: ${error.error || 'Unknown error'}`);
+      }
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      console.error("Archive clear failed:", err);
+      alert(`Failed to clear archive: ${errorMsg}`);
     }
   };
 
