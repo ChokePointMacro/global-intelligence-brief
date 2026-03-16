@@ -864,24 +864,23 @@ const Dashboard = ({ user }: { user: UserData | null }) => {
                           </div>
 
                           {/* Main Content - 20 Headlines Grid */}
-                          <div className="flex-1 py-12">
-                            <div className="flex items-center gap-4 mb-10">
-                              <p className="text-sm font-mono uppercase tracking-[0.5em]" style={{ color: 'rgba(247, 147, 26, 0.5)' }}>20 Critical Insight Nodes</p>
+                          <div className="flex-1 py-6">
+                            <div className="flex items-center gap-4 mb-6">
+                              <p className="text-base font-mono uppercase tracking-[0.5em]" style={{ color: 'rgba(247, 147, 26, 0.5)' }}>20 Critical Insight Nodes</p>
                               <div className="flex-1 h-px" style={{ backgroundColor: 'rgba(247, 147, 26, 0.1)' }} />
                             </div>
                             
-                            <div className="grid grid-cols-2 gap-x-16 gap-y-10">
+                            <div className="grid grid-cols-2 gap-x-8 gap-y-4">
                               {activeReport.headlines.map((h, idx) => (
                                 <div key={idx} className="relative">
-                                  <div className="flex gap-4 items-start">
-                                    <span className="text-sm font-mono font-bold pt-1" style={{ color: '#f7931a' }}>
+                                  <div className="flex gap-3 items-start">
+                                    <span className="text-lg font-mono font-bold pt-0.5" style={{ color: '#f7931a' }}>
                                       {(idx + 1).toString().padStart(2, '0')}
                                     </span>
-                                    <div className="flex-1 space-y-2">
-                                      <p className="text-[14px] font-sans font-medium leading-[1.6] block" style={{ color: '#f3f4f6' }}>
-                                        {h.title.length > 150 ? h.title.substring(0, 150) + '...' : h.title}
+                                    <div className="flex-1">
+                                      <p className="text-[16px] font-sans font-semibold leading-tight block" style={{ color: '#f3f4f6' }}>
+                                        {h.title.length > 100 ? h.title.substring(0, 100) + '...' : h.title}
                                       </p>
-                                      <div className="w-6 h-px opacity-20" style={{ backgroundColor: '#f7931a' }} />
                                     </div>
                                   </div>
                                 </div>
