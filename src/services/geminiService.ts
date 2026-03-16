@@ -148,9 +148,6 @@ STRICT RULES:
     console.error(`[generateWeeklyReport] ✗ Failed to generate ${reportTitle}:`, errorMsg);
     throw new Error(`Failed to generate report: ${errorMsg}`);
   }
-    console.error(`[generateWeeklyReport] ✗ Failed to generate ${reportTitle}:`, errorMsg);
-    throw new Error(`Failed to generate report: ${errorMsg}`);
-  }
 }
 
 export async function generateInstagramCaption(report: WeeklyReport): Promise<string> {
