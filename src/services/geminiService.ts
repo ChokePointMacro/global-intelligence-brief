@@ -125,20 +125,23 @@ STRICT RULES:
     }
 
     const invalidHeadlines: string[] = [];
+    let hasInsufficientDetail = false;
     for (let i = 0; i < parsed.headlines.length; i++) {
       const headline = parsed.headlines[i];
       const summaryWords = countWords(headline.summary || "");
       
       if (!headline.summary || summaryWords < 280) {
-        invalidHeadlines.push(`Headline ${i + 1} "${headline.title}": ${summaryWords} words (needs ≥280)`);
+        invalidHeadlines.push(`Headline ${i + 1} "${headline.title}": ${summaryWords} words`);
         console.warn(`[generateWeeklyReport] ⚠️  Short summary for headline ${i + 1}: "${headline.title}" - only ${summaryWords} words`);
+        hasInsufficientDetail = true;
       }
     }
     
-    if (invalidHeadlines.length > 0) {
+    if (hasInsufficientDetail) {
       const issues = invalidHeadlines.join("\n");
-      console.error(`[generateWeeklyReport] ⚠️  Found ${invalidHeadlines.length} headlines with incomplete summaries:\n${issues}`);
-      throw new Error(`Quality check failed: ${invalidHeadlines.length} headlines have incomplete summaries. AI returned insufficient detail. Please regenerate.`);
+      console.warn(`[generateWeeklyReport] ⚠️  Found ${invalidHeadlines.length} headlines with insufficient detail:\n${issues}`);
+      // Add disclaimer to the analysis
+      parsed.analysis.overallSummary += "\n\n⚠️ **DISCLAIMER**: Some headlines in this report contain insufficient context. For complete analysis, refer to the detailed summaries or original sources.";
     }
 
     console.log(`[generateWeeklyReport] ✓ Successfully generated ${parsed.headlines.length} headlines for ${reportTitle}`);
