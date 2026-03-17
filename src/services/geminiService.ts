@@ -1,4 +1,8 @@
-import { generateReportWithFallback, parseJSONResponse, type AIResponse } from "./aiService";
+import { generateReportWithFallback, parseJSONResponse } from "./aiService";
+import Anthropic from "@anthropic-ai/sdk";
+import OpenAI from "openai";
+
+// ── Interfaces ────────────────────────────────────────────────────────────────
 
 export interface Headline {
   title: string;
@@ -55,9 +59,122 @@ export interface ForecastReport {
   analysis: ForecastAnalysis;
 }
 
+// ── Constants & shared helpers ────────────────────────────────────────────────
+
+const INSTAGRAM_MAX_CHARS = 2100;
+
+function formatCurrentDate(): string {
+  return new Date().toLocaleDateString('en-US', {
+    weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+  });
+}
+
+function truncateToInstagram(text: string): string {
+  return text.length > INSTAGRAM_MAX_CHARS
+    ? text.slice(0, INSTAGRAM_MAX_CHARS - 3) + "..."
+    : text;
+}
+
+// ── Report type configuration ─────────────────────────────────────────────────
+
+interface ReportConfig {
+  topicFocus: string;
+  reportTitle: string;
+  timeframe: string;
+  timeframeDescriptor: string;
+  sentimentVocab: string;
+  maxTokens: number;
+  isConspiracy?: boolean;
+}
+
+const REPORT_CONFIGS: Record<string, ReportConfig> = {
+  global: {
+    topicFocus: "Global macro shifts, geopolitical events, and major economic trends",
+    reportTitle: "Global Pulse",
+    timeframe: "last 7 days",
+    timeframeDescriptor: "from the last 7 days",
+    sentimentVocab: "escalating | stable | de-escalating",
+    maxTokens: 8000,
+  },
+  crypto: {
+    topicFocus: "Cryptocurrency industry ONLY. Focus on Bitcoin, Ethereum, Altcoins, DeFi, Blockchain technology, NFTs, GameFi, Crypto regulation, exchange developments, and significant Web3 industry events. Omit non-crypto news.",
+    reportTitle: "Crypto Industry Pulse",
+    timeframe: "last 7 days",
+    timeframeDescriptor: "from the last 7 days",
+    sentimentVocab: "bullish | bearish | neutral",
+    maxTokens: 8000,
+  },
+  equities: {
+    topicFocus: "S&P 500 Equities ONLY. Focus on the top 500 US stocks, significant news, earnings results, and price movements for companies within the S&P 500. Omit all other macro news, geopolitics, or non-S&P 500 stocks.",
+    reportTitle: "S&P 500 Momentum Report",
+    timeframe: "last 7 days",
+    timeframeDescriptor: "from the last 7 days",
+    sentimentVocab: "bullish | bearish | neutral",
+    maxTokens: 8000,
+  },
+  nasdaq: {
+    topicFocus: "Nasdaq-100 tech and growth stocks ONLY. Focus on AAPL, NVDA, MSFT, META, AMZN, GOOGL, TSLA and other Nasdaq-100 constituents. Emphasise: AI/product announcements, earnings beats/misses, analyst upgrades/downgrades, rate-sensitive growth stock moves, and sector-wide tech themes. Omit S&P 500 non-tech names and macro news unless it directly moves Nasdaq prices.",
+    reportTitle: "Nasdaq-100 Tech Pulse",
+    timeframe: "last 7 days",
+    timeframeDescriptor: "from the last 7 days",
+    sentimentVocab: "bullish | bearish | neutral",
+    maxTokens: 8000,
+  },
+  conspiracies: {
+    topicFocus: "Widely viral, unverified or actively contested claims circulating on X (Twitter), TikTok, Facebook, Reddit, and Google. Focus on topics that are heavily discussed in mainstream social media but lack confirmation from established news sources — stories that are disputed, fact-checked as false, or still under investigation. Include historical context from the last 20 years where relevant, but prioritize what is trending in the last 30 days.",
+    reportTitle: "The Conspiracy Pulse",
+    timeframe: "last 30 days (with 20-year historical context)",
+    timeframeDescriptor: "from the last 30 days",
+    sentimentVocab: "viral | fading | debunked",
+    maxTokens: 12000,
+    isConspiracy: true,
+  },
+  china: {
+    topicFocus: `Chinese influence, control, and leverage points in global supply chains — focusing on hidden dependencies that most market participants underestimate. Coverage must span: (1) Critical Minerals & Rare Earths — gallium, germanium, graphite, cobalt, NdFeB magnets and export control developments; (2) Agricultural Inputs — phosphate, fertilizer, potash supply chokepoints; (3) Pharmaceuticals — API/active pharmaceutical ingredient dependencies, heparin, generic drug supply; (4) Semiconductors & Electronics — PCB manufacturing, advanced packaging, ZPMC port cranes; (5) EV & Battery — CATL, LFP chemistry, graphite anode, lithium refining; (6) Maritime & Shipping — Chinese shipbuilding dominance, COSCO fleet movements, port infrastructure; (7) Military & Dual-Use — PLA modernization, Volt Typhoon/Salt Typhoon infrastructure access, technology transfer; (8) Trade Policy — US-China tariff escalation (Trump 2.0 145%), decoupling vs engagement debate, friend-shoring progress; (9) Foreign Investment — BRI project updates, Chinese FDI into critical resource nations, Western divestment pressures; (10) Risk Events — Taiwan strait tensions, export ban escalation, sanctions, commodity market manipulation. Emphasise non-obvious, high-consequence dependencies that cascade across industries if disrupted. Include investment and risk implications for each item.`,
+    reportTitle: "China Supply Chain Intelligence",
+    timeframe: "last 90 days with 30-day forward outlook",
+    timeframeDescriptor: "from the last 90 days, with forward-looking risk and opportunity analysis for the next 30 days",
+    sentimentVocab: "critical | escalating | opportunity | bullish | bearish | risk-off | stable | de-escalating",
+    maxTokens: 14000,
+  },
+};
+
+function getTrendingWeightInstructions(type: string): string {
+  switch (type) {
+    case 'global':
+      return `\nTRENDING WEIGHT SYSTEM — rank all 20 headlines by combined score of:\n  - Recency (40%): events from last 24–72 hours score highest\n  - Social Traction (30%): volume of coverage across X/Twitter, Google Trends, Reddit, and mainstream media\n  - Strategic Impact (30%): geopolitical, economic, or military significance\nSort headlines with highest trendScore first. Assign each headline a trendScore (1–100).`;
+    case 'crypto':
+      return `\nTRENDING WEIGHT SYSTEM — rank all 20 headlines by:\n  - Price Impact (40%): headlines that moved BTC/ETH or altcoins ≥2%\n  - Social Traction (35%): trending on crypto Twitter, Reddit r/CryptoCurrency, Discord\n  - Regulatory Weight (25%): government actions, exchange rulings, legal developments\nSort highest trendScore first. Assign each headline a trendScore (1–100).`;
+    case 'equities':
+      return `\nTRENDING WEIGHT SYSTEM — rank all 20 headlines by:\n  - Market Impact (40%): % move in stock or sector ETF\n  - Earnings/Guidance (35%): beats, misses, forward guidance revisions\n  - Analyst Coverage (25%): upgrades, downgrades, price target changes\nSort highest trendScore first. Assign each headline a trendScore (1–100).`;
+    case 'nasdaq':
+      return `\nTRENDING WEIGHT SYSTEM — rank all 20 headlines by:\n  - Price/Volatility Impact (40%): % move in individual Nasdaq-100 stock or QQQ ETF\n  - Earnings & Product News (35%): earnings beats/misses, AI announcements, product launches, guidance changes\n  - Analyst & Institutional Activity (25%): upgrades, downgrades, price target revisions, large fund moves\nSort highest trendScore first. Assign each headline a trendScore (1–100).`;
+    default:
+      return `\nTRENDING WEIGHT: Assign each headline a trendScore (1–100) based on recency, social volume, and strategic importance. Sort highest first.`;
+  }
+}
+
+function validateHeadlines(headlines: Headline[]): void {
+  let stubCount = 0;
+  for (let i = 0; i < headlines.length; i++) {
+    const words = (headlines[i].summary || "").trim().split(/\s+/).filter(w => w.length > 0).length;
+    if (words < 20) {
+      stubCount++;
+      console.warn(`[generateWeeklyReport] ⚠ Stub summary — headline ${i + 1}: ${words} words`);
+    }
+  }
+  if (stubCount === headlines.length) {
+    throw new Error("All summaries are empty stubs — provider returned no usable content.");
+  }
+}
+
+// ── Forecast report ───────────────────────────────────────────────────────────
+
 export async function generateForecastReport(): Promise<ForecastReport> {
-  const currentDate = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
-  const sevenDaysOut = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+  const currentDate = formatCurrentDate();
+  const sevenDaysOut = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toLocaleDateString('en-US', {
+    weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+  });
 
   const prompt = `You are a senior geopolitical risk analyst and macro strategist. Today is ${currentDate}. Your forward planning window is ${currentDate} through ${sevenDaysOut}.
 
@@ -100,7 +217,7 @@ OUTPUT RULES:
     const aiResponse = await generateReportWithFallback(prompt, ['claude', 'gpt'], 10000);
     const parsed = parseJSONResponse<ForecastReport>(aiResponse);
 
-    if (!parsed.events || parsed.events.length === 0) throw new Error('No events in forecast response');
+    if (!parsed.events?.length) throw new Error('No events in forecast response');
     if (!parsed.analysis) throw new Error('No analysis in forecast response');
 
     parsed.events.sort((a, b) => a.rank - b.rank);
@@ -113,87 +230,28 @@ OUTPUT RULES:
   }
 }
 
+// ── Weekly report ─────────────────────────────────────────────────────────────
+
 export async function generateWeeklyReport(type: string = 'global', customTopic?: string): Promise<WeeklyReport> {
-  let topicFocus = "Global macro shifts, geopolitical events, and major economic trends";
-  let reportTitle = "Global Pulse";
-  let isConspiracyReport = false;
-  let timeframe = "last 7 days";
-  let timeframeDescriptor = "from the last 7 days";
-  let sentimentVocab = "escalating | stable | de-escalating";
+  const cfg: ReportConfig = type === 'custom' && customTopic
+    ? {
+        topicFocus: customTopic,
+        reportTitle: "Custom Intelligence Brief",
+        timeframe: "last 90 days with 30-day forward outlook",
+        timeframeDescriptor: "from the last 90 days, with forward-looking risk analysis for the next 30 days",
+        sentimentVocab: "bullish | bearish | neutral | escalating | stable | de-escalating | critical | opportunity",
+        maxTokens: 14000,
+      }
+    : (REPORT_CONFIGS[type] ?? REPORT_CONFIGS.global);
 
-  if (type === 'crypto') {
-    topicFocus = "Cryptocurrency industry ONLY. Focus on Bitcoin, Ethereum, Altcoins, DeFi, Blockchain technology, NFTs, GameFi, Crypto regulation, exchange developments, and significant Web3 industry events. Omit non-crypto news.";
-    reportTitle = "Crypto Industry Pulse";
-    sentimentVocab = "bullish | bearish | neutral";
-  } else if (type === 'equities') {
-    topicFocus = "S&P 500 Equities ONLY. Focus on the top 500 US stocks, significant news, earnings results, and price movements for companies within the S&P 500. Omit all other macro news, geopolitics, or non-S&P 500 stocks.";
-    reportTitle = "S&P 500 Momentum Report";
-    sentimentVocab = "bullish | bearish | neutral";
-  } else if (type === 'nasdaq') {
-    topicFocus = "Nasdaq-100 tech and growth stocks ONLY. Focus on AAPL, NVDA, MSFT, META, AMZN, GOOGL, TSLA and other Nasdaq-100 constituents. Emphasise: AI/product announcements, earnings beats/misses, analyst upgrades/downgrades, rate-sensitive growth stock moves, and sector-wide tech themes. Omit S&P 500 non-tech names and macro news unless it directly moves Nasdaq prices.";
-    reportTitle = "Nasdaq-100 Tech Pulse";
-    sentimentVocab = "bullish | bearish | neutral";
-  } else if (type === 'conspiracies') {
-    topicFocus = "Widely viral, unverified or actively contested claims circulating on X (Twitter), TikTok, Facebook, Reddit, and Google. Focus on topics that are heavily discussed in mainstream social media but lack confirmation from established news sources — stories that are disputed, fact-checked as false, or still under investigation. Include historical context from the last 20 years where relevant, but prioritize what is trending in the last 30 days.";
-    reportTitle = "The Conspiracy Pulse";
-    isConspiracyReport = true;
-    timeframe = "last 30 days (with 20-year historical context)";
-    timeframeDescriptor = "from the last 30 days";
-    sentimentVocab = "viral | fading | debunked";
-  } else if (type === 'china') {
-    topicFocus = `Chinese influence, control, and leverage points in global supply chains — focusing on hidden dependencies that most market participants underestimate. Coverage must span: (1) Critical Minerals & Rare Earths — gallium, germanium, graphite, cobalt, NdFeB magnets and export control developments; (2) Agricultural Inputs — phosphate, fertilizer, potash supply chokepoints; (3) Pharmaceuticals — API/active pharmaceutical ingredient dependencies, heparin, generic drug supply; (4) Semiconductors & Electronics — PCB manufacturing, advanced packaging, ZPMC port cranes; (5) EV & Battery — CATL, LFP chemistry, graphite anode, lithium refining; (6) Maritime & Shipping — Chinese shipbuilding dominance, COSCO fleet movements, port infrastructure; (7) Military & Dual-Use — PLA modernization, Volt Typhoon/Salt Typhoon infrastructure access, technology transfer; (8) Trade Policy — US-China tariff escalation (Trump 2.0 145%), decoupling vs engagement debate, friend-shoring progress; (9) Foreign Investment — BRI project updates, Chinese FDI into critical resource nations, Western divestment pressures; (10) Risk Events — Taiwan strait tensions, export ban escalation, sanctions, commodity market manipulation. Emphasise non-obvious, high-consequence dependencies that cascade across industries if disrupted. Include investment and risk implications for each item.`;
-    reportTitle = "China Supply Chain Intelligence";
-    timeframe = "last 90 days with 30-day forward outlook";
-    timeframeDescriptor = "from the last 90 days, with forward-looking risk and opportunity analysis for the next 30 days";
-    sentimentVocab = "critical | escalating | opportunity | bullish | bearish | risk-off | stable | de-escalating";
-  } else if (type === 'custom' && customTopic) {
-    topicFocus = customTopic;
-    reportTitle = "Custom Intelligence Brief";
-    timeframe = "last 90 days with 30-day forward outlook";
-    timeframeDescriptor = "from the last 90 days, with forward-looking risk analysis for the next 30 days";
-    sentimentVocab = "bullish | bearish | neutral | escalating | stable | de-escalating | critical | opportunity";
-  }
+  const currentDate = formatCurrentDate();
+  const trendingWeightInstructions = getTrendingWeightInstructions(type);
 
-  const currentDate = new Date().toLocaleDateString('en-US', {
-    weekday: 'long',
-    year: 'numeric',
-    month: 'long',
-    day: 'numeric'
-  });
+  const conspiracyAddition = cfg.isConspiracy
+    ? '\nCONSPIRACY REPORT: Focus on trending topics with LOW credibility from the last 30 days.\nInclude historical context from the last 20 years to show patterns and recurring themes.'
+    : '';
 
-  const trendingWeightInstructions = type === 'global' ? `
-TRENDING WEIGHT SYSTEM — rank all 20 headlines by combined score of:
-  - Recency (40%): events from last 24–72 hours score highest
-  - Social Traction (30%): volume of coverage across X/Twitter, Google Trends, Reddit, and mainstream media
-  - Strategic Impact (30%): geopolitical, economic, or military significance
-Sort headlines with highest trendScore first. Assign each headline a trendScore (1–100).` : type === 'crypto' ? `
-TRENDING WEIGHT SYSTEM — rank all 20 headlines by:
-  - Price Impact (40%): headlines that moved BTC/ETH or altcoins ≥2%
-  - Social Traction (35%): trending on crypto Twitter, Reddit r/CryptoCurrency, Discord
-  - Regulatory Weight (25%): government actions, exchange rulings, legal developments
-Sort highest trendScore first. Assign each headline a trendScore (1–100).` : type === 'equities' ? `
-TRENDING WEIGHT SYSTEM — rank all 20 headlines by:
-  - Market Impact (40%): % move in stock or sector ETF
-  - Earnings/Guidance (35%): beats, misses, forward guidance revisions
-  - Analyst Coverage (25%): upgrades, downgrades, price target changes
-Sort highest trendScore first. Assign each headline a trendScore (1–100).` : type === 'nasdaq' ? `
-TRENDING WEIGHT SYSTEM — rank all 20 headlines by:
-  - Price/Volatility Impact (40%): % move in individual Nasdaq-100 stock or QQQ ETF
-  - Earnings & Product News (35%): earnings beats/misses, AI announcements, product launches, guidance changes
-  - Analyst & Institutional Activity (25%): upgrades, downgrades, price target revisions, large fund moves
-Sort highest trendScore first. Assign each headline a trendScore (1–100).` : `
-TRENDING WEIGHT: Assign each headline a trendScore (1–100) based on recency, social volume, and strategic importance. Sort highest first.`;
-
-  const conspiracyPromptAddition = isConspiracyReport ? `
-CONSPIRACY REPORT: Focus on trending topics with LOW credibility from the last 30 days.
-Include historical context from the last 20 years to show patterns and recurring themes.` : '';
-
-  const prompt = `You are a factual intelligence analyst. Today is ${currentDate}. STRICT NEUTRALITY — report only verified facts from major news sources (Reuters, AP, Bloomberg, BBC, CNN, Al Jazeera, WSJ, FT, etc). No speculation, opinion, or political bias.
-
-TASK: Generate exactly 20 headlines of MAJOR news events and strategic developments ${timeframeDescriptor}.
-Topic scope: ${topicFocus}
-
-${type === 'global' ? `MANDATORY COVERAGE AREAS — you MUST include at least one headline from each:
+  const mandatoryAreas = type === 'global' ? `MANDATORY COVERAGE AREAS — you MUST include at least one headline from each:
 1. Active military conflicts (Ukraine-Russia, Middle East, any new flashpoints)
 2. US / China / EU economic or trade policy
 3. Energy markets (oil, gas, commodities)
@@ -207,13 +265,20 @@ RECENCY: Prioritize last 72 hours. If nothing broke in 72h on a topic, use the m
 3. Semiconductors or hardware (AVGO, AMD, INTC, QCOM)
 4. Analyst calls or institutional moves on any Nasdaq-100 name
 5. Macro catalyst directly affecting Nasdaq (Fed, rates, CPI if tech-relevant)
-Fill remaining slots with the highest-trendScore Nasdaq-100 stories available.` : ''}
+Fill remaining slots with the highest-trendScore Nasdaq-100 stories available.` : '';
 
-${type === 'conspiracies' ? `HISTORICAL CONTEXT: Include patterns ongoing for years or decades, but prioritize what is trending RIGHT NOW in the last 30 days.` : ''}
+  const prompt = `You are a factual intelligence analyst. Today is ${currentDate}. STRICT NEUTRALITY — report only verified facts from major news sources (Reuters, AP, Bloomberg, BBC, CNN, Al Jazeera, WSJ, FT, etc). No speculation, opinion, or political bias.
+
+TASK: Generate exactly 20 headlines of MAJOR news events and strategic developments ${cfg.timeframeDescriptor}.
+Topic scope: ${cfg.topicFocus}
+
+${mandatoryAreas}
+
+${type === 'conspiracies' ? 'HISTORICAL CONTEXT: Include patterns ongoing for years or decades, but prioritize what is trending RIGHT NOW in the last 30 days.' : ''}
 
 ${trendingWeightInstructions}
 
-${conspiracyPromptAddition}
+${conspiracyAddition}
 
 HEADLINE FIELDS (repeat for all 20):
 - title: factual headline ≤20 words — WHAT, WHERE, WHEN
@@ -223,7 +288,7 @@ HEADLINE FIELDS (repeat for all 20):
 - alternateUrl: second independent source URL (different publication)
 - category: conflict | tension | diplomatic | strategic | military | economic | technology | market
 - socialPost: ≤280 character standalone tweet. Do NOT copy the first sentence of the summary. Write a punchy, self-contained post with a hook, key fact, and context. Must read well on its own.
-- sentiment: exactly one word from: ${sentimentVocab}
+- sentiment: exactly one word from: ${cfg.sentimentVocab}
 
 ANALYSIS SECTION:
 - performanceRanking: top 3 stories ranked by strategic importance, one sentence each
@@ -239,22 +304,16 @@ OUTPUT RULES:
 
   try {
     console.log(`[generateWeeklyReport] Generating ${type} report...`);
-
-    const maxTokens = type === 'conspiracies' ? 12000 : (type === 'custom' || type === 'china') ? 14000 : 8000;
-    const aiResponse = await generateReportWithFallback(prompt, ["claude", "gpt"], maxTokens);
+    const aiResponse = await generateReportWithFallback(prompt, ["claude", "gpt"], cfg.maxTokens);
     console.log(`[generateWeeklyReport] Using provider: ${aiResponse.provider}`);
 
     const parsed = parseJSONResponse<WeeklyReport>(aiResponse);
 
-    if (!parsed.headlines || parsed.headlines.length === 0) {
-      throw new Error("No headlines in response");
-    }
+    if (!parsed.headlines?.length) throw new Error("No headlines in response");
 
     if (!parsed.analysis) {
-      // Synthesize a fallback analysis from the headlines rather than failing
       const topHeadline = parsed.headlines[0];
-      const sentiments = parsed.headlines.map(h => h.sentiment).filter(Boolean);
-      const dominantSentiment = sentiments.length > 0 ? sentiments[0] : 'escalating';
+      const dominantSentiment = parsed.headlines.map(h => h.sentiment).find(Boolean) ?? 'escalating';
       parsed.analysis = {
         performanceRanking: `${parsed.headlines.length} intelligence items ranked by strategic impact and recency`,
         verificationScore: 87,
@@ -265,45 +324,26 @@ OUTPUT RULES:
       console.warn(`[generateWeeklyReport] ⚠ Missing analysis — synthesized fallback from headlines`);
     }
 
-    function countWords(text: string): number {
-      return text.trim().split(/\s+/).filter(w => w.length > 0).length;
-    }
-
-    // Sort by trendScore descending if present
     parsed.headlines.sort((a, b) => (b.trendScore ?? 0) - (a.trendScore ?? 0));
+    validateHeadlines(parsed.headlines);
 
-    // Quality check: warn only — never block a report that has real content
-    // Only hard-fail if summaries are truly empty (< 20 words = stub/placeholder)
-    let stubCount = 0;
-    for (let i = 0; i < parsed.headlines.length; i++) {
-      const words = countWords(parsed.headlines[i].summary || "");
-      if (words < 20) {
-        stubCount++;
-        console.warn(`[generateWeeklyReport] ⚠ Stub summary — headline ${i + 1}: ${words} words`);
-      }
-    }
-
-    if (stubCount === parsed.headlines.length) {
-      throw new Error("All summaries are empty stubs — provider returned no usable content.");
-    }
-
-    console.log(`[generateWeeklyReport] ✓ Successfully generated ${parsed.headlines.length} headlines for ${reportTitle}`);
+    console.log(`[generateWeeklyReport] ✓ Generated ${parsed.headlines.length} headlines for ${cfg.reportTitle}`);
     return parsed;
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
-    console.error(`[generateWeeklyReport] ✗ Failed to generate ${reportTitle}:`, errorMsg);
+    console.error(`[generateWeeklyReport] ✗ Failed:`, errorMsg);
     throw new Error(`Failed to generate report: ${errorMsg}`);
   }
 }
 
-export async function generateSubstackArticle(report: WeeklyReport): Promise<string> {
-  const currentDate = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+// ── Substack article ──────────────────────────────────────────────────────────
 
+export async function generateSubstackArticle(report: WeeklyReport): Promise<string> {
   const headlinesBlock = report.headlines.map((h, i) =>
     `${i + 1}. **${h.title}** [${h.category.toUpperCase()}]\n${h.summary}`
   ).join('\n\n');
 
-  const prompt = `You are a senior macro analyst and writer for ChokePoint Macro, a professional financial and geopolitical intelligence publication. Today is ${currentDate}.
+  const prompt = `You are a senior macro analyst and writer for ChokePoint Macro, a professional financial and geopolitical intelligence publication. Today is ${formatCurrentDate()}.
 
 TASK: Write a Substack article of EXACTLY 2,000–2,500 words synthesising the 20 intelligence headlines below into a single coherent narrative for sophisticated readers.
 
@@ -334,9 +374,7 @@ ${report.analysis.overallSummary}`;
 
   try {
     console.log("[generateSubstackArticle] Generating article...");
-    const Anthropic = (await import('@anthropic-ai/sdk')).default;
     const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY || "" });
-
     const response = await claude.messages.create({
       model: "claude-sonnet-4-6",
       max_tokens: 4000,
@@ -344,7 +382,7 @@ ${report.analysis.overallSummary}`;
       messages: [{ role: "user", content: prompt }],
     });
 
-    const article = response.content[0].type === "text" ? response.content[0].text : "";
+    const article = response.content[0]?.type === "text" ? response.content[0].text : "";
     if (!article) throw new Error("Empty response from Claude");
     console.log("[generateSubstackArticle] ✓ Article generated");
     return article;
@@ -353,6 +391,8 @@ ${report.analysis.overallSummary}`;
     throw new Error("Failed to generate Substack article: " + (error instanceof Error ? error.message : String(error)));
   }
 }
+
+// ── Instagram caption ─────────────────────────────────────────────────────────
 
 export async function generateInstagramCaption(report: WeeklyReport): Promise<string> {
   const headlinesList = report.headlines.map((h, i) => `${i + 1}. ${h.title}`).join('\n');
@@ -369,8 +409,8 @@ TASK:
 Create a high-impact Instagram caption that summarizes these 20 points into one cohesive, engaging post.
 
 STRICT REQUIREMENTS:
-1. ABSOLUTE MAXIMUM LENGTH: 2,100 characters (to leave a safety buffer for the 2,200 Instagram limit).
-2. YOU MUST BE CONCISE. If you exceed 2,100 characters, the post will be rejected.
+1. ABSOLUTE MAXIMUM LENGTH: ${INSTAGRAM_MAX_CHARS} characters (to leave a safety buffer for the 2,200 Instagram limit).
+2. YOU MUST BE CONCISE. If you exceed ${INSTAGRAM_MAX_CHARS} characters, the post will be rejected.
 3. Start with a hook that stops the scroll.
 4. Group the 20 points into 3-4 major themes or megatrends.
 5. Use bullet points for readability.
@@ -379,52 +419,42 @@ STRICT REQUIREMENTS:
 8. Do NOT just list the 20 headlines. Synthesize them.
 `;
 
+  console.log("[generateInstagramCaption] Starting caption generation...");
+
   try {
-    console.log("[generateInstagramCaption] Starting caption generation...");
-    const Anthropic = (await import('@anthropic-ai/sdk')).default;
-    const OpenAI = (await import('openai')).default;
-
-    // Try Claude first, then GPT
-    try {
-      console.log("[generateInstagramCaption] Trying Claude...");
-      const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY || "" });
-      const response = await claude.messages.create({
-        model: "claude-sonnet-4-6",
-        max_tokens: 2200,
-        messages: [{ role: "user", content: prompt }],
-      });
-      const caption = response.content[0].type === "text" ? response.content[0].text : "";
-      if (caption) {
-        console.log("[generateInstagramCaption] ✓ Claude succeeded");
-        return caption.length > 2200 ? caption.slice(0, 2197) + "..." : caption;
-      }
-    } catch (claudeError) {
-      console.warn("[generateInstagramCaption] Claude failed, trying GPT...", claudeError instanceof Error ? claudeError.message : String(claudeError));
+    const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY || "" });
+    const response = await claude.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 2200,
+      messages: [{ role: "user", content: prompt }],
+    });
+    const caption = response.content[0]?.type === "text" ? response.content[0].text : "";
+    if (caption) {
+      console.log("[generateInstagramCaption] ✓ Claude succeeded");
+      return truncateToInstagram(caption);
     }
-
-    try {
-      console.log("[generateInstagramCaption] Trying GPT...");
-      const gpt = new OpenAI({ apiKey: process.env.OPENAI_API_KEY || "" });
-      const response = await gpt.chat.completions.create({
-        model: "gpt-4o",
-        messages: [
-          { role: "system", content: "You are an expert social media strategist. Create viral Instagram captions." },
-          { role: "user", content: prompt },
-        ],
-        max_tokens: 2200,
-      });
-      const caption = response.choices[0].message.content || "";
-      if (caption) {
-        console.log("[generateInstagramCaption] ✓ GPT succeeded");
-        return caption.length > 2200 ? caption.slice(0, 2197) + "..." : caption;
-      }
-    } catch (gptError) {
-      console.error("[generateInstagramCaption] GPT failed:", gptError instanceof Error ? gptError.message : String(gptError));
-    }
-
-    return "Failed to generate Instagram caption. Please try again.";
-  } catch (error) {
-    console.error("[generateInstagramCaption] Fatal error:", error);
-    return "Failed to generate Instagram caption.";
+  } catch (claudeError) {
+    console.warn("[generateInstagramCaption] Claude failed, trying GPT...", claudeError instanceof Error ? claudeError.message : String(claudeError));
   }
+
+  try {
+    const gpt = new OpenAI({ apiKey: process.env.OPENAI_API_KEY || "" });
+    const response = await gpt.chat.completions.create({
+      model: "gpt-4o",
+      messages: [
+        { role: "system", content: "You are an expert social media strategist. Create viral Instagram captions." },
+        { role: "user", content: prompt },
+      ],
+      max_tokens: 2200,
+    });
+    const caption = response.choices[0]?.message.content || "";
+    if (caption) {
+      console.log("[generateInstagramCaption] ✓ GPT succeeded");
+      return truncateToInstagram(caption);
+    }
+  } catch (gptError) {
+    console.error("[generateInstagramCaption] GPT failed:", gptError instanceof Error ? gptError.message : String(gptError));
+  }
+
+  return "Failed to generate Instagram caption. Please try again.";
 }

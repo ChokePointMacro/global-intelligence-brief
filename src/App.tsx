@@ -2166,24 +2166,31 @@ const CredentialsModal = ({
 
   const handleSave = async () => {
     setSaving(true); setMsg(null);
-    const res = await apiFetch(`/api/platform-credentials/${platform}`, {
-      method: 'POST',
-      body: JSON.stringify({ credentials: fields }),
-    });
-    const data = await res.json();
-    setSaving(false);
-    if (!res.ok) { setMsg({ ok: false, text: data.error || 'Save failed' }); return; }
-    setSaved(true);
-    // Auto-test after saving
-    setTesting(true);
-    const testRes = await apiFetch(`/api/platform-credentials/${platform}/test`);
-    const testData = await testRes.json();
-    setTesting(false);
-    if (testData.ok) {
-      setMsg({ ok: true, text: '✓ Credentials saved and verified' });
-      setTimeout(() => { onSaved(); onClose(); }, 1200);
-    } else {
-      setMsg({ ok: false, text: `Saved but verification failed: ${testData.error}` });
+    try {
+      const res = await apiFetch(`/api/platform-credentials/${platform}`, {
+        method: 'POST',
+        body: JSON.stringify({ credentials: fields }),
+      });
+      const data = await res.json();
+      if (!res.ok) { setMsg({ ok: false, text: data.error || 'Save failed' }); return; }
+      setSaved(true);
+      setTesting(true);
+      try {
+        const testRes = await apiFetch(`/api/platform-credentials/${platform}/test`);
+        const testData = await testRes.json();
+        if (testData.ok) {
+          setMsg({ ok: true, text: '✓ Credentials saved and verified' });
+          setTimeout(() => { onSaved(); onClose(); }, 1200);
+        } else {
+          setMsg({ ok: false, text: `Saved but verification failed: ${testData.error}` });
+        }
+      } finally {
+        setTesting(false);
+      }
+    } catch {
+      setMsg({ ok: false, text: 'Network error — please try again.' });
+    } finally {
+      setSaving(false);
     }
   };
 
