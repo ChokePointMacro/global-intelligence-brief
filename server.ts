@@ -1366,6 +1366,65 @@ app.post("/api/auto-schedule/confirm", (req, res) => {
 
 // ─── Debug ─────────────────────────────────────────────────────────────────────
 
+// ─── Context Files ─────────────────────────────────────────────────────────────
+
+const CONTEXT_DIR = path.resolve('context');
+if (!fs.existsSync(CONTEXT_DIR)) fs.mkdirSync(CONTEXT_DIR, { recursive: true });
+
+const sanitizeFilename = (name: string) =>
+  name.replace(/[^a-zA-Z0-9-_]/g, '-').replace(/-+/g, '-').slice(0, 80) + '.md';
+
+app.get("/api/context-files", requireAuth, (req, res) => {
+  try {
+    const files = fs.readdirSync(CONTEXT_DIR)
+      .filter(f => f.endsWith('.md'))
+      .map(f => {
+        const stat = fs.statSync(path.join(CONTEXT_DIR, f));
+        const content = fs.readFileSync(path.join(CONTEXT_DIR, f), 'utf-8');
+        const firstLine = content.split('\n').find(l => l.trim()) || f;
+        const title = firstLine.replace(/^#+\s*/, '').trim();
+        return { name: f, title, size: stat.size, updatedAt: stat.mtime.toISOString() };
+      })
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    res.json(files);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to list context files' });
+  }
+});
+
+app.get("/api/context-files/:name", requireAuth, (req, res) => {
+  const filename = req.params.name.endsWith('.md') ? req.params.name : req.params.name + '.md';
+  const filePath = path.join(CONTEXT_DIR, path.basename(filename));
+  if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'File not found' });
+  res.json({ name: path.basename(filePath), content: fs.readFileSync(filePath, 'utf-8') });
+});
+
+app.post("/api/context-files", requireAuth, (req, res) => {
+  const { name, content } = req.body;
+  if (!name?.trim() || !content?.trim()) return res.status(400).json({ error: 'name and content required' });
+  const filename = sanitizeFilename(name.trim().replace(/\.md$/, ''));
+  const filePath = path.join(CONTEXT_DIR, filename);
+  fs.writeFileSync(filePath, content.trim());
+  res.json({ success: true, name: filename });
+});
+
+app.patch("/api/context-files/:name", requireAuth, (req, res) => {
+  const filename = req.params.name.endsWith('.md') ? req.params.name : req.params.name + '.md';
+  const filePath = path.join(CONTEXT_DIR, path.basename(filename));
+  const { content } = req.body;
+  if (!content?.trim()) return res.status(400).json({ error: 'content required' });
+  fs.writeFileSync(filePath, content.trim());
+  res.json({ success: true });
+});
+
+app.delete("/api/context-files/:name", requireAuth, (req, res) => {
+  const filename = req.params.name.endsWith('.md') ? req.params.name : req.params.name + '.md';
+  const filePath = path.join(CONTEXT_DIR, path.basename(filename));
+  if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'File not found' });
+  fs.unlinkSync(filePath);
+  res.json({ success: true });
+});
+
 app.get("/api/debug/session", (req, res) => {
   res.json({ sessionId: req.sessionID, userId: (req.session as any).userId });
 });

@@ -803,6 +803,17 @@ const Dashboard = () => {
   const [autoSchedulePreview, setAutoSchedulePreview] = useState<any>(null);
   const [autoScheduleLoading, setAutoScheduleLoading] = useState(false);
   const [autoScheduleConfirming, setAutoScheduleConfirming] = useState(false);
+  // Sidebar tabs
+  const [sidebarTab, setSidebarTab] = useState<'archive' | 'context'>('archive');
+  const [contextFiles, setContextFiles] = useState<any[]>([]);
+  const [activeContextFile, setActiveContextFile] = useState<string | null>(null);
+  const [activeContextContent, setActiveContextContent] = useState<string>('');
+  const [editingContext, setEditingContext] = useState(false);
+  const [editContextContent, setEditContextContent] = useState('');
+  const [contextSaving, setContextSaving] = useState(false);
+  const [showNewContextForm, setShowNewContextForm] = useState(false);
+  const [newContextName, setNewContextName] = useState('');
+  const [newContextContent, setNewContextContent] = useState('');
   const instaAssetRef = useRef<HTMLDivElement>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const navigate = useNavigate();
@@ -842,7 +853,51 @@ const Dashboard = () => {
     }
   };
 
-  useEffect(() => { fetchReports(); }, []);
+  const fetchContextFiles = async () => {
+    const res = await apiFetch('/api/context-files');
+    if (res.ok) setContextFiles(await res.json());
+  };
+
+  const loadContextFile = async (name: string) => {
+    const res = await apiFetch(`/api/context-files/${name}`);
+    if (res.ok) {
+      const data = await res.json();
+      setActiveContextFile(name);
+      setActiveContextContent(data.content);
+      setEditingContext(false);
+    }
+  };
+
+  const saveContextFile = async () => {
+    if (!activeContextFile) return;
+    setContextSaving(true);
+    await apiFetch(`/api/context-files/${activeContextFile}`, { method: 'PATCH', body: JSON.stringify({ content: editContextContent }) });
+    setContextSaving(false);
+    setActiveContextContent(editContextContent);
+    setEditingContext(false);
+    fetchContextFiles();
+  };
+
+  const deleteContextFile = async (name: string) => {
+    if (!confirm(`Delete "${name}"?`)) return;
+    await apiFetch(`/api/context-files/${name}`, { method: 'DELETE' });
+    if (activeContextFile === name) { setActiveContextFile(null); setActiveContextContent(''); }
+    fetchContextFiles();
+  };
+
+  const createContextFile = async () => {
+    if (!newContextName.trim() || !newContextContent.trim()) return;
+    const res = await apiFetch('/api/context-files', { method: 'POST', body: JSON.stringify({ name: newContextName, content: newContextContent }) });
+    if (res.ok) {
+      const data = await res.json();
+      setShowNewContextForm(false);
+      setNewContextName(''); setNewContextContent('');
+      await fetchContextFiles();
+      loadContextFile(data.name);
+    }
+  };
+
+  useEffect(() => { fetchReports(); fetchContextFiles(); }, []);
 
   const clearArchive = async () => {
     if (!confirm("Delete all reports in the archive?")) return;
@@ -1309,49 +1364,177 @@ const Dashboard = () => {
       {/* Main Grid */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-12">
         {/* Sidebar */}
-        <div className="lg:col-span-3 space-y-6 relative z-10">
-          <div className="flex items-center justify-between border-b border-btc-orange/20 pb-2">
-            <h3 className="text-xs font-mono uppercase tracking-widest opacity-40">Archive</h3>
-            {reports.length > 0 && (
-              <button onClick={clearArchive} className="text-[8px] font-mono uppercase tracking-widest text-red-500 hover:underline">Clear All</button>
-            )}
+        <div className="lg:col-span-3 space-y-4 relative z-10">
+
+          {/* Tab switcher */}
+          <div className="flex border-b border-white/8">
+            {(['archive', 'context'] as const).map(t => (
+              <button
+                key={t}
+                onClick={() => setSidebarTab(t)}
+                className={`flex-1 py-2 text-[10px] font-mono uppercase tracking-widest transition-colors ${
+                  sidebarTab === t
+                    ? 'text-btc-orange border-b-2 border-btc-orange -mb-px'
+                    : 'text-white/25 hover:text-white/50'
+                }`}
+              >{t}</button>
+            ))}
           </div>
-          <div className="space-y-2">
-            {reports.map((r) => {
-              const rC = getReportColor(r.type);
-              const isActive = activeReportId === r.id;
-              return (
-                <div key={r.id} className="relative group/item">
-                  <button
-                    onClick={() => setActiveReportId(r.id)}
-                    className="w-full text-left p-4 border transition-all flex flex-col gap-1 pr-10 relative overflow-hidden"
-                    style={{
-                      backgroundColor: isActive ? `rgba(${rC.rgb},0.08)` : '#0a0a0a',
-                      borderColor: isActive ? rC.hex : `rgba(255,255,255,0.06)`,
-                      boxShadow: isActive ? `0 0 12px rgba(${rC.rgb},0.12)` : 'none',
-                    }}
-                  >
-                    {/* Left accent bar — always shows type color */}
-                    <div className="absolute left-0 top-0 bottom-0 w-[3px]" style={{ backgroundColor: rC.hex, opacity: isActive ? 1 : 0.4 }} />
-                    <span className="text-[10px] font-mono uppercase pl-3" style={{ color: rC.hex, opacity: 0.7 }}>{getReportLabel(r)}</span>
-                    <span className="text-xs font-medium truncate pl-3 text-gray-400">{new Date(r.updated_at).toLocaleDateString()}</span>
-                  </button>
-                  <button
-                    onClick={(e) => deleteReport(r.id, e)}
-                    className="absolute right-2 top-1/2 -translate-y-1/2 p-2 text-red-500 opacity-0 group-hover/item:opacity-40 hover:!opacity-100 transition-opacity hover:bg-red-500/10 rounded-sm z-10"
-                  >
-                    <Trash2 size={14} />
+
+          {/* Archive tab */}
+          {sidebarTab === 'archive' && (
+            <div className="space-y-2">
+              <div className="flex items-center justify-between pb-1">
+                <span className="text-[9px] font-mono uppercase tracking-widest text-white/20">{reports.length} reports</span>
+                {reports.length > 0 && (
+                  <button onClick={clearArchive} className="text-[8px] font-mono uppercase tracking-widest text-red-500/50 hover:text-red-500 transition-colors">Clear All</button>
+                )}
+              </div>
+              {reports.map((r) => {
+                const rC = getReportColor(r.type);
+                const isActive = activeReportId === r.id;
+                return (
+                  <div key={r.id} className="relative group/item">
+                    <button
+                      onClick={() => { setActiveReportId(r.id); setActiveContextFile(null); }}
+                      className="w-full text-left p-4 border transition-all flex flex-col gap-1 pr-10 relative overflow-hidden"
+                      style={{
+                        backgroundColor: isActive ? `rgba(${rC.rgb},0.08)` : '#0a0a0a',
+                        borderColor: isActive ? rC.hex : `rgba(255,255,255,0.06)`,
+                        boxShadow: isActive ? `0 0 12px rgba(${rC.rgb},0.12)` : 'none',
+                      }}
+                    >
+                      <div className="absolute left-0 top-0 bottom-0 w-[3px]" style={{ backgroundColor: rC.hex, opacity: isActive ? 1 : 0.4 }} />
+                      <span className="text-[10px] font-mono uppercase pl-3" style={{ color: rC.hex, opacity: 0.7 }}>{getReportLabel(r)}</span>
+                      <span className="text-xs font-medium truncate pl-3 text-gray-400">{new Date(r.updated_at).toLocaleDateString()}</span>
+                    </button>
+                    <button
+                      onClick={(e) => deleteReport(r.id, e)}
+                      className="absolute right-2 top-1/2 -translate-y-1/2 p-2 text-red-500 opacity-0 group-hover/item:opacity-40 hover:!opacity-100 transition-opacity hover:bg-red-500/10 rounded-sm z-10"
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {/* Context tab */}
+          {sidebarTab === 'context' && (
+            <div className="space-y-2">
+              <div className="flex items-center justify-between pb-1">
+                <span className="text-[9px] font-mono uppercase tracking-widest text-white/20">{contextFiles.length} files</span>
+                <button
+                  onClick={() => setShowNewContextForm(f => !f)}
+                  className="flex items-center gap-1 text-[8px] font-mono uppercase tracking-widest text-teal-400/50 hover:text-teal-400 transition-colors"
+                >
+                  <Plus size={10} /> New
+                </button>
+              </div>
+
+              {/* New file form */}
+              {showNewContextForm && (
+                <div className="border border-teal-400/20 bg-teal-400/5 p-3 space-y-2">
+                  <input
+                    type="text" placeholder="File name (e.g. us-energy-policy)"
+                    value={newContextName}
+                    onChange={e => setNewContextName(e.target.value)}
+                    className="w-full bg-black/40 border border-white/10 text-white text-[11px] font-mono px-2 py-1.5 outline-none focus:border-teal-400/40 placeholder:text-white/20"
+                  />
+                  <textarea
+                    placeholder="Paste context content here..."
+                    value={newContextContent}
+                    onChange={e => setNewContextContent(e.target.value)}
+                    rows={5}
+                    className="w-full bg-black/40 border border-white/10 text-white text-[11px] font-mono px-2 py-1.5 outline-none focus:border-teal-400/40 placeholder:text-white/20 resize-none"
+                  />
+                  <button onClick={createContextFile} className="flex items-center gap-1.5 px-3 py-1.5 border border-teal-400/30 bg-teal-400/5 text-teal-400 text-[9px] font-mono uppercase tracking-wider hover:bg-teal-400/10 transition-all">
+                    <Check size={10} /> Create
                   </button>
                 </div>
-              );
-            })}
-          </div>
+              )}
+
+              {contextFiles.map(f => (
+                <div key={f.name} className="relative group/ctx">
+                  <button
+                    onClick={() => { loadContextFile(f.name); setActiveReportId(null); }}
+                    className={`w-full text-left p-3 border transition-all flex flex-col gap-1 pr-8 relative overflow-hidden ${
+                      activeContextFile === f.name
+                        ? 'border-teal-400/40 bg-teal-400/8'
+                        : 'border-white/5 bg-[#0a0a0a] hover:border-white/10'
+                    }`}
+                  >
+                    <div className="absolute left-0 top-0 bottom-0 w-[3px]" style={{ backgroundColor: '#2dd4bf', opacity: activeContextFile === f.name ? 1 : 0.3 }} />
+                    <span className="text-[10px] font-mono pl-3 text-teal-400/80 truncate">{f.title}</span>
+                    <span className="text-[9px] font-mono pl-3 text-white/25">
+                      {Math.round(f.size / 1024 * 10) / 10}kb · {new Date(f.updatedAt).toLocaleDateString()}
+                    </span>
+                  </button>
+                  <button
+                    onClick={() => deleteContextFile(f.name)}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 p-1.5 text-red-500 opacity-0 group-hover/ctx:opacity-40 hover:!opacity-100 transition-opacity"
+                  >
+                    <Trash2 size={12} />
+                  </button>
+                </div>
+              ))}
+
+              {contextFiles.length === 0 && !showNewContextForm && (
+                <p className="text-[10px] font-mono text-white/20 text-center py-6">No context files yet.<br />Click + New to add one.</p>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Report View */}
         <div className="lg:col-span-9">
           <AnimatePresence mode="wait">
-            {activeReport && isForecast && forecastReport ? (
+            {/* Context file viewer */}
+            {activeContextFile && activeContextContent && !activeReport ? (
+              <motion.div key={activeContextFile} initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -20 }}>
+                <div className="border border-teal-400/20 bg-black/20">
+                  <div className="flex items-center justify-between p-4 border-b border-teal-400/10 bg-teal-400/5">
+                    <div className="flex items-center gap-3">
+                      <FileText size={14} className="text-teal-400/60" />
+                      <div>
+                        <p className="text-xs font-mono text-teal-400">{activeContextFile}</p>
+                        <p className="text-[9px] font-mono text-white/30 uppercase tracking-wider">Intelligence Context File</p>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      {editingContext ? (
+                        <>
+                          <button onClick={saveContextFile} disabled={contextSaving} className="flex items-center gap-1.5 px-3 py-1.5 border border-teal-400/30 bg-teal-400/5 text-teal-400 text-[9px] font-mono uppercase tracking-wider hover:bg-teal-400/10 transition-all disabled:opacity-40">
+                            {contextSaving ? <Loader2 size={10} className="animate-spin" /> : <Check size={10} />} Save
+                          </button>
+                          <button onClick={() => setEditingContext(false)} className="px-3 py-1.5 border border-white/10 text-white/30 text-[9px] font-mono uppercase tracking-wider hover:text-white/50 transition-colors">Cancel</button>
+                        </>
+                      ) : (
+                        <button onClick={() => { setEditingContext(true); setEditContextContent(activeContextContent); }}
+                          className="flex items-center gap-1.5 px-3 py-1.5 border border-white/10 text-white/30 text-[9px] font-mono uppercase tracking-wider hover:text-teal-400/70 hover:border-teal-400/20 transition-all">
+                          <Pencil size={10} /> Edit
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  <div className="p-6">
+                    {editingContext ? (
+                      <textarea
+                        value={editContextContent}
+                        onChange={e => setEditContextContent(e.target.value)}
+                        className="w-full bg-black/40 border border-white/10 text-white/80 text-xs font-mono p-4 outline-none focus:border-teal-400/30 transition-colors resize-none"
+                        style={{ minHeight: '60vh' }}
+                      />
+                    ) : (
+                      <div className="prose prose-invert prose-sm max-w-none prose-headings:font-mono prose-headings:text-teal-400 prose-code:text-teal-300 prose-strong:text-white prose-p:text-white/70 prose-li:text-white/70 prose-table:text-white/70">
+                        <Markdown>{activeContextContent}</Markdown>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </motion.div>
+            ) : activeReport && isForecast && forecastReport ? (
               <motion.div
                 key={activeReportId || 'forecast'}
                 initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -20 }}
