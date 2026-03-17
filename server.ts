@@ -6,6 +6,9 @@ import SQLiteStoreFactory from "connect-sqlite3";
 import { TwitterApi } from "twitter-api-v2";
 import nodemailer from "nodemailer";
 import bcrypt from "bcryptjs";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
+import crypto from "crypto";
 import db from "./db.ts";
 import dotenv from "dotenv";
 import path from "path";
@@ -17,6 +20,12 @@ dotenv.config();
 
 const app = express();
 const PORT = 3000;
+
+// ─── Startup Security Checks ───────────────────────────────────────────────────
+
+if (!process.env.SESSION_SECRET || process.env.SESSION_SECRET === 'gib-secret') {
+  console.warn("⚠️  SESSION_SECRET is not set or uses the insecure default. Set a strong random secret in .env");
+}
 
 // Normalize APP_URL
 if (process.env.APP_URL && process.env.APP_URL.endsWith('/')) {
@@ -30,7 +39,56 @@ if (!fs.existsSync("./sessions")) {
 const SQLiteStore = (SQLiteStoreFactory as any)(session);
 
 app.set('trust proxy', 1);
-app.use(express.json());
+
+// ─── Security Headers (Helmet) ─────────────────────────────────────────────────
+app.use(helmet({
+  contentSecurityPolicy: false, // Vite dev server injects inline scripts; configure per env if needed
+  crossOriginEmbedderPolicy: false,
+}));
+
+// ─── Body size limit ───────────────────────────────────────────────────────────
+app.use(express.json({ limit: '100kb' }));
+
+// ─── Rate Limiters ─────────────────────────────────────────────────────────────
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many attempts. Please wait 15 minutes before trying again." },
+});
+
+const reportGenLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Report generation rate limit exceeded. Please wait before generating more reports." },
+});
+
+const postLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Posting rate limit exceeded. Please wait before posting again." },
+});
+
+const emailLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Email rate limit exceeded. Maximum 5 emails per hour." },
+});
+
+// ─── Auth Middleware ───────────────────────────────────────────────────────────
+
+const requireAuth = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (!(req.session as any).userId) return res.status(401).json({ error: "Not authenticated" });
+  next();
+};
 
 // Session ID header bypass for iframe cookie issues
 app.use((req, res, next) => {
@@ -167,14 +225,13 @@ app.get("/auth/x/callback", async (req, res) => {
 
     req.session.save((err) => {
       if (err) console.error("Session save error:", err);
-      res.send(`
-        <html><body><script>
-          if (window.opener) {
-            window.opener.postMessage({ type: 'OAUTH_AUTH_SUCCESS', sessionId: '${req.sessionID}' }, '*');
-            window.close();
-          } else { window.location.href = '/'; }
-        </script></body></html>
-      `);
+      const sid = JSON.stringify(req.sessionID);
+      res.send(`<html><body><script>
+        if (window.opener) {
+          window.opener.postMessage({ type: 'OAUTH_AUTH_SUCCESS', sessionId: ${sid} }, '*');
+          window.close();
+        } else { window.location.href = '/'; }
+      </script></body></html>`);
     });
   } catch (error) {
     console.error("X auth failed:", error);
@@ -200,7 +257,7 @@ app.get("/api/auth/me", (req, res) => {
 
 // ─── Email / Password Auth ──────────────────────────────────────────────────
 
-app.post("/api/auth/register", async (req, res) => {
+app.post("/api/auth/register", authLimiter, async (req, res) => {
   const { email, password, displayName } = req.body;
   if (!email || !password) return res.status(400).json({ error: "Email and password required" });
   if (password.length < 8) return res.status(400).json({ error: "Password must be at least 8 characters" });
@@ -226,7 +283,7 @@ app.post("/api/auth/register", async (req, res) => {
   }
 });
 
-app.post("/api/auth/login", async (req, res) => {
+app.post("/api/auth/login", authLimiter, async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: "Email and password required" });
 
@@ -253,7 +310,7 @@ app.get("/api/auth/linkedin/url", (req, res) => {
   const clientId = process.env.LINKEDIN_CLIENT_ID;
   if (!clientId) return res.status(503).json({ error: "LinkedIn not configured. Add LINKEDIN_CLIENT_ID to .env" });
 
-  const state = Math.random().toString(36).substring(2);
+  const state = crypto.randomBytes(16).toString('hex');
   const redirectUri = getRedirectUri(req, 'linkedin');
   db.prepare("INSERT OR REPLACE INTO pending_auth (state, code_verifier, platform) VALUES (?, '', 'linkedin')").run(state);
 
@@ -265,6 +322,7 @@ app.get("/auth/linkedin/callback", async (req, res) => {
   const { code, state } = req.query;
   const userId = (req.session as any).userId;
 
+  if (!userId) return res.status(401).send("You must be logged in to connect LinkedIn");
   if (!code || !state) return res.status(400).send("Missing code or state");
 
   const pending = db.prepare("SELECT state FROM pending_auth WHERE state = ? AND platform = 'linkedin'").get(state) as any;
@@ -302,7 +360,7 @@ app.get("/auth/linkedin/callback", async (req, res) => {
         person_urn = excluded.person_urn,
         expires_at = excluded.expires_at,
         updated_at = CURRENT_TIMESTAMP
-    `).run(userId || 'anonymous', tokenData.access_token, userInfo.name || '', userInfo.sub || '', Date.now() + (tokenData.expires_in || 3600) * 1000);
+    `).run(userId, tokenData.access_token, userInfo.name || '', userInfo.sub || '', Date.now() + (tokenData.expires_in || 3600) * 1000);
 
     res.send(`<html><body><script>
       if (window.opener) { window.opener.postMessage({ type: 'OAUTH_LINKEDIN_SUCCESS' }, '*'); window.close(); }
@@ -320,7 +378,7 @@ app.get("/api/auth/threads/url", (req, res) => {
   const appId = process.env.THREADS_APP_ID;
   if (!appId) return res.status(503).json({ error: "Threads not configured. Add THREADS_APP_ID to .env" });
 
-  const state = Math.random().toString(36).substring(2);
+  const state = crypto.randomBytes(16).toString('hex');
   const redirectUri = getRedirectUri(req, 'threads');
   db.prepare("INSERT OR REPLACE INTO pending_auth (state, code_verifier, platform) VALUES (?, '', 'threads')").run(state);
 
@@ -332,6 +390,7 @@ app.get("/auth/threads/callback", async (req, res) => {
   const { code, state } = req.query;
   const userId = (req.session as any).userId;
 
+  if (!userId) return res.status(401).send("You must be logged in to connect Threads");
   if (!code || !state) return res.status(400).send("Missing code or state");
 
   const pending = db.prepare("SELECT state FROM pending_auth WHERE state = ? AND platform = 'threads'").get(state) as any;
@@ -366,7 +425,7 @@ app.get("/auth/threads/callback", async (req, res) => {
         handle = excluded.handle,
         person_urn = excluded.person_urn,
         updated_at = CURRENT_TIMESTAMP
-    `).run(userId || 'anonymous', tokenData.access_token, userInfo.username || '', userInfo.id || '');
+    `).run(userId, tokenData.access_token, userInfo.username || '', userInfo.id || '');
 
     res.send(`<html><body><script>
       if (window.opener) { window.opener.postMessage({ type: 'OAUTH_THREADS_SUCCESS' }, '*'); window.close(); }
@@ -431,9 +490,10 @@ app.get("/auth/x/connect/callback", async (req, res) => {
         updated_at = CURRENT_TIMESTAMP
     `).run(userId || 'anonymous', accessToken, refreshToken || '', `@${xUser.username}`, expiresAt);
 
+    const xHandle = JSON.stringify('@' + xUser.username);
     res.send(`<html><body><script>
       if (window.opener) {
-        window.opener.postMessage({ type: 'OAUTH_X_CONNECT_SUCCESS', handle: '@${xUser.username}' }, '*');
+        window.opener.postMessage({ type: 'OAUTH_X_CONNECT_SUCCESS', handle: ${xHandle} }, '*');
         window.close();
       } else { window.location.href = '/settings'; }
     </script></body></html>`);
@@ -451,7 +511,7 @@ app.get("/api/auth/instagram/url", (req, res) => {
   const appId = process.env.INSTAGRAM_APP_ID;
   if (!appId) return res.status(503).json({ error: "Instagram not configured. Add INSTAGRAM_APP_ID to .env" });
 
-  const state = Math.random().toString(36).substring(2);
+  const state = crypto.randomBytes(16).toString('hex');
   const redirectUri = getRedirectUri(req, 'instagram');
   db.prepare("INSERT OR REPLACE INTO pending_auth (state, code_verifier, platform) VALUES (?, '', 'instagram')").run(state);
 
@@ -521,12 +581,13 @@ app.get("/auth/instagram/callback", async (req, res) => {
         handle = excluded.handle,
         person_urn = excluded.person_urn,
         updated_at = CURRENT_TIMESTAMP
-    `).run(userId || 'anonymous', pageToken, igUsername, igUserId);
+    `).run(userId, pageToken, igUsername, igUserId);
 
     const displayHandle = igUserId ? `@${igUsername}` : igUsername;
+    const igHandleJson = JSON.stringify(displayHandle);
     res.send(`<html><body><script>
       if (window.opener) {
-        window.opener.postMessage({ type: 'OAUTH_INSTAGRAM_SUCCESS', handle: '${displayHandle}' }, '*');
+        window.opener.postMessage({ type: 'OAUTH_INSTAGRAM_SUCCESS', handle: ${igHandleJson} }, '*');
         window.close();
       } else { window.location.href = '/settings'; }
     </script></body></html>`);
@@ -588,7 +649,7 @@ app.post("/api/social/bluesky/connect", async (req, res) => {
 
 // ─── Multi-platform post endpoint ─────────────────────────────────────────────
 
-app.post("/api/social/post", async (req, res) => {
+app.post("/api/social/post", requireAuth, postLimiter, async (req, res) => {
   const userId = (req.session as any).userId;
   const { text, platforms } = req.body as { text: string; platforms: string[] };
 
@@ -753,7 +814,7 @@ app.post("/api/social/post", async (req, res) => {
 
 // ─── Report Generation ─────────────────────────────────────────────────────────
 
-app.get("/api/debug/models", async (req, res) => {
+app.get("/api/debug/models", requireAuth, async (req, res) => {
   try {
     const { GoogleGenAI } = await import("@google/genai");
     const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
@@ -765,7 +826,7 @@ app.get("/api/debug/models", async (req, res) => {
   }
 });
 
-app.post("/api/generate-report", async (req, res) => {
+app.post("/api/generate-report", requireAuth, reportGenLimiter, async (req, res) => {
   try {
     const { type, customTopic } = req.body;
 
@@ -821,7 +882,7 @@ app.post("/api/generate-report", async (req, res) => {
 
 // ─── Instagram Caption ────────────────────────────────────────────────────────
 
-app.post("/api/instagram-caption", async (req, res) => {
+app.post("/api/instagram-caption", requireAuth, reportGenLimiter, async (req, res) => {
   try {
     const { reportId } = req.body;
     const reportRow = db.prepare("SELECT * FROM reports WHERE id = ?").get(reportId) as any;
@@ -841,7 +902,7 @@ app.post("/api/instagram-caption", async (req, res) => {
 
 // ─── Audio Brief ───────────────────────────────────────────────────────────────
 
-app.post("/api/audio-brief", async (req, res) => {
+app.post("/api/audio-brief", requireAuth, reportGenLimiter, async (req, res) => {
   const { reportId } = req.body;
   const reportRow = db.prepare("SELECT * FROM reports WHERE id = ?").get(reportId) as any;
   if (!reportRow) return res.status(404).json({ error: "Report not found" });
@@ -876,9 +937,10 @@ app.post("/api/audio-brief", async (req, res) => {
 
 // ─── Email Digest ──────────────────────────────────────────────────────────────
 
-app.post("/api/email-digest", async (req, res) => {
+app.post("/api/email-digest", requireAuth, emailLimiter, async (req, res) => {
   const { reportId, to } = req.body;
   if (!to) return res.status(400).json({ error: "Recipient email (to) required" });
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) return res.status(400).json({ error: "Invalid email address" });
 
   const reportRow = db.prepare("SELECT * FROM reports WHERE id = ?").get(reportId) as any;
   if (!reportRow) return res.status(404).json({ error: "Report not found" });
@@ -942,7 +1004,7 @@ app.post("/api/email-digest", async (req, res) => {
 
 // ─── Substack Article ──────────────────────────────────────────────────────────
 
-app.post("/api/substack-article", async (req, res) => {
+app.post("/api/substack-article", requireAuth, reportGenLimiter, async (req, res) => {
   const { reportId } = req.body;
   if (!reportId) return res.status(400).json({ error: "reportId required" });
 
@@ -962,12 +1024,12 @@ app.post("/api/substack-article", async (req, res) => {
 
 // ─── Report Archive ────────────────────────────────────────────────────────────
 
-app.get("/api/reports", (req, res) => {
+app.get("/api/reports", requireAuth, (req, res) => {
   const reports = db.prepare("SELECT * FROM reports ORDER BY updated_at DESC").all() as any[];
   res.json(reports.map(r => ({ ...r, content: JSON.parse(r.content) })));
 });
 
-app.post("/api/reports", (req, res) => {
+app.post("/api/reports", requireAuth, (req, res) => {
   const { id, type, content, customTopic } = req.body;
   db.prepare(`
     INSERT INTO reports (id, type, content, custom_topic, updated_at)
@@ -977,7 +1039,7 @@ app.post("/api/reports", (req, res) => {
   res.json({ success: true });
 });
 
-app.delete("/api/reports", (req, res) => {
+app.delete("/api/reports", requireAuth, (req, res) => {
   try {
     console.log("Clearing all reports...");
     db.prepare("DELETE FROM reports").run();
@@ -990,7 +1052,7 @@ app.delete("/api/reports", (req, res) => {
   }
 });
 
-app.delete("/api/reports/:id", (req, res) => {
+app.delete("/api/reports/:id", requireAuth, (req, res) => {
   try {
     console.log("Deleting report:", req.params.id);
     db.prepare("DELETE FROM reports WHERE id = ?").run(req.params.id);
@@ -1005,12 +1067,12 @@ app.delete("/api/reports/:id", (req, res) => {
 
 // ─── Report Schedules ──────────────────────────────────────────────────────────
 
-app.get("/api/scheduled-reports", (req, res) => {
+app.get("/api/scheduled-reports", requireAuth, (req, res) => {
   const schedules = db.prepare("SELECT * FROM scheduled_reports ORDER BY created_at DESC").all();
   res.json(schedules);
 });
 
-app.post("/api/scheduled-reports", (req, res) => {
+app.post("/api/scheduled-reports", requireAuth, (req, res) => {
   const { report_type, custom_topic, schedule_time, days } = req.body;
   if (!report_type || !schedule_time) {
     return res.status(400).json({ error: "report_type and schedule_time required" });
@@ -1022,13 +1084,13 @@ app.post("/api/scheduled-reports", (req, res) => {
   res.json({ success: true, id: result.lastInsertRowid });
 });
 
-app.patch("/api/scheduled-reports/:id", (req, res) => {
+app.patch("/api/scheduled-reports/:id", requireAuth, (req, res) => {
   const { enabled } = req.body;
   db.prepare("UPDATE scheduled_reports SET enabled = ? WHERE id = ?").run(enabled ? 1 : 0, req.params.id);
   res.json({ success: true });
 });
 
-app.delete("/api/scheduled-reports/:id", (req, res) => {
+app.delete("/api/scheduled-reports/:id", requireAuth, (req, res) => {
   db.prepare("DELETE FROM scheduled_reports WHERE id = ?").run(req.params.id);
   res.json({ success: true });
 });
@@ -1060,7 +1122,7 @@ function getXTokenRecord(userId: string): any | null {
   return platformToken || null;
 }
 
-app.post("/api/post-to-x", async (req, res) => {
+app.post("/api/post-to-x", postLimiter, async (req, res) => {
   if (!hasValidXCredentials) {
     return res.status(503).json({ error: "X posting not enabled on this server" });
   }
@@ -1093,9 +1155,11 @@ app.post("/api/post-to-x", async (req, res) => {
   }
 });
 
-app.post("/api/schedule-post", (req, res) => {
+app.post("/api/schedule-post", requireAuth, (req, res) => {
   const userId = (req.session as any).userId;
   const { content, scheduledAt } = req.body;
+  if (!content?.trim()) return res.status(400).json({ error: "content required" });
+  if (!scheduledAt) return res.status(400).json({ error: "scheduledAt required" });
   db.prepare(`INSERT INTO scheduled_posts (user_id, content, scheduled_at) VALUES (?, ?, ?)`).run(userId, content, scheduledAt);
   res.json({ success: true });
 });
@@ -1118,7 +1182,7 @@ const REPORT_DAY_MAP: Record<string, number> = {
   forecast: 0, crypto: 1, nasdaq: 2, conspiracies: 3, equities: 4, global: 5,
 };
 
-app.post("/api/auto-schedule/preview", (req, res) => {
+app.post("/api/auto-schedule/preview", requireAuth, (req, res) => {
   const { reportId } = req.body;
   if (!reportId) return res.status(400).json({ error: "reportId required" });
 
