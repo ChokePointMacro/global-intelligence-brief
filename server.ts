@@ -954,7 +954,7 @@ app.post("/api/generate-report", requireAuth, reportGenLimiter, async (req, res)
   try {
     const { type, customTopic } = req.body;
 
-    if (!type || !['global', 'crypto', 'equities', 'nasdaq', 'conspiracies', 'custom', 'forecast'].includes(type)) {
+    if (!type || !['global', 'crypto', 'equities', 'nasdaq', 'conspiracies', 'custom', 'forecast', 'china'].includes(type)) {
       return res.status(400).json({ error: "Invalid report type" });
     }
     if (type === 'custom' && !customTopic?.trim()) {
