@@ -75,6 +75,7 @@ const REPORT_COLORS: Record<string, { hex: string; rgb: string }> = {
   conspiracies: { hex: '#f87171', rgb: '248,113,113' },
   forecast:     { hex: '#facc15', rgb: '250,204,21' },
   custom:       { hex: '#2dd4bf', rgb: '45,212,191' },
+  china:        { hex: '#ef4444', rgb: '239,68,68' },
 };
 
 const getReportColor = (type?: string) =>
@@ -834,7 +835,7 @@ const Dashboard = () => {
 
   const getReportLabel = (r: any) => {
     if (r.type === 'custom') return r.custom_topic ? truncateToWords(r.custom_topic, 4) : 'Custom';
-    const labels: Record<string, string> = { equities: 'S&P 500', nasdaq: 'Nasdaq-100', crypto: 'Crypto', conspiracies: 'Conspiracies', global: 'Global', forecast: '7-Day Forecast' };
+    const labels: Record<string, string> = { equities: 'S&P 500', nasdaq: 'Nasdaq-100', crypto: 'Crypto', conspiracies: 'Conspiracies', global: 'Global', forecast: '7-Day Forecast', china: 'China Supply Chain' };
     return labels[r.type] || 'Global';
   };
 
@@ -1281,6 +1282,7 @@ const Dashboard = () => {
                 { id: 'nasdaq', label: 'Nasdaq-100' },
                 { id: 'conspiracies', label: 'Conspiracies' },
                 { id: 'forecast', label: '7-Day Forecast' },
+                { id: 'china', label: 'China S.C.' },
                 { id: 'custom', label: 'Custom' },
               ].map((t) => (
                 <button
@@ -2271,6 +2273,7 @@ const PROFILE_TYPE_META: Record<string, { label: string; color: string; bar: str
   conspiracies: { label: 'Conspiracies',   color: 'text-red-400',    bar: 'bg-red-400'    },
   forecast:     { label: '7-Day Forecast', color: 'text-yellow-400', bar: 'bg-yellow-400' },
   custom:       { label: 'Custom',         color: 'text-teal-400',   bar: 'bg-teal-400'   },
+  china:        { label: 'China S.C.',     color: 'text-red-400',    bar: 'bg-red-400'    },
 };
 
 const Profile = ({ user, onLogout }: { user: UserData | null; onLogout: () => void }) => {
@@ -3465,7 +3468,7 @@ const Settings = ({ user, onLogout }: { user: UserData | null; onLogout: () => v
                     <label className="text-[9px] font-mono uppercase tracking-widest opacity-40">Report Type</label>
                     <select value={newSchedule.type} onChange={e => setNewSchedule(s => ({ ...s, type: e.target.value }))}
                       className="w-full px-2 py-1.5 bg-black/60 border border-btc-orange/20 text-white font-mono text-xs outline-none focus:border-btc-orange">
-                      {['global', 'crypto', 'equities', 'nasdaq', 'conspiracies', 'custom'].map(t => <option key={t} value={t}>{t}</option>)}
+                      {['global', 'crypto', 'equities', 'nasdaq', 'conspiracies', 'china', 'custom'].map(t => <option key={t} value={t}>{t}</option>)}
                     </select>
                   </div>
                   <div className="space-y-1">

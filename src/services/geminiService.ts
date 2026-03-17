@@ -140,6 +140,12 @@ export async function generateWeeklyReport(type: string = 'global', customTopic?
     timeframe = "last 30 days (with 20-year historical context)";
     timeframeDescriptor = "from the last 30 days";
     sentimentVocab = "viral | fading | debunked";
+  } else if (type === 'china') {
+    topicFocus = `Chinese influence, control, and leverage points in global supply chains — focusing on hidden dependencies that most market participants underestimate. Coverage must span: (1) Critical Minerals & Rare Earths — gallium, germanium, graphite, cobalt, NdFeB magnets and export control developments; (2) Agricultural Inputs — phosphate, fertilizer, potash supply chokepoints; (3) Pharmaceuticals — API/active pharmaceutical ingredient dependencies, heparin, generic drug supply; (4) Semiconductors & Electronics — PCB manufacturing, advanced packaging, ZPMC port cranes; (5) EV & Battery — CATL, LFP chemistry, graphite anode, lithium refining; (6) Maritime & Shipping — Chinese shipbuilding dominance, COSCO fleet movements, port infrastructure; (7) Military & Dual-Use — PLA modernization, Volt Typhoon/Salt Typhoon infrastructure access, technology transfer; (8) Trade Policy — US-China tariff escalation (Trump 2.0 145%), decoupling vs engagement debate, friend-shoring progress; (9) Foreign Investment — BRI project updates, Chinese FDI into critical resource nations, Western divestment pressures; (10) Risk Events — Taiwan strait tensions, export ban escalation, sanctions, commodity market manipulation. Emphasise non-obvious, high-consequence dependencies that cascade across industries if disrupted. Include investment and risk implications for each item.`;
+    reportTitle = "China Supply Chain Intelligence";
+    timeframe = "last 90 days with 30-day forward outlook";
+    timeframeDescriptor = "from the last 90 days, with forward-looking risk and opportunity analysis for the next 30 days";
+    sentimentVocab = "critical | escalating | opportunity | bullish | bearish | risk-off | stable | de-escalating";
   } else if (type === 'custom' && customTopic) {
     topicFocus = customTopic;
     reportTitle = "Custom Intelligence Brief";
@@ -234,7 +240,7 @@ OUTPUT RULES:
   try {
     console.log(`[generateWeeklyReport] Generating ${type} report...`);
 
-    const maxTokens = type === 'conspiracies' ? 12000 : type === 'custom' ? 14000 : 8000;
+    const maxTokens = type === 'conspiracies' ? 12000 : (type === 'custom' || type === 'china') ? 14000 : 8000;
     const aiResponse = await generateReportWithFallback(prompt, ["claude", "gpt"], maxTokens);
     console.log(`[generateWeeklyReport] Using provider: ${aiResponse.provider}`);
 
