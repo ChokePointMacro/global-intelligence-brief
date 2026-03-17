@@ -1927,6 +1927,12 @@ const Profile = ({ user, onLogout }: { user: UserData | null; onLogout: () => vo
   const [pwSaving, setPwSaving] = useState(false);
   const [pwMsg, setPwMsg] = useState<{ ok: boolean; text: string } | null>(null);
 
+  // Social connect
+  const [blueskyForm, setBlueskyForm] = useState({ identifier: '', appPassword: '' });
+  const [blueskyLoading, setBlueskyLoading] = useState(false);
+  const [blueskyMsg, setBlueskyMsg] = useState('');
+  const [connectingPlatform, setConnectingPlatform] = useState<string | null>(null);
+
   useEffect(() => {
     if (!user) return;
     setNameVal(user.displayName || '');
@@ -1943,6 +1949,44 @@ const Profile = ({ user, onLogout }: { user: UserData | null; onLogout: () => vo
       });
     }).finally(() => setLoading(false));
   }, [user]);
+
+  const connectOAuth = (platform: string, event: string) => {
+    setConnectingPlatform(platform);
+    apiFetch(`/api/auth/${platform}/url`).then(r => r.json()).then(data => {
+      if (!data.url) { alert(data.error || `Failed to get ${platform} auth URL`); setConnectingPlatform(null); return; }
+      const popup = window.open(data.url, `${platform}_auth`, 'width=600,height=700');
+      const handler = (e: MessageEvent) => {
+        if (e.data?.type === event) {
+          window.removeEventListener('message', handler);
+          popup?.close();
+          const platformKey = platform === 'x/connect' ? 'x' : platform.split('/')[0];
+          if (e.data.handle) setSocialAccounts(prev => [...prev.filter(a => a.platform !== platformKey), { platform: platformKey, handle: e.data.handle }]);
+          apiFetch('/api/social/accounts').then(r => r.json()).then(d => setSocialAccounts(d.accounts || []));
+          setConnectingPlatform(null);
+        }
+      };
+      window.addEventListener('message', handler);
+    }).catch(() => setConnectingPlatform(null));
+  };
+
+  const disconnectPlatform = async (platform: string) => {
+    if (!confirm(`Disconnect ${platform}?`)) return;
+    await apiFetch(`/api/social/${platform}`, { method: 'DELETE' });
+    setSocialAccounts(prev => prev.filter(a => a.platform !== platform));
+  };
+
+  const connectBluesky = async () => {
+    if (!blueskyForm.identifier || !blueskyForm.appPassword) return setBlueskyMsg("Enter handle and app password.");
+    setBlueskyLoading(true); setBlueskyMsg('');
+    const res = await apiFetch('/api/social/bluesky/connect', { method: 'POST', body: JSON.stringify(blueskyForm) });
+    const data = await res.json();
+    if (res.ok) {
+      setBlueskyMsg(`✓ Connected as ${data.handle}`);
+      setBlueskyForm({ identifier: '', appPassword: '' });
+      setSocialAccounts(prev => [...prev.filter(a => a.platform !== 'bluesky'), { platform: 'bluesky', handle: data.handle }]);
+    } else { setBlueskyMsg(`✗ ${data.error}`); }
+    setBlueskyLoading(false);
+  };
 
   const saveName = async () => {
     if (!nameVal.trim()) return;
@@ -2104,21 +2148,188 @@ const Profile = ({ user, onLogout }: { user: UserData | null; onLogout: () => vo
             <p className="text-[10px] font-mono uppercase tracking-widest text-white/40">Connected Networks</p>
           </div>
           <div className="space-y-2">
-            {PLATFORMS.map(({ id, label, Icon, color, border, bg }) => {
-              const acct = socialAccounts.find(a => a.platform === id);
+
+            {/* X */}
+            {(() => {
+              const acct = socialAccounts.find(a => a.platform === 'x');
+              const isXLogin = user.authMethod === 'x';
               return (
-                <div key={id} className={`flex items-center justify-between px-3 py-2 border ${acct ? border : 'border-white/5'} ${acct ? bg : 'bg-transparent'}`}>
-                  <div className="flex items-center gap-2">
-                    <Icon size={12} className={acct ? color : 'text-white/20'} />
-                    <span className={`text-[10px] font-mono ${acct ? 'text-white/70' : 'text-white/20'}`}>{label}</span>
+                <div className={`border p-3 transition-all ${acct || isXLogin ? 'border-sky-400/20 bg-sky-400/5' : 'border-white/5'}`}>
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <Twitter size={13} className={acct || isXLogin ? 'text-sky-400' : 'text-white/20'} />
+                      <span className={`text-[10px] font-mono ${acct || isXLogin ? 'text-white/70' : 'text-white/25'}`}>X / Twitter</span>
+                      {(acct || isXLogin) && <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />}
+                    </div>
+                    <div className="flex items-center gap-3">
+                      {isXLogin
+                        ? <span className="text-[9px] font-mono text-sky-400/70">Active via X login</span>
+                        : acct
+                          ? <>
+                              <span className="text-[9px] font-mono text-sky-400">{acct.handle}</span>
+                              <button onClick={() => disconnectPlatform('x')} className="text-[9px] font-mono text-red-400/60 hover:text-red-400 uppercase tracking-wider transition-colors">Disconnect</button>
+                            </>
+                          : <button
+                              onClick={() => connectOAuth('x/connect', 'OAUTH_X_CONNECT_SUCCESS')}
+                              disabled={connectingPlatform === 'x/connect'}
+                              className="flex items-center gap-1.5 px-2.5 py-1.5 border border-sky-400/30 bg-sky-400/5 text-sky-400 text-[9px] font-mono uppercase tracking-wider hover:bg-sky-400/10 transition-all disabled:opacity-40"
+                            >
+                              {connectingPlatform === 'x/connect' ? <Loader2 size={10} className="animate-spin" /> : <Twitter size={10} />} Connect
+                            </button>
+                      }
+                    </div>
                   </div>
-                  {acct
-                    ? <span className={`text-[9px] font-mono ${color}`}>{acct.handle}</span>
-                    : <span className="text-[9px] font-mono text-white/15 uppercase tracking-wider">Not connected</span>
-                  }
                 </div>
               );
-            })}
+            })()}
+
+            {/* Instagram */}
+            {(() => {
+              const acct = socialAccounts.find(a => a.platform === 'instagram');
+              return (
+                <div className={`border p-3 transition-all ${acct ? 'border-pink-400/20 bg-pink-400/5' : 'border-white/5'}`}>
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <Instagram size={13} className={acct ? 'text-pink-400' : 'text-white/20'} />
+                      <span className={`text-[10px] font-mono ${acct ? 'text-white/70' : 'text-white/25'}`}>Instagram</span>
+                      {acct && <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />}
+                    </div>
+                    <div className="flex items-center gap-3">
+                      {acct
+                        ? <>
+                            <span className="text-[9px] font-mono text-pink-400">{acct.handle}</span>
+                            <button onClick={() => disconnectPlatform('instagram')} className="text-[9px] font-mono text-red-400/60 hover:text-red-400 uppercase tracking-wider transition-colors">Disconnect</button>
+                          </>
+                        : <button
+                            onClick={() => connectOAuth('instagram', 'OAUTH_INSTAGRAM_SUCCESS')}
+                            disabled={connectingPlatform === 'instagram'}
+                            className="flex items-center gap-1.5 px-2.5 py-1.5 border border-pink-400/30 bg-pink-400/5 text-pink-400 text-[9px] font-mono uppercase tracking-wider hover:bg-pink-400/10 transition-all disabled:opacity-40"
+                          >
+                            {connectingPlatform === 'instagram' ? <Loader2 size={10} className="animate-spin" /> : <Instagram size={10} />} Connect
+                          </button>
+                      }
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* LinkedIn */}
+            {(() => {
+              const acct = socialAccounts.find(a => a.platform === 'linkedin');
+              return (
+                <div className={`border p-3 transition-all ${acct ? 'border-blue-400/20 bg-blue-400/5' : 'border-white/5'}`}>
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <Linkedin size={13} className={acct ? 'text-blue-400' : 'text-white/20'} />
+                      <span className={`text-[10px] font-mono ${acct ? 'text-white/70' : 'text-white/25'}`}>LinkedIn</span>
+                      {acct && <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />}
+                    </div>
+                    <div className="flex items-center gap-3">
+                      {acct
+                        ? <>
+                            <span className="text-[9px] font-mono text-blue-400">{acct.handle}</span>
+                            <button onClick={() => disconnectPlatform('linkedin')} className="text-[9px] font-mono text-red-400/60 hover:text-red-400 uppercase tracking-wider transition-colors">Disconnect</button>
+                          </>
+                        : <button
+                            onClick={() => connectOAuth('linkedin', 'OAUTH_LINKEDIN_SUCCESS')}
+                            disabled={connectingPlatform === 'linkedin'}
+                            className="flex items-center gap-1.5 px-2.5 py-1.5 border border-blue-400/30 bg-blue-400/5 text-blue-400 text-[9px] font-mono uppercase tracking-wider hover:bg-blue-400/10 transition-all disabled:opacity-40"
+                          >
+                            {connectingPlatform === 'linkedin' ? <Loader2 size={10} className="animate-spin" /> : <Linkedin size={10} />} Connect
+                          </button>
+                      }
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* Threads */}
+            {(() => {
+              const acct = socialAccounts.find(a => a.platform === 'threads');
+              return (
+                <div className={`border p-3 transition-all ${acct ? 'border-purple-400/20 bg-purple-400/5' : 'border-white/5'}`}>
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <AtSign size={13} className={acct ? 'text-purple-400' : 'text-white/20'} />
+                      <span className={`text-[10px] font-mono ${acct ? 'text-white/70' : 'text-white/25'}`}>Threads</span>
+                      {acct && <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />}
+                    </div>
+                    <div className="flex items-center gap-3">
+                      {acct
+                        ? <>
+                            <span className="text-[9px] font-mono text-purple-400">{acct.handle}</span>
+                            <button onClick={() => disconnectPlatform('threads')} className="text-[9px] font-mono text-red-400/60 hover:text-red-400 uppercase tracking-wider transition-colors">Disconnect</button>
+                          </>
+                        : <button
+                            onClick={() => connectOAuth('threads', 'OAUTH_THREADS_SUCCESS')}
+                            disabled={connectingPlatform === 'threads'}
+                            className="flex items-center gap-1.5 px-2.5 py-1.5 border border-purple-400/30 bg-purple-400/5 text-purple-400 text-[9px] font-mono uppercase tracking-wider hover:bg-purple-400/10 transition-all disabled:opacity-40"
+                          >
+                            {connectingPlatform === 'threads' ? <Loader2 size={10} className="animate-spin" /> : <AtSign size={10} />} Connect
+                          </button>
+                      }
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* Bluesky */}
+            {(() => {
+              const acct = socialAccounts.find(a => a.platform === 'bluesky');
+              return (
+                <div className={`border p-3 transition-all ${acct ? 'border-cyan-400/20 bg-cyan-400/5' : 'border-white/5'}`}>
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <MessageSquare size={13} className={acct ? 'text-cyan-400' : 'text-white/20'} />
+                      <span className={`text-[10px] font-mono ${acct ? 'text-white/70' : 'text-white/25'}`}>Bluesky</span>
+                      {acct && <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />}
+                    </div>
+                    <div className="flex items-center gap-3">
+                      {acct
+                        ? <>
+                            <span className="text-[9px] font-mono text-cyan-400">{acct.handle}</span>
+                            <button onClick={() => disconnectPlatform('bluesky')} className="text-[9px] font-mono text-red-400/60 hover:text-red-400 uppercase tracking-wider transition-colors">Disconnect</button>
+                          </>
+                        : <button
+                            onClick={() => setConnectingPlatform(prev => prev === 'bluesky' ? null : 'bluesky')}
+                            className="flex items-center gap-1.5 px-2.5 py-1.5 border border-cyan-400/30 bg-cyan-400/5 text-cyan-400 text-[9px] font-mono uppercase tracking-wider hover:bg-cyan-400/10 transition-all"
+                          >
+                            <MessageSquare size={10} /> Connect
+                          </button>
+                      }
+                    </div>
+                  </div>
+                  {/* Bluesky inline form */}
+                  {connectingPlatform === 'bluesky' && !acct && (
+                    <div className="mt-3 pt-3 border-t border-cyan-400/10 space-y-2">
+                      <input
+                        type="text" placeholder="handle (e.g. you.bsky.social)"
+                        value={blueskyForm.identifier}
+                        onChange={e => setBlueskyForm(f => ({ ...f, identifier: e.target.value }))}
+                        className="w-full bg-black/40 border border-white/10 text-white text-[11px] font-mono px-2.5 py-1.5 outline-none focus:border-cyan-400/40 placeholder:text-white/20"
+                      />
+                      <input
+                        type="password" placeholder="App Password (from bsky.app/settings)"
+                        value={blueskyForm.appPassword}
+                        onChange={e => setBlueskyForm(f => ({ ...f, appPassword: e.target.value }))}
+                        className="w-full bg-black/40 border border-white/10 text-white text-[11px] font-mono px-2.5 py-1.5 outline-none focus:border-cyan-400/40 placeholder:text-white/20"
+                      />
+                      {blueskyMsg && <p className={`text-[10px] font-mono ${blueskyMsg.startsWith('✓') ? 'text-green-400' : 'text-red-400'}`}>{blueskyMsg}</p>}
+                      <button
+                        onClick={connectBluesky} disabled={blueskyLoading}
+                        className="flex items-center gap-1.5 px-3 py-1.5 border border-cyan-400/30 bg-cyan-400/5 text-cyan-400 text-[9px] font-mono uppercase tracking-wider hover:bg-cyan-400/10 transition-all disabled:opacity-40"
+                      >
+                        {blueskyLoading ? <Loader2 size={10} className="animate-spin" /> : <Check size={10} />} Authenticate
+                      </button>
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+
           </div>
         </div>
       </div>
