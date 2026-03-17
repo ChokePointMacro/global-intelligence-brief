@@ -17,11 +17,11 @@ const MatrixBackground: React.FC = () => {
     const drops: number[] = new Array(columns).fill(0);
 
     const draw = () => {
-      ctx.fillStyle = 'rgba(10, 10, 10, 0.1)';
+      ctx.fillStyle = 'rgba(10, 10, 10, 0.15)';
       ctx.fillRect(0, 0, width, height);
 
       ctx.fillStyle = '#f7931a'; // Bitcoin Orange
-      ctx.font = '15px monospace';
+      ctx.font = '14px monospace';
 
       for (let i = 0; i < drops.length; i++) {
         const text = Math.random() > 0.5 ? '1' : '0';
@@ -59,8 +59,8 @@ const MatrixBackground: React.FC = () => {
   return (
     <canvas
       ref={canvasRef}
-      className="fixed inset-0 pointer-events-none opacity-10 z-0"
-      style={{ filter: 'blur(0.5px)' }}
+      className="fixed inset-0 pointer-events-none opacity-20 z-0"
+      style={{ filter: 'blur(0.3px)' }}
     />
   );
 };

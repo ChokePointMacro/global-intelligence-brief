@@ -1,6 +1,6 @@
 import OpenAI from "openai";
 import Anthropic from "@anthropic-ai/sdk";
-import { GoogleGenAI, Type } from "@google/genai";
+import { GoogleGenAI } from "@google/genai";
 
 export interface AIResponse {
   content: string;
@@ -34,7 +34,8 @@ function getAnthropic() {
  */
 export async function generateReportWithFallback(
   prompt: string,
-  providers: Array<"gemini" | "claude" | "gpt"> = ["gemini", "claude", "gpt"]
+  providers: Array<"gemini" | "claude" | "gpt"> = ["claude", "gemini", "gpt"],
+  maxTokens = 8000
 ): Promise<AIResponse> {
   const errors: Array<{ provider: string; error: string }> = [];
   const rateLimitErrors: string[] = [];
@@ -47,9 +48,9 @@ export async function generateReportWithFallback(
       if (provider === "gemini") {
         response = await generateWithGemini(prompt);
       } else if (provider === "claude") {
-        response = await generateWithClaude(prompt);
+        response = await generateWithClaude(prompt, maxTokens);
       } else if (provider === "gpt") {
-        response = await generateWithGPT(prompt);
+        response = await generateWithGPT(prompt, maxTokens);
       } else {
         continue;
       }
@@ -110,7 +111,7 @@ export async function generateReportWithFallback(
 async function generateWithGemini(prompt: string): Promise<AIResponse> {
   const ai = getGeminiAI();
   // Try available models in order of preference
-  const modelsToTry = ["gemini-pro", "gemini-1.5-pro", "gemini-2.0-flash"];
+  const modelsToTry = ["gemini-2.0-flash", "gemini-1.5-pro", "gemini-pro"];
   
   for (const model of modelsToTry) {
     try {
@@ -143,12 +144,12 @@ async function generateWithGemini(prompt: string): Promise<AIResponse> {
   throw new Error("No available Gemini models");
 }
 
-async function generateWithClaude(prompt: string): Promise<AIResponse> {
+async function generateWithClaude(prompt: string, maxTokens = 8000): Promise<AIResponse> {
   const client = getAnthropic();
 
   const response = await client.messages.create({
-    model: "claude-3-5-sonnet-20241022",
-    max_tokens: 4096,
+    model: "claude-sonnet-4-6",
+    max_tokens: maxTokens,
     messages: [
       {
         role: "user",
@@ -162,14 +163,19 @@ async function generateWithClaude(prompt: string): Promise<AIResponse> {
     response.content[0].type === "text" ? response.content[0].text : "";
   if (!content) throw new Error("Empty response from Claude");
 
+  if (response.stop_reason === "max_tokens") {
+    console.warn("[generateWithClaude] WARNING: Response truncated at max_tokens limit");
+    throw new Error("Claude response truncated — token limit reached. Response is incomplete.");
+  }
+
   return {
     content,
     provider: "claude",
-    model: "claude-3-5-sonnet-20241022",
+    model: "claude-sonnet-4-6",
   };
 }
 
-async function generateWithGPT(prompt: string): Promise<AIResponse> {
+async function generateWithGPT(prompt: string, maxTokens = 8000): Promise<AIResponse> {
   const client = getOpenAI();
 
   const response = await client.chat.completions.create({
@@ -185,7 +191,7 @@ async function generateWithGPT(prompt: string): Promise<AIResponse> {
         content: prompt + "\n\nRETURN ONLY JSON - NO MARKDOWN - NO CODE BLOCKS - START WITH { AND END WITH }",
       },
     ],
-    max_tokens: 16000, // GPT-4o max completion tokens is 16384
+    max_tokens: Math.min(maxTokens, 16000), // GPT-4o max completion tokens is 16384
   });
 
   const content = response.choices[0].message.content || "";

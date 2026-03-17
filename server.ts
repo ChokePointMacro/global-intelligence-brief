@@ -4,10 +4,12 @@ import session from "express-session";
 import cookieParser from "cookie-parser";
 import SQLiteStoreFactory from "connect-sqlite3";
 import { TwitterApi } from "twitter-api-v2";
+import nodemailer from "nodemailer";
+import bcrypt from "bcryptjs";
 import db from "./db.ts";
 import dotenv from "dotenv";
 import path from "path";
-import { generateWeeklyReport, generateInstagramCaption, type WeeklyReport } from "./src/services/geminiService.ts";
+import { generateWeeklyReport, generateInstagramCaption, generateSubstackArticle, generateForecastReport, type WeeklyReport } from "./src/services/geminiService.ts";
 
 import fs from "fs";
 
@@ -28,15 +30,12 @@ if (!fs.existsSync("./sessions")) {
 const SQLiteStore = (SQLiteStoreFactory as any)(session);
 
 app.set('trust proxy', 1);
-
 app.use(express.json());
 
 // Session ID header bypass for iframe cookie issues
 app.use((req, res, next) => {
   const headerSid = req.headers['x-session-id'];
   if (headerSid && typeof headerSid === 'string') {
-    // We can't easily change the session ID after it's been parsed by express-session
-    // but we can try to set it in the cookie header so express-session finds it
     if (!req.headers.cookie || !req.headers.cookie.includes('gib.sid')) {
       req.headers.cookie = `gib.sid=${headerSid}; ${req.headers.cookie || ''}`;
     }
@@ -45,7 +44,6 @@ app.use((req, res, next) => {
 });
 
 app.get("/api/health", (req, res) => {
-  console.log("Health check requested");
   res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
 
@@ -59,8 +57,8 @@ app.use(
     proxy: true,
     name: 'gib.sid',
     cookie: {
-      secure: true,
-      sameSite: "none",
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: process.env.NODE_ENV === 'production' ? "none" : "lax",
       httpOnly: true,
       maxAge: 1000 * 60 * 60 * 24 * 7,
     },
@@ -72,110 +70,85 @@ app.use((req, res, next) => {
   next();
 });
 
+// ─── X (Twitter) client ───────────────────────────────────────────────────────
+
 const xClient = new TwitterApi({
   clientId: process.env.X_CLIENT_ID || "",
   clientSecret: process.env.X_CLIENT_SECRET || "",
 });
 
-const hasValidXCredentials = process.env.X_CLIENT_ID && 
-  process.env.X_CLIENT_SECRET && 
+const hasValidXCredentials = process.env.X_CLIENT_ID &&
+  process.env.X_CLIENT_SECRET &&
   !process.env.X_CLIENT_ID.includes("dummy") &&
   !process.env.X_CLIENT_SECRET.includes("dummy");
 
 if (!hasValidXCredentials) {
-  console.error("❌ CRITICAL: X_CLIENT_ID or X_CLIENT_SECRET is missing or using dummy values in .env");
-  console.error("   To enable X posting, add your OAuth credentials to the .env file:");
-  console.error("   X_CLIENT_ID=your_client_id");
-  console.error("   X_CLIENT_SECRET=your_client_secret");
-  console.error("   Get these from: https://developer.x.com/en/portal/dashboard");
+  console.error("❌ X_CLIENT_ID or X_CLIENT_SECRET missing or using dummy values.");
 }
 
-// Auth Routes
-const getRedirectUri = (req: express.Request) => {
+// ─── Auth helpers ──────────────────────────────────────────────────────────────
+
+const getRedirectUri = (req: express.Request, platform = 'x') => {
   if (process.env.APP_URL) {
-    return `${process.env.APP_URL}/auth/x/callback`;
+    return `${process.env.APP_URL}/auth/${platform}/callback`;
   }
   const protocol = req.headers['x-forwarded-proto'] || 'https';
   const host = req.headers.host;
-  const baseUrl = `${protocol}://${host}`;
-  return `${baseUrl}/auth/x/callback`;
+  return `${protocol}://${host}/auth/${platform}/callback`;
 };
 
+// ─── X Auth Routes ─────────────────────────────────────────────────────────────
+
 app.get("/api/auth/x/url", (req, res) => {
-  // Validate X credentials before attempting auth
   if (!hasValidXCredentials) {
-    return res.status(500).json({ 
-      error: "X OAuth credentials not configured",
-      details: "Server admin needs to set valid X_CLIENT_ID and X_CLIENT_SECRET in .env file"
-    });
+    return res.status(500).json({ error: "X OAuth credentials not configured" });
   }
-  
-  console.log("Generating auth URL. Host:", req.headers.host);
-  
   try {
-    const redirectUri = getRedirectUri(req);
-    console.log("Generating auth URL with redirectUri:", redirectUri);
+    const redirectUri = getRedirectUri(req, 'x');
     const { url, codeVerifier, state } = xClient.generateOAuth2AuthLink(
       redirectUri,
       { scope: ["tweet.read", "tweet.write", "users.read", "offline.access"] }
     );
     (req.session as any).codeVerifier = codeVerifier;
     (req.session as any).state = state;
-    db.prepare("INSERT OR REPLACE INTO pending_auth (state, code_verifier) VALUES (?, ?)").run(state, codeVerifier);
-    
+    db.prepare("INSERT OR REPLACE INTO pending_auth (state, code_verifier, platform) VALUES (?, ?, 'x')").run(state, codeVerifier);
     req.session.save((err) => {
       if (err) console.error("Session save error in /url:", err);
-      console.log("Auth URL generated and session saved. Session ID:", req.sessionID);
       res.json({ url });
     });
   } catch (error) {
-    console.error("Failed to generate auth link:", error);
-    res.status(500).json({ 
-      error: "Failed to generate auth link",
-      details: error instanceof Error ? error.message : String(error)
-    });
+    res.status(500).json({ error: "Failed to generate auth link", details: error instanceof Error ? error.message : String(error) });
   }
 });
 
 app.get("/auth/x/callback", async (req, res) => {
-  console.log("X callback received. Host:", req.headers.host);
   const { state, code } = req.query;
   let codeVerifier: string | undefined;
-  
+
   if (state) {
-    const pending = db.prepare("SELECT code_verifier FROM pending_auth WHERE state = ?").get(state) as any;
+    const pending = db.prepare("SELECT code_verifier FROM pending_auth WHERE state = ? AND platform = 'x'").get(state) as any;
     if (pending) {
       codeVerifier = pending.code_verifier;
-      console.log("Found codeVerifier in DB for state:", state);
       db.prepare("DELETE FROM pending_auth WHERE state = ?").run(state);
     }
   }
 
-  if (!codeVerifier) {
-    codeVerifier = (req.session as any).codeVerifier;
-    console.log("Checking session for codeVerifier:", codeVerifier ? "Found" : "Not found");
-  }
-
+  if (!codeVerifier) codeVerifier = (req.session as any).codeVerifier;
   if (!codeVerifier || !code) {
-    console.error("Missing codeVerifier or code. codeVerifier:", codeVerifier, "code:", code);
     return res.status(400).send("Invalid session - please try connecting again.");
   }
 
   try {
-    const redirectUri = getRedirectUri(req);
-    console.log("Exchanging code for tokens with redirectUri:", redirectUri);
+    const redirectUri = getRedirectUri(req, 'x');
     const { client: loggedClient, accessToken, refreshToken, expiresIn } = await xClient.loginWithOAuth2({
       code: code as string,
       codeVerifier,
       redirectUri,
     });
-    console.log("Token exchange successful. Access token received.");
 
-    console.log("Fetching user data from X...");
     const { data: userObject } = await loggedClient.v2.me({
       "user.fields": ["profile_image_url", "username", "name"],
     });
-    console.log("User data fetched successfully:", userObject.username, "(ID:", userObject.id, ")");
 
     const expiresAt = Date.now() + (expiresIn || 0) * 1000;
     db.prepare(`
@@ -191,48 +164,384 @@ app.get("/auth/x/callback", async (req, res) => {
     `).run(userObject.id, userObject.username, userObject.name, userObject.profile_image_url || "", accessToken, refreshToken || "", expiresAt);
 
     (req.session as any).userId = userObject.id;
-    console.log("Session userId set:", userObject.id, "Session ID:", req.sessionID);
 
     req.session.save((err) => {
       if (err) console.error("Session save error:", err);
-      console.log("Session saved. Sending success response. SID:", req.sessionID);
       res.send(`
-        <html>
-          <body>
-            <script>
-              console.log("Auth success. Sending message to opener...");
-              if (window.opener) {
-                window.opener.postMessage({ type: 'OAUTH_AUTH_SUCCESS', sessionId: '${req.sessionID}' }, '*');
-                window.close();
-              } else {
-                window.location.href = '/';
-              }
-            </script>
-          </body>
-        </html>
+        <html><body><script>
+          if (window.opener) {
+            window.opener.postMessage({ type: 'OAUTH_AUTH_SUCCESS', sessionId: '${req.sessionID}' }, '*');
+            window.close();
+          } else { window.location.href = '/'; }
+        </script></body></html>
       `);
     });
   } catch (error) {
-    console.error("Auth failed during token exchange/user fetch:", error);
+    console.error("X auth failed:", error);
     res.status(500).send("Auth failed");
   }
 });
 
 app.get("/api/auth/me", (req, res) => {
-  console.log("Session ID in /api/auth/me:", req.sessionID);
   const userId = (req.session as any).userId;
-  console.log("UserId in session:", userId);
   if (!userId) return res.status(401).json({ error: "Not authenticated", sessionId: req.sessionID });
-  const user = db.prepare("SELECT * FROM users WHERE x_id = ?").get(userId) as any;
+  // userId is either an x_id (X OAuth) or email (email/password)
+  const user = db.prepare("SELECT * FROM users WHERE x_id = ? OR email = ?").get(userId, userId) as any;
   if (!user) return res.status(401).json({ error: "User not found", sessionId: req.sessionID });
-  res.json({ id: user.x_id, username: user.username, displayName: user.display_name, profileImage: user.profile_image, sessionId: req.sessionID });
+  res.json({
+    id: user.x_id || user.email,
+    username: user.username || user.email,
+    displayName: user.display_name,
+    profileImage: user.profile_image || null,
+    authMethod: user.x_id ? 'x' : 'email',
+    sessionId: req.sessionID,
+  });
+});
+
+// ─── Email / Password Auth ──────────────────────────────────────────────────
+
+app.post("/api/auth/register", async (req, res) => {
+  const { email, password, displayName } = req.body;
+  if (!email || !password) return res.status(400).json({ error: "Email and password required" });
+  if (password.length < 8) return res.status(400).json({ error: "Password must be at least 8 characters" });
+
+  const existing = db.prepare("SELECT id FROM users WHERE email = ?").get(email) as any;
+  if (existing) return res.status(409).json({ error: "An account with this email already exists" });
+
+  try {
+    const passwordHash = await bcrypt.hash(password, 12);
+    const result = db.prepare(`
+      INSERT INTO users (email, password_hash, username, display_name)
+      VALUES (?, ?, ?, ?)
+    `).run(email, passwordHash, email.split('@')[0], displayName || email.split('@')[0]);
+
+    (req.session as any).userId = email;
+    req.session.save((err) => {
+      if (err) console.error("Session save error:", err);
+      res.json({ success: true, id: result.lastInsertRowid, sessionId: req.sessionID });
+    });
+  } catch (error) {
+    console.error("[register] Error:", error);
+    res.status(500).json({ error: "Registration failed" });
+  }
+});
+
+app.post("/api/auth/login", async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: "Email and password required" });
+
+  const user = db.prepare("SELECT * FROM users WHERE email = ?").get(email) as any;
+  if (!user || !user.password_hash) return res.status(401).json({ error: "Invalid email or password" });
+
+  const valid = await bcrypt.compare(password, user.password_hash);
+  if (!valid) return res.status(401).json({ error: "Invalid email or password" });
+
+  (req.session as any).userId = email;
+  req.session.save((err) => {
+    if (err) console.error("Session save error:", err);
+    res.json({ success: true, displayName: user.display_name, sessionId: req.sessionID });
+  });
 });
 
 app.post("/api/auth/logout", (req, res) => {
   req.session.destroy(() => res.json({ success: true }));
 });
 
-// List available Gemini models (for debugging)
+// ─── LinkedIn OAuth ────────────────────────────────────────────────────────────
+
+app.get("/api/auth/linkedin/url", (req, res) => {
+  const clientId = process.env.LINKEDIN_CLIENT_ID;
+  if (!clientId) return res.status(503).json({ error: "LinkedIn not configured. Add LINKEDIN_CLIENT_ID to .env" });
+
+  const state = Math.random().toString(36).substring(2);
+  const redirectUri = getRedirectUri(req, 'linkedin');
+  db.prepare("INSERT OR REPLACE INTO pending_auth (state, code_verifier, platform) VALUES (?, '', 'linkedin')").run(state);
+
+  const url = `https://www.linkedin.com/oauth/v2/authorization?response_type=code&client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=openid%20profile%20w_member_social&state=${state}`;
+  res.json({ url });
+});
+
+app.get("/auth/linkedin/callback", async (req, res) => {
+  const { code, state } = req.query;
+  const userId = (req.session as any).userId;
+
+  if (!code || !state) return res.status(400).send("Missing code or state");
+
+  const pending = db.prepare("SELECT state FROM pending_auth WHERE state = ? AND platform = 'linkedin'").get(state) as any;
+  if (!pending) return res.status(400).send("Invalid state");
+  db.prepare("DELETE FROM pending_auth WHERE state = ?").run(state);
+
+  try {
+    const redirectUri = getRedirectUri(req, 'linkedin');
+    const tokenRes = await fetch("https://www.linkedin.com/oauth/v2/accessToken", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code: code as string,
+        redirect_uri: redirectUri,
+        client_id: process.env.LINKEDIN_CLIENT_ID!,
+        client_secret: process.env.LINKEDIN_CLIENT_SECRET!,
+      }),
+    });
+    const tokenData = await tokenRes.json() as any;
+    if (!tokenData.access_token) throw new Error("No access token returned");
+
+    // Get user info
+    const userRes = await fetch("https://api.linkedin.com/v2/userinfo", {
+      headers: { Authorization: `Bearer ${tokenData.access_token}` },
+    });
+    const userInfo = await userRes.json() as any;
+
+    db.prepare(`
+      INSERT INTO platform_tokens (user_id, platform, access_token, handle, person_urn, expires_at)
+      VALUES (?, 'linkedin', ?, ?, ?, ?)
+      ON CONFLICT(user_id, platform) DO UPDATE SET
+        access_token = excluded.access_token,
+        handle = excluded.handle,
+        person_urn = excluded.person_urn,
+        expires_at = excluded.expires_at,
+        updated_at = CURRENT_TIMESTAMP
+    `).run(userId || 'anonymous', tokenData.access_token, userInfo.name || '', userInfo.sub || '', Date.now() + (tokenData.expires_in || 3600) * 1000);
+
+    res.send(`<html><body><script>
+      if (window.opener) { window.opener.postMessage({ type: 'OAUTH_LINKEDIN_SUCCESS' }, '*'); window.close(); }
+      else { window.location.href = '/settings'; }
+    </script></body></html>`);
+  } catch (error) {
+    console.error("LinkedIn auth failed:", error);
+    res.status(500).send("LinkedIn auth failed");
+  }
+});
+
+// ─── Threads OAuth ─────────────────────────────────────────────────────────────
+
+app.get("/api/auth/threads/url", (req, res) => {
+  const appId = process.env.THREADS_APP_ID;
+  if (!appId) return res.status(503).json({ error: "Threads not configured. Add THREADS_APP_ID to .env" });
+
+  const state = Math.random().toString(36).substring(2);
+  const redirectUri = getRedirectUri(req, 'threads');
+  db.prepare("INSERT OR REPLACE INTO pending_auth (state, code_verifier, platform) VALUES (?, '', 'threads')").run(state);
+
+  const url = `https://www.threads.net/oauth/authorize?client_id=${appId}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=threads_basic,threads_content_publish&response_type=code&state=${state}`;
+  res.json({ url });
+});
+
+app.get("/auth/threads/callback", async (req, res) => {
+  const { code, state } = req.query;
+  const userId = (req.session as any).userId;
+
+  if (!code || !state) return res.status(400).send("Missing code or state");
+
+  const pending = db.prepare("SELECT state FROM pending_auth WHERE state = ? AND platform = 'threads'").get(state) as any;
+  if (!pending) return res.status(400).send("Invalid state");
+  db.prepare("DELETE FROM pending_auth WHERE state = ?").run(state);
+
+  try {
+    const redirectUri = getRedirectUri(req, 'threads');
+    const tokenRes = await fetch("https://graph.threads.net/oauth/access_token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id: process.env.THREADS_APP_ID!,
+        client_secret: process.env.THREADS_APP_SECRET!,
+        grant_type: "authorization_code",
+        redirect_uri: redirectUri,
+        code: code as string,
+      }),
+    });
+    const tokenData = await tokenRes.json() as any;
+    if (!tokenData.access_token) throw new Error("No access token");
+
+    // Get user ID
+    const userRes = await fetch(`https://graph.threads.net/v1.0/me?fields=id,username&access_token=${tokenData.access_token}`);
+    const userInfo = await userRes.json() as any;
+
+    db.prepare(`
+      INSERT INTO platform_tokens (user_id, platform, access_token, handle, person_urn)
+      VALUES (?, 'threads', ?, ?, ?)
+      ON CONFLICT(user_id, platform) DO UPDATE SET
+        access_token = excluded.access_token,
+        handle = excluded.handle,
+        person_urn = excluded.person_urn,
+        updated_at = CURRENT_TIMESTAMP
+    `).run(userId || 'anonymous', tokenData.access_token, userInfo.username || '', userInfo.id || '');
+
+    res.send(`<html><body><script>
+      if (window.opener) { window.opener.postMessage({ type: 'OAUTH_THREADS_SUCCESS' }, '*'); window.close(); }
+      else { window.location.href = '/settings'; }
+    </script></body></html>`);
+  } catch (error) {
+    console.error("Threads auth failed:", error);
+    res.status(500).send("Threads auth failed");
+  }
+});
+
+// ─── Social accounts ───────────────────────────────────────────────────────────
+
+app.get("/api/social/accounts", (req, res) => {
+  const userId = (req.session as any).userId;
+  if (!userId) return res.json({ accounts: [] });
+  const accounts = db.prepare("SELECT platform, handle FROM platform_tokens WHERE user_id = ?").all(userId) as any[];
+  res.json({ accounts });
+});
+
+app.delete("/api/social/:platform", (req, res) => {
+  const userId = (req.session as any).userId;
+  if (!userId) return res.status(401).json({ error: "Not authenticated" });
+  db.prepare("DELETE FROM platform_tokens WHERE user_id = ? AND platform = ?").run(userId, req.params.platform);
+  res.json({ success: true });
+});
+
+// Bluesky — app password connect (no OAuth needed)
+app.post("/api/social/bluesky/connect", async (req, res) => {
+  const { identifier, appPassword } = req.body;
+  const userId = (req.session as any).userId;
+  if (!userId) return res.status(401).json({ error: "Not authenticated" });
+  if (!identifier || !appPassword) return res.status(400).json({ error: "identifier and appPassword required" });
+
+  try {
+    // Verify credentials by creating a session
+    const sessionRes = await fetch("https://bsky.social/xrpc/com.atproto.server.createSession", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ identifier, password: appPassword }),
+    });
+    const sessionData = await sessionRes.json() as any;
+    if (!sessionRes.ok) throw new Error(sessionData.message || "Invalid credentials");
+
+    // Store identifier + appPassword (app passwords are designed for this use case)
+    db.prepare(`
+      INSERT INTO platform_tokens (user_id, platform, access_token, handle, person_urn)
+      VALUES (?, 'bluesky', ?, ?, ?)
+      ON CONFLICT(user_id, platform) DO UPDATE SET
+        access_token = excluded.access_token,
+        handle = excluded.handle,
+        person_urn = excluded.person_urn,
+        updated_at = CURRENT_TIMESTAMP
+    `).run(userId, appPassword, identifier, sessionData.did || '');
+
+    res.json({ success: true, handle: identifier });
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : "Bluesky connection failed" });
+  }
+});
+
+// ─── Multi-platform post endpoint ─────────────────────────────────────────────
+
+app.post("/api/social/post", async (req, res) => {
+  const userId = (req.session as any).userId;
+  const { text, platforms } = req.body as { text: string; platforms: string[] };
+
+  if (!userId) return res.status(401).json({ error: "Not authenticated" });
+  if (!text) return res.status(400).json({ error: "text required" });
+  if (!platforms || platforms.length === 0) return res.status(400).json({ error: "at least one platform required" });
+
+  const results: Record<string, { success: boolean; error?: string; id?: string }> = {};
+
+  // Post to Bluesky
+  if (platforms.includes('bluesky')) {
+    try {
+      const token = db.prepare("SELECT * FROM platform_tokens WHERE user_id = ? AND platform = 'bluesky'").get(userId) as any;
+      if (!token) throw new Error("Bluesky not connected");
+
+      const sessionRes = await fetch("https://bsky.social/xrpc/com.atproto.server.createSession", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ identifier: token.handle, password: token.access_token }),
+      });
+      const session = await sessionRes.json() as any;
+      if (!sessionRes.ok) throw new Error(session.message || "Bluesky auth failed");
+
+      const postRes = await fetch("https://bsky.social/xrpc/com.atproto.repo.createRecord", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.accessJwt}` },
+        body: JSON.stringify({
+          repo: session.did,
+          collection: "app.bsky.feed.post",
+          record: { $type: "app.bsky.feed.post", text: text.substring(0, 300), createdAt: new Date().toISOString() },
+        }),
+      });
+      const postData = await postRes.json() as any;
+      if (!postRes.ok) throw new Error(postData.message || "Bluesky post failed");
+      results.bluesky = { success: true, id: postData.uri };
+    } catch (err) {
+      results.bluesky = { success: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  // Post to LinkedIn
+  if (platforms.includes('linkedin')) {
+    try {
+      const token = db.prepare("SELECT * FROM platform_tokens WHERE user_id = ? AND platform = 'linkedin'").get(userId) as any;
+      if (!token) throw new Error("LinkedIn not connected");
+
+      const postRes = await fetch("https://api.linkedin.com/rest/posts", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token.access_token}`,
+          "Content-Type": "application/json",
+          "LinkedIn-Version": "202401",
+          "X-Restli-Protocol-Version": "2.0.0",
+        },
+        body: JSON.stringify({
+          author: `urn:li:person:${token.person_urn}`,
+          lifecycleState: "PUBLISHED",
+          specificContent: {
+            "com.linkedin.ugc.ShareContent": {
+              shareCommentary: { text },
+              shareMediaCategory: "NONE",
+            },
+          },
+          visibility: { "com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC" },
+        }),
+      });
+      if (!postRes.ok) {
+        const errData = await postRes.json() as any;
+        throw new Error(errData.message || `LinkedIn post failed (${postRes.status})`);
+      }
+      results.linkedin = { success: true };
+    } catch (err) {
+      results.linkedin = { success: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  // Post to Threads
+  if (platforms.includes('threads')) {
+    try {
+      const token = db.prepare("SELECT * FROM platform_tokens WHERE user_id = ? AND platform = 'threads'").get(userId) as any;
+      if (!token) throw new Error("Threads not connected");
+
+      // Step 1: Create container
+      const containerRes = await fetch(`https://graph.threads.net/v1.0/${token.person_urn}/threads`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ media_type: "TEXT", text: text.substring(0, 500), access_token: token.access_token }),
+      });
+      const container = await containerRes.json() as any;
+      if (!container.id) throw new Error("Failed to create Threads container");
+
+      // Step 2: Publish
+      await new Promise(resolve => setTimeout(resolve, 1000)); // brief pause before publish
+      const publishRes = await fetch(`https://graph.threads.net/v1.0/${token.person_urn}/threads_publish`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ creation_id: container.id, access_token: token.access_token }),
+      });
+      const publishData = await publishRes.json() as any;
+      if (!publishRes.ok) throw new Error(publishData.error?.message || "Threads publish failed");
+      results.threads = { success: true, id: publishData.id };
+    } catch (err) {
+      results.threads = { success: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  res.json({ results });
+});
+
+// ─── Report Generation ─────────────────────────────────────────────────────────
+
 app.get("/api/debug/models", async (req, res) => {
   try {
     const { GoogleGenAI } = await import("@google/genai");
@@ -245,135 +554,215 @@ app.get("/api/debug/models", async (req, res) => {
   }
 });
 
-// Report Generation Endpoint
 app.post("/api/generate-report", async (req, res) => {
   try {
-    const { type } = req.body;
-    
-    if (!type || !['global', 'crypto', 'equities', 'conspiracies'].includes(type)) {
+    const { type, customTopic } = req.body;
+
+    if (!type || !['global', 'crypto', 'equities', 'nasdaq', 'conspiracies', 'custom', 'forecast'].includes(type)) {
       return res.status(400).json({ error: "Invalid report type" });
     }
-    
+    if (type === 'custom' && !customTopic?.trim()) {
+      return res.status(400).json({ error: "Custom topic text is required" });
+    }
+
     console.log(`[API] Generating ${type} report...`);
-    const report = await generateWeeklyReport(type);
-    
-    if (!report || !report.headlines || report.headlines.length === 0) {
+
+    if (type === 'forecast') {
+      const forecast = await generateForecastReport();
+      if (!forecast?.events?.length) return res.status(500).json({ error: "Failed to generate forecast: no events returned" });
+      console.log(`[API] Successfully generated forecast with ${forecast.events.length} events`);
+      return res.json(forecast);
+    }
+
+    const report = await generateWeeklyReport(type, customTopic);
+
+    if (!report?.headlines?.length) {
       return res.status(500).json({ error: "Failed to generate report: no headlines returned" });
     }
-    
+
     console.log(`[API] Successfully generated ${type} report with ${report.headlines.length} headlines`);
     res.json(report);
   } catch (error) {
     console.error("[API] Report generation error:", error);
     const message = error instanceof Error ? error.message : String(error);
-    
-    // Parse error message for specific issues
+
     let errorType = "UNKNOWN";
     let userMessage = message;
     let statusCode = 500;
-    
-    // Check for rate limit errors
-    if (
-      message.includes("rate limit") ||
-      message.includes("Rate limit") ||
-      message.includes("429") ||
-      message.includes("quota") ||
-      message.includes("Quota exceeded")
-    ) {
-      errorType = "RATE_LIMIT";
-      statusCode = 429;
+
+    if (message.includes("rate limit") || message.includes("Rate limit") || message.includes("429") || message.includes("quota")) {
+      errorType = "RATE_LIMIT"; statusCode = 429;
       userMessage = "Rate limit reached. Please upgrade your API plan or wait before retrying.";
+    } else if (message.includes("invalid_api_key") || message.includes("API key") || message.includes("unauthorized") || message.includes("UNAUTHENTICATED")) {
+      errorType = "AUTH_ERROR"; statusCode = 401;
+      userMessage = "API authentication failed. Please check your API keys.";
+    } else if (message.includes("JSON") || message.includes("parse")) {
+      errorType = "PARSING_ERROR"; statusCode = 500;
+      userMessage = "The AI returned invalid data format. This is usually temporary - please retry.";
+    } else if (message.includes("All AI providers failed")) {
+      errorType = "ALL_PROVIDERS_FAILED"; statusCode = 503;
+      userMessage = "All AI providers are currently unavailable. Please try again.";
     }
-    // Check for authentication/API key errors
-    else if (
-      message.includes("invalid_api_key") ||
-      message.includes("API key") ||
-      message.includes("unauthorized") ||
-      message.includes("Unauthorized") ||
-      message.includes("UNAUTHENTICATED") ||
-      message.includes("authentication")
-    ) {
-      errorType = "AUTH_ERROR";
-      statusCode = 401;
-      userMessage = "API authentication failed. Please check your API keys are configured correctly.";
-    }
-    // Check for JSON parsing issues
-    else if (
-      message.includes("JSON") ||
-      message.includes("parse") ||
-      message.includes("Invalid")
-    ) {
-      errorType = "PARSING_ERROR";
-      statusCode = 500;
-      userMessage = "The AI provider returned invalid data format. This is usually temporary - please retry.";
-    }
-    // Check if all providers failed
-    else if (message.includes("All AI providers failed")) {
-      errorType = "ALL_PROVIDERS_FAILED";
-      statusCode = 503;
-      userMessage = "All AI providers are currently unavailable. Please try again in a moment.";
-    }
-    
-    res.status(statusCode).json({ 
-      error: userMessage,
-      type: errorType,
-      details: message.substring(0, 200) // Include technical details for debugging
-    });
+
+    res.status(statusCode).json({ error: userMessage, type: errorType, details: message.substring(0, 200) });
   }
 });
 
-// Instagram Caption Endpoint
+// ─── Instagram Caption ────────────────────────────────────────────────────────
+
 app.post("/api/instagram-caption", async (req, res) => {
   try {
     const { reportId } = req.body;
-    
-    // Get report from database or memory
-    const reports = db.prepare("SELECT * FROM reports WHERE id = ?").get(reportId) as any;
-    if (!reports) {
-      return res.status(404).json({ error: "Report not found" });
-    }
-    
-    const report = JSON.parse(reports.content);
-    console.log(`[API] Generating Instagram caption for ${reportId}...`);
+    const reportRow = db.prepare("SELECT * FROM reports WHERE id = ?").get(reportId) as any;
+    if (!reportRow) return res.status(404).json({ error: "Report not found" });
+
+    const report = JSON.parse(reportRow.content);
     const caption = await generateInstagramCaption(report);
-    
-    console.log(`[API] Successfully generated Instagram caption`);
     res.json({ caption });
   } catch (error) {
-    console.error("[API] Instagram caption error:", error);
     const message = error instanceof Error ? error.message : String(error);
-    
-    // Check for rate limit errors and return appropriate status code
-    if (
-      message.includes("rate limit") ||
-      message.includes("Rate limit") ||
-      message.includes("429") ||
-      message.includes("quota") ||
-      message.includes("Quota")
-    ) {
-      return res.status(429).json({ 
-        error: `Rate limit error: ${message}`,
-        type: "RATE_LIMIT"
-      });
+    if (message.includes("rate limit") || message.includes("429") || message.includes("quota")) {
+      return res.status(429).json({ error: `Rate limit error: ${message}`, type: "RATE_LIMIT" });
     }
-    
     res.status(500).json({ error: `Failed to generate caption: ${message}` });
   }
 });
 
-// Report Routes
+// ─── Audio Brief ───────────────────────────────────────────────────────────────
+
+app.post("/api/audio-brief", async (req, res) => {
+  const { reportId } = req.body;
+  const reportRow = db.prepare("SELECT * FROM reports WHERE id = ?").get(reportId) as any;
+  if (!reportRow) return res.status(404).json({ error: "Report not found" });
+
+  try {
+    const report = JSON.parse(reportRow.content) as WeeklyReport;
+
+    // Build spoken text: summary + top 5 headlines
+    const headlineIntros = report.headlines.slice(0, 5).map((h, i) =>
+      `Story ${i + 1}: ${h.title}.`
+    ).join(' ');
+    const text = `Today's Intelligence Brief. ${report.analysis.overallSummary} Here are the top stories. ${headlineIntros}`.substring(0, 4096);
+
+    const OpenAI = (await import('openai')).default;
+    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY || "" });
+
+    const mp3Response = await openai.audio.speech.create({
+      model: "tts-1",
+      voice: "onyx",
+      input: text,
+    });
+
+    const buffer = Buffer.from(await mp3Response.arrayBuffer());
+    res.set('Content-Type', 'audio/mpeg');
+    res.set('Content-Disposition', `attachment; filename="brief-${reportId}.mp3"`);
+    res.send(buffer);
+  } catch (error) {
+    console.error("[API] Audio brief error:", error);
+    res.status(500).json({ error: "Failed to generate audio brief" });
+  }
+});
+
+// ─── Email Digest ──────────────────────────────────────────────────────────────
+
+app.post("/api/email-digest", async (req, res) => {
+  const { reportId, to } = req.body;
+  if (!to) return res.status(400).json({ error: "Recipient email (to) required" });
+
+  const reportRow = db.prepare("SELECT * FROM reports WHERE id = ?").get(reportId) as any;
+  if (!reportRow) return res.status(404).json({ error: "Report not found" });
+
+  if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
+    return res.status(503).json({ error: "Email not configured. Add SMTP_HOST, SMTP_USER, SMTP_PASS to .env" });
+  }
+
+  try {
+    const report = JSON.parse(reportRow.content) as WeeklyReport;
+
+    const transporter = nodemailer.createTransport({
+      host: process.env.SMTP_HOST,
+      port: parseInt(process.env.SMTP_PORT || "587"),
+      secure: process.env.SMTP_PORT === "465",
+      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+    });
+
+    const headlinesHtml = report.headlines.map((h, i) => `
+      <tr style="border-bottom:1px solid #1a1a1a;">
+        <td style="padding:12px 8px;color:#f7931a;font-family:monospace;width:24px;">${String(i + 1).padStart(2, '0')}</td>
+        <td style="padding:12px 8px;">
+          <p style="margin:0 0 4px;color:#ffffff;font-weight:600;">${h.title}</p>
+          <span style="font-size:11px;color:#888;font-family:monospace;text-transform:uppercase;">${h.category}</span>
+          ${h.sentiment ? `<span style="margin-left:8px;font-size:10px;color:#f7931a;font-family:monospace;">${h.sentiment}</span>` : ''}
+        </td>
+      </tr>`).join('');
+
+    const html = `
+      <div style="background:#0a0a0a;color:#e5e5e5;font-family:sans-serif;max-width:700px;margin:0 auto;padding:32px;">
+        <div style="border-bottom:1px solid rgba(247,147,26,0.3);padding-bottom:24px;margin-bottom:24px;">
+          <p style="color:#f7931a;font-family:monospace;font-size:11px;text-transform:uppercase;letter-spacing:0.3em;margin:0 0 8px;">Global Intelligence Brief</p>
+          <h1 style="color:#ffffff;font-size:36px;font-style:italic;margin:0;">The Pulse.</h1>
+          <p style="color:#888;font-size:12px;margin:8px 0 0;">${new Date().toLocaleDateString('en-US', { weekday:'long',year:'numeric',month:'long',day:'numeric' })}</p>
+        </div>
+        <div style="background:rgba(247,147,26,0.05);border:1px solid rgba(247,147,26,0.2);padding:20px;margin-bottom:24px;">
+          <p style="color:#f7931a;font-family:monospace;font-size:10px;text-transform:uppercase;letter-spacing:0.2em;margin:0 0 12px;">Strategic Summary</p>
+          <p style="color:#d1d5db;line-height:1.6;margin:0;">${report.analysis.overallSummary.substring(0, 600)}...</p>
+        </div>
+        <table style="width:100%;border-collapse:collapse;">
+          ${headlinesHtml}
+        </table>
+        <div style="margin-top:32px;padding-top:16px;border-top:1px solid rgba(247,147,26,0.1);text-align:center;">
+          <p style="color:#444;font-family:monospace;font-size:10px;text-transform:uppercase;margin:0;">Global Pulse · Intelligence Brief</p>
+        </div>
+      </div>`;
+
+    const info = await transporter.sendMail({
+      from: process.env.SMTP_FROM || process.env.SMTP_USER,
+      to,
+      subject: `Intelligence Brief — ${new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}`,
+      html,
+    });
+
+    res.json({ success: true, messageId: info.messageId });
+  } catch (error) {
+    console.error("[API] Email digest error:", error);
+    res.status(500).json({ error: "Failed to send email: " + (error instanceof Error ? error.message : String(error)) });
+  }
+});
+
+// ─── Substack Article ──────────────────────────────────────────────────────────
+
+app.post("/api/substack-article", async (req, res) => {
+  const { reportId } = req.body;
+  if (!reportId) return res.status(400).json({ error: "reportId required" });
+
+  const reportRow = db.prepare("SELECT * FROM reports WHERE id = ?").get(reportId) as any;
+  if (!reportRow) return res.status(404).json({ error: "Report not found" });
+
+  try {
+    const report = JSON.parse(reportRow.content) as WeeklyReport;
+    console.log(`[API] Generating Substack article for report ${reportId}...`);
+    const article = await generateSubstackArticle(report);
+    res.json({ article });
+  } catch (error) {
+    console.error("[API] Substack article error:", error);
+    res.status(500).json({ error: error instanceof Error ? error.message : "Failed to generate article" });
+  }
+});
+
+// ─── Report Archive ────────────────────────────────────────────────────────────
+
 app.get("/api/reports", (req, res) => {
   const reports = db.prepare("SELECT * FROM reports ORDER BY updated_at DESC").all() as any[];
   res.json(reports.map(r => ({ ...r, content: JSON.parse(r.content) })));
 });
 
 app.post("/api/reports", (req, res) => {
-  const { id, type, content } = req.body;
+  const { id, type, content, customTopic } = req.body;
   db.prepare(`
-    INSERT INTO reports (id, type, content, updated_at)
-    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-    ON CONFLICT(id) DO UPDATE SET content = excluded.content, updated_at = CURRENT_TIMESTAMP
-  `).run(id, type, JSON.stringify(content));
+    INSERT INTO reports (id, type, content, custom_topic, updated_at)
+    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(id) DO UPDATE SET content = excluded.content, custom_topic = excluded.custom_topic, updated_at = CURRENT_TIMESTAMP
+  `).run(id, type, JSON.stringify(content), customTopic || null);
   res.json({ success: true });
 });
 
@@ -403,7 +792,38 @@ app.delete("/api/reports/:id", (req, res) => {
   }
 });
 
-// Helper to refresh X access token
+// ─── Report Schedules ──────────────────────────────────────────────────────────
+
+app.get("/api/scheduled-reports", (req, res) => {
+  const schedules = db.prepare("SELECT * FROM scheduled_reports ORDER BY created_at DESC").all();
+  res.json(schedules);
+});
+
+app.post("/api/scheduled-reports", (req, res) => {
+  const { report_type, custom_topic, schedule_time, days } = req.body;
+  if (!report_type || !schedule_time) {
+    return res.status(400).json({ error: "report_type and schedule_time required" });
+  }
+  const result = db.prepare(`
+    INSERT INTO scheduled_reports (report_type, custom_topic, schedule_time, days)
+    VALUES (?, ?, ?, ?)
+  `).run(report_type, custom_topic || null, schedule_time, days || '1,2,3,4,5');
+  res.json({ success: true, id: result.lastInsertRowid });
+});
+
+app.patch("/api/scheduled-reports/:id", (req, res) => {
+  const { enabled } = req.body;
+  db.prepare("UPDATE scheduled_reports SET enabled = ? WHERE id = ?").run(enabled ? 1 : 0, req.params.id);
+  res.json({ success: true });
+});
+
+app.delete("/api/scheduled-reports/:id", (req, res) => {
+  db.prepare("DELETE FROM scheduled_reports WHERE id = ?").run(req.params.id);
+  res.json({ success: true });
+});
+
+// ─── X Posting ─────────────────────────────────────────────────────────────────
+
 async function refreshXToken(user: any) {
   if (user.expires_at > Date.now() + 60000) return user.access_token;
   const client = new TwitterApi({ clientId: process.env.X_CLIENT_ID!, clientSecret: process.env.X_CLIENT_SECRET! });
@@ -413,103 +833,36 @@ async function refreshXToken(user: any) {
   return accessToken;
 }
 
-// Background task
-setInterval(async () => {
-  try {
-    const pending = db.prepare("SELECT * FROM scheduled_posts WHERE status = 'pending' AND scheduled_at <= ?").all(new Date().toISOString()) as any[];
-    for (const post of pending) {
-      const user = db.prepare("SELECT * FROM users WHERE x_id = ?").get(post.user_id) as any;
-      if (!user) continue;
-      try {
-        const accessToken = await refreshXToken(user);
-        const client = new TwitterApi(accessToken);
-        await client.v2.tweet(post.content);
-        db.prepare("UPDATE scheduled_posts SET status = 'posted' WHERE id = ?").run(post.id);
-      } catch (error) {
-        console.error(`Background task failed for post ${post.id}:`, error);
-        db.prepare("UPDATE scheduled_posts SET status = 'failed' WHERE id = ?").run(post.id);
-      }
-    }
-  } catch (err) {
-    console.error("Background task interval error:", err);
-  }
-}, 60000);
-
 app.post("/api/post-to-x", async (req, res) => {
-  // Validate X credentials
   if (!hasValidXCredentials) {
-    console.error("[post-to-x] X credentials not configured");
-    return res.status(503).json({ 
-      error: "X posting not enabled on this server",
-      details: "Server admin needs to configure X OAuth credentials"
-    });
+    return res.status(503).json({ error: "X posting not enabled on this server" });
   }
-  
+
   const userId = (req.session as any).userId;
   const { text } = req.body;
-  
-  if (!userId) {
-    console.error("[post-to-x] No userId in session");
-    return res.status(401).json({ error: "Not authenticated - please connect your X account" });
-  }
-  
+
+  if (!userId) return res.status(401).json({ error: "Not authenticated - please connect your X account" });
+
   const user = db.prepare("SELECT * FROM users WHERE x_id = ?").get(userId) as any;
-  if (!user) {
-    console.error("[post-to-x] User not found for ID:", userId);
-    return res.status(401).json({ error: "User data not found - please reconnect X account" });
-  }
-  
-  if (!text || text.trim().length === 0) {
-    return res.status(400).json({ error: "Cannot post empty content" });
-  }
-  
-  if (text.length > 280) {
-    return res.status(400).json({ error: `Post too long: ${text.length}/280 characters` });
-  }
-  
+  if (!user) return res.status(401).json({ error: "User data not found - please reconnect X account" });
+  if (!text?.trim()) return res.status(400).json({ error: "Cannot post empty content" });
+  if (text.length > 280) return res.status(400).json({ error: `Post too long: ${text.length}/280 characters` });
+
   try {
-    console.log("[post-to-x] Refreshing token for user:", user.username);
     const accessToken = await refreshXToken(user);
-    
-    if (!accessToken) {
-      console.error("[post-to-x] Failed to get access token");
-      return res.status(401).json({ error: "Failed to authenticate - token is invalid" });
-    }
-    
-    console.log("[post-to-x] Creating TwitterApi client with token...");
+    if (!accessToken) return res.status(401).json({ error: "Failed to authenticate - token is invalid" });
+
     const client = new TwitterApi(accessToken);
-    
-    console.log("[post-to-x] Posting tweet:", text.substring(0, 50) + "...");
     const result = await client.v2.tweet(text);
-    
-    console.log("[post-to-x] ✓ Tweet posted successfully:", result.data.id);
     res.json({ success: true, tweetId: result.data.id });
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
-    console.error("[post-to-x] Error posting to X:", errorMsg, error);
-    
-    // Provide specific error messages
     if (errorMsg.includes("401") || errorMsg.includes("Unauthorized")) {
-      return res.status(401).json({ 
-        error: "Authentication failed - your X session may have expired. Please reconnect.",
-        details: errorMsg 
-      });
+      return res.status(401).json({ error: "Authentication failed - reconnect your X account", details: errorMsg });
     } else if (errorMsg.includes("429") || errorMsg.includes("rate")) {
-      return res.status(429).json({ 
-        error: "Rate limited - you're posting too frequently. Please wait a moment.",
-        details: errorMsg 
-      });
-    } else if (errorMsg.includes("140")) {
-      return res.status(400).json({ 
-        error: "Tweet is too long or contains invalid characters.",
-        details: errorMsg 
-      });
+      return res.status(429).json({ error: "Rate limited - please wait before posting", details: errorMsg });
     }
-    
-    res.status(500).json({ 
-      error: "Failed to post to X - please try again or check your connection",
-      details: errorMsg.substring(0, 200)
-    });
+    res.status(500).json({ error: "Failed to post to X", details: errorMsg.substring(0, 200) });
   }
 });
 
@@ -531,16 +884,223 @@ app.delete("/api/scheduled-posts/:id", (req, res) => {
   res.json({ success: true });
 });
 
-app.get("/api/debug/session", (req, res) => {
-  res.json({
-    sessionId: req.sessionID,
-    session: req.session,
-    cookies: req.cookies,
-    headers: req.headers
-  });
+// ─── Auto-Schedule ─────────────────────────────────────────────────────────────
+
+// Weekly report → publishing day mapping
+const REPORT_DAY_MAP: Record<string, number> = {
+  forecast: 0, crypto: 1, nasdaq: 2, conspiracies: 3, equities: 4, global: 5,
+};
+
+app.post("/api/auto-schedule/preview", (req, res) => {
+  const { reportId } = req.body;
+  if (!reportId) return res.status(400).json({ error: "reportId required" });
+
+  const row = db.prepare("SELECT * FROM reports WHERE id = ?").get(reportId) as any;
+  if (!row) return res.status(404).json({ error: "Report not found" });
+
+  const content = JSON.parse(row.content);
+  const reportType: string = row.type;
+  const targetDay = REPORT_DAY_MAP[reportType] ?? 1;
+  const nextDate  = getNextWeekday(targetDay);
+
+  const items: any[] = [];
+
+  // Tweets (7am–7pm EST)
+  if (content.headlines?.length) {
+    const slots = calculateTweetSlots(nextDate, content.headlines);
+    for (const s of slots) {
+      items.push({ type: 'tweet', time: s.time, content: s.content, title: s.title, trendScore: s.trendScore, enabled: true });
+    }
+  }
+
+  // Instagram reminder (9am EST = 14:00 UTC)
+  const instaTime = new Date(nextDate.getTime() + 4 * 60 * 60 * 1000); // +4h from midnight EST = 9am EST
+  items.push({ type: 'instagram', time: instaTime.toISOString(), content: 'Post your 21-slide Instagram carousel for today\'s report.', enabled: true });
+
+  // Substack reminder (next Monday 9am EST)
+  const nextMonday = getNextWeekday(1);
+  const substackTime = new Date(nextMonday.getTime() + 4 * 60 * 60 * 1000);
+  items.push({ type: 'substack', time: substackTime.toISOString(), content: 'Publish your Substack article for this week\'s intelligence brief.', enabled: true });
+
+  // Sort chronologically
+  items.sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime());
+
+  res.json({ reportType, nextDate: nextDate.toISOString(), items });
 });
 
-// Vite middleware
+app.post("/api/auto-schedule/confirm", (req, res) => {
+  const userId = (req.session as any).userId;
+  if (!userId) return res.status(401).json({ error: "Not authenticated" });
+
+  const { items } = req.body;
+  if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "No items provided" });
+
+  let count = 0;
+  for (const item of items) {
+    if (!item.enabled) continue;
+    const content = item.type === 'tweet' ? item.content :
+                    item.type === 'instagram' ? `[INSTAGRAM] ${item.content}` :
+                    `[SUBSTACK] ${item.content}`;
+    db.prepare("INSERT INTO scheduled_posts (user_id, content, scheduled_at, status) VALUES (?, ?, ?, 'pending')")
+      .run(userId, content, item.time);
+    count++;
+  }
+
+  res.json({ success: true, scheduled: count });
+});
+
+// ─── Debug ─────────────────────────────────────────────────────────────────────
+
+app.get("/api/debug/session", (req, res) => {
+  res.json({ sessionId: req.sessionID, userId: (req.session as any).userId });
+});
+
+// ─── Auto-Schedule Helpers ─────────────────────────────────────────────────────
+
+// Returns the next Date (midnight EST) for the given day-of-week (0=Sun…6=Sat)
+// If today IS that day, schedules for next week.
+function getNextWeekday(targetDay: number): Date {
+  const now = new Date();
+  // EST = UTC-5; get current EST day-of-week
+  const estNow = new Date(now.getTime() - 5 * 60 * 60 * 1000);
+  let daysUntil = (targetDay - estNow.getDay() + 7) % 7;
+  if (daysUntil === 0) daysUntil = 7;
+  // Midnight EST = 05:00 UTC
+  const result = new Date(estNow);
+  result.setDate(result.getDate() + daysUntil);
+  result.setUTCHours(5, 0, 0, 0); // midnight EST
+  return result;
+}
+
+// Assign tweets to time slots from 7am–7pm EST, highest trendScore to highest engagement hour
+function calculateTweetSlots(baseDate: Date, tweets: any[]): Array<{ time: string; content: string; trendScore: number; title: string }> {
+  const count = tweets.length;
+  if (count === 0) return [];
+
+  const startMinEST = 7 * 60;  // 420
+  const endMinEST  = 19 * 60;  // 1140
+  const totalMins  = endMinEST - startMinEST; // 720
+  const interval   = totalMins / count;
+
+  // Finance/politics Twitter engagement score per EST hour
+  const engHour: Record<number, number> = {
+    7:8, 8:10, 9:9, 10:6, 11:5, 12:8, 13:7, 14:5, 15:6, 16:10, 17:9, 18:7,
+  };
+
+  // Build evenly-spaced slots (stored as UTC)
+  const slots: Date[] = Array.from({ length: count }, (_, i) => {
+    const minFromMidnightEST = startMinEST + Math.round(i * interval);
+    const d = new Date(baseDate);
+    // baseDate is midnight EST = 05:00 UTC; add EST minutes
+    d.setTime(baseDate.getTime() + minFromMidnightEST * 60000);
+    return d;
+  });
+
+  // Score each slot (EST hour = UTC hour - 5)
+  const scored = slots.map((d, i) => ({ i, slot: d, score: engHour[d.getUTCHours() - 5] ?? 5 }));
+  // Sort slot indices by engagement descending
+  const slotsByEng = [...scored].sort((a, b) => b.score - a.score).map(s => s.i);
+
+  // Assign tweet[i] (sorted by trendScore desc already) → slot with ith highest engagement
+  const assigned: Array<{ time: string; content: string; trendScore: number; title: string }> = new Array(count);
+  for (let ti = 0; ti < count; ti++) {
+    assigned[ti] = {
+      time: slots[slotsByEng[ti]].toISOString(),
+      content: tweets[ti].socialPost,
+      trendScore: tweets[ti].trendScore ?? (count - ti),
+      title: tweets[ti].title,
+    };
+  }
+
+  // Return sorted chronologically
+  return assigned.sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime());
+}
+
+// ─── Background Tasks ──────────────────────────────────────────────────────────
+
+// Seed default weekly report schedule if none exist
+try {
+  const existing = db.prepare("SELECT COUNT(*) as c FROM scheduled_reports").get() as any;
+  if (existing.c === 0) {
+    const defaults = [
+      { type: 'global',       days: '5', time: '06:00' }, // Friday
+      { type: 'crypto',       days: '1', time: '06:00' }, // Monday
+      { type: 'nasdaq',       days: '2', time: '06:00' }, // Tuesday
+      { type: 'conspiracies', days: '3', time: '06:00' }, // Wednesday
+      { type: 'equities',     days: '4', time: '06:00' }, // Thursday
+      { type: 'forecast',     days: '0', time: '06:00' }, // Sunday
+    ];
+    const insert = db.prepare("INSERT INTO scheduled_reports (report_type, schedule_time, days, enabled) VALUES (?, ?, ?, 1)");
+    for (const d of defaults) insert.run(d.type, d.time, d.days);
+    console.log("[Seed] Default weekly report schedules created");
+  }
+} catch (err) {
+  console.error("[Seed] Failed to seed schedules:", err);
+}
+
+setInterval(async () => {
+  // Process scheduled social posts
+  try {
+    const pending = db.prepare("SELECT * FROM scheduled_posts WHERE status = 'pending' AND scheduled_at <= ?").all(new Date().toISOString()) as any[];
+    for (const post of pending) {
+      const user = db.prepare("SELECT * FROM users WHERE x_id = ?").get(post.user_id) as any;
+      if (!user) continue;
+      try {
+        const accessToken = await refreshXToken(user);
+        const client = new TwitterApi(accessToken);
+        await client.v2.tweet(post.content);
+        db.prepare("UPDATE scheduled_posts SET status = 'posted' WHERE id = ?").run(post.id);
+      } catch (error) {
+        console.error(`Background task failed for post ${post.id}:`, error);
+        db.prepare("UPDATE scheduled_posts SET status = 'failed' WHERE id = ?").run(post.id);
+      }
+    }
+  } catch (err) {
+    console.error("Scheduled posts task error:", err);
+  }
+
+  // Process scheduled report generation
+  try {
+    const now = new Date();
+    const currentTime = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
+    const currentDay = now.getDay().toString();
+    const todayStr = now.toISOString().split('T')[0];
+
+    const schedules = db.prepare(`
+      SELECT * FROM scheduled_reports
+      WHERE enabled = 1
+        AND schedule_time = ?
+        AND (last_run IS NULL OR date(last_run) != ?)
+    `).all(currentTime, todayStr) as any[];
+
+    for (const schedule of schedules) {
+      const scheduleDays = schedule.days.split(',').map((d: string) => d.trim());
+      if (!scheduleDays.includes(currentDay)) continue;
+
+      try {
+        console.log(`[Cron] Generating scheduled ${schedule.report_type} report...`);
+        const isF = schedule.report_type === 'forecast';
+        const report = isF
+          ? await generateForecastReport()
+          : await generateWeeklyReport(schedule.report_type, schedule.custom_topic || undefined);
+        const reportId = `${schedule.report_type}-${Date.now()}`;
+        db.prepare(`
+          INSERT INTO reports (id, type, content, custom_topic, updated_at)
+          VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+        `).run(reportId, schedule.report_type, JSON.stringify(report), schedule.custom_topic || null);
+        db.prepare("UPDATE scheduled_reports SET last_run = CURRENT_TIMESTAMP WHERE id = ?").run(schedule.id);
+        console.log(`[Cron] ✓ Scheduled report generated: ${reportId}`);
+      } catch (err) {
+        console.error(`[Cron] Failed to generate scheduled report ${schedule.id}:`, err);
+      }
+    }
+  } catch (err) {
+    console.error("Scheduled reports task error:", err);
+  }
+}, 60000);
+
+// ─── Vite / Static ─────────────────────────────────────────────────────────────
+
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
