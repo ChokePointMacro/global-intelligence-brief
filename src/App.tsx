@@ -40,6 +40,11 @@ import {
   Check,
   ToggleLeft,
   ToggleRight,
+  Shield,
+  Pencil,
+  Lock,
+  Activity,
+  Award,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { clsx, type ClassValue } from 'clsx';
@@ -1877,32 +1882,324 @@ const BackButton = () => {
   );
 };
 
+const CLEARANCE_LEVELS = [
+  { min: 0,  label: 'Recruit',              color: 'text-gray-400',   border: 'border-gray-400/30',   bg: 'bg-gray-400/10'   },
+  { min: 1,  label: 'Analyst',              color: 'text-sky-400',    border: 'border-sky-400/30',    bg: 'bg-sky-400/10'    },
+  { min: 5,  label: 'Senior Analyst',       color: 'text-blue-400',   border: 'border-blue-400/30',   bg: 'bg-blue-400/10'   },
+  { min: 15, label: 'Field Operative',      color: 'text-purple-400', border: 'border-purple-400/30', bg: 'bg-purple-400/10' },
+  { min: 30, label: 'Intelligence Officer', color: 'text-btc-orange', border: 'border-btc-orange/30', bg: 'bg-btc-orange/10' },
+  { min: 50, label: 'Strategic Director',   color: 'text-yellow-300', border: 'border-yellow-300/30', bg: 'bg-yellow-300/10' },
+];
+
+const getClearance = (count: number) => {
+  let level = CLEARANCE_LEVELS[0];
+  for (const l of CLEARANCE_LEVELS) { if (count >= l.min) level = l; }
+  return level;
+};
+
+const PROFILE_TYPE_META: Record<string, { label: string; color: string; bar: string }> = {
+  global:       { label: 'Global Pulse',   color: 'text-blue-400',   bar: 'bg-blue-400'   },
+  crypto:       { label: 'Crypto',         color: 'text-btc-orange', bar: 'bg-btc-orange' },
+  equities:     { label: 'S&P 500',        color: 'text-green-400',  bar: 'bg-green-400'  },
+  nasdaq:       { label: 'Nasdaq-100',     color: 'text-purple-400', bar: 'bg-purple-400' },
+  conspiracies: { label: 'Conspiracies',   color: 'text-red-400',    bar: 'bg-red-400'    },
+  forecast:     { label: '7-Day Forecast', color: 'text-yellow-400', bar: 'bg-yellow-400' },
+  custom:       { label: 'Custom',         color: 'text-teal-400',   bar: 'bg-teal-400'   },
+};
+
 const Profile = ({ user, onLogout }: { user: UserData | null; onLogout: () => void }) => {
-  if (!user) return <div className="text-center py-20 font-mono">Loading profile...</div>;
+  const [reports, setReports] = useState<any[]>([]);
+  const [socialAccounts, setSocialAccounts] = useState<SocialAccount[]>([]);
+  const [postStats, setPostStats] = useState({ posted: 0, pending: 0 });
+  const [loading, setLoading] = useState(true);
+
+  // Edit display name
+  const [editingName, setEditingName] = useState(false);
+  const [nameVal, setNameVal] = useState('');
+  const [nameSaving, setNameSaving] = useState(false);
+  const [nameSuccess, setNameSuccess] = useState(false);
+
+  // Change password
+  const [showPwForm, setShowPwForm] = useState(false);
+  const [pwCurrent, setPwCurrent] = useState('');
+  const [pwNew, setPwNew] = useState('');
+  const [pwConfirm, setPwConfirm] = useState('');
+  const [pwSaving, setPwSaving] = useState(false);
+  const [pwMsg, setPwMsg] = useState<{ ok: boolean; text: string } | null>(null);
+
+  useEffect(() => {
+    if (!user) return;
+    setNameVal(user.displayName || '');
+    Promise.all([
+      apiFetch('/api/reports').then(r => r.ok ? r.json() : []),
+      apiFetch('/api/social/accounts').then(r => r.ok ? r.json() : { accounts: [] }),
+      apiFetch('/api/scheduled-posts').then(r => r.ok ? r.json() : []),
+    ]).then(([reps, social, posts]) => {
+      setReports(Array.isArray(reps) ? reps : []);
+      setSocialAccounts(social.accounts || []);
+      setPostStats({
+        posted: posts.filter((p: any) => p.status === 'posted').length,
+        pending: posts.filter((p: any) => p.status === 'pending').length,
+      });
+    }).finally(() => setLoading(false));
+  }, [user]);
+
+  const saveName = async () => {
+    if (!nameVal.trim()) return;
+    setNameSaving(true);
+    const r = await apiFetch('/api/auth/profile', { method: 'PATCH', body: JSON.stringify({ displayName: nameVal.trim() }) });
+    setNameSaving(false);
+    if (r.ok) { setEditingName(false); setNameSuccess(true); setTimeout(() => setNameSuccess(false), 2000); }
+  };
+
+  const savePassword = async () => {
+    if (!pwCurrent || !pwNew || !pwConfirm) { setPwMsg({ ok: false, text: 'All fields required' }); return; }
+    if (pwNew !== pwConfirm) { setPwMsg({ ok: false, text: 'New passwords do not match' }); return; }
+    if (pwNew.length < 8) { setPwMsg({ ok: false, text: 'New password must be at least 8 characters' }); return; }
+    setPwSaving(true);
+    const r = await apiFetch('/api/auth/change-password', { method: 'POST', body: JSON.stringify({ currentPassword: pwCurrent, newPassword: pwNew }) });
+    const data = await r.json();
+    setPwSaving(false);
+    if (r.ok) { setPwMsg({ ok: true, text: 'Password updated successfully' }); setPwCurrent(''); setPwNew(''); setPwConfirm(''); setTimeout(() => setShowPwForm(false), 1500); }
+    else setPwMsg({ ok: false, text: data.error || 'Failed to update password' });
+  };
+
+  if (!user) return <div className="text-center py-20 font-mono text-white/40">Loading profile...</div>;
+
+  const byType = reports.reduce((acc: Record<string, number>, r: any) => { acc[r.type] = (acc[r.type] || 0) + 1; return acc; }, {});
+  const maxTypeCount = Math.max(1, ...Object.values(byType) as number[]);
+  const clearance = getClearance(reports.length);
+  const connectedCount = socialAccounts.length;
+  const initials = (user.displayName || user.username || '?').split(' ').map(w => w[0]).join('').toUpperCase().slice(0, 2);
+
+  const PLATFORMS = [
+    { id: 'x',        label: 'X',        Icon: Twitter,    color: 'text-sky-400',    border: 'border-sky-400/20',    bg: 'bg-sky-400/5'    },
+    { id: 'instagram',label: 'Instagram', Icon: Instagram,  color: 'text-pink-400',   border: 'border-pink-400/20',   bg: 'bg-pink-400/5'   },
+    { id: 'linkedin', label: 'LinkedIn',  Icon: Linkedin,   color: 'text-blue-400',   border: 'border-blue-400/20',   bg: 'bg-blue-400/5'   },
+    { id: 'threads',  label: 'Threads',   Icon: AtSign,     color: 'text-purple-400', border: 'border-purple-400/20', bg: 'bg-purple-400/5' },
+    { id: 'bluesky',  label: 'Bluesky',   Icon: MessageSquare, color: 'text-cyan-400', border: 'border-cyan-400/20',  bg: 'bg-cyan-400/5'   },
+  ];
 
   return (
-    <div className="max-w-2xl mx-auto space-y-12">
+    <div className="max-w-3xl mx-auto space-y-6 pb-12">
       <BackButton />
-      <div className="bg-white border border-[#141414] p-12 text-center space-y-6 shadow-[12px_12px_0px_0px_rgba(20,20,20,1)]">
-        <img src={user.profileImage} alt={user.displayName} className="w-32 h-32 rounded-full mx-auto border-4 border-[#141414]" />
-        <div>
-          <h1 className="text-4xl font-serif italic">{user.displayName}</h1>
-          <p className="text-sm font-mono opacity-60">@{user.username}</p>
-        </div>
-        <div className="pt-6 border-t border-[#141414]/10 grid grid-cols-2 gap-8">
-          <div className="text-center">
-            <p className="text-[10px] font-mono uppercase tracking-widest opacity-40">Account Status</p>
-            <p className="text-xs font-mono font-bold">Verified Node</p>
+
+      {/* ── Hero Card ── */}
+      <div className="relative border border-btc-orange/20 bg-gradient-to-b from-btc-orange/[0.04] to-transparent overflow-hidden">
+        {/* subtle grid overlay */}
+        <div className="absolute inset-0 opacity-[0.03]" style={{ backgroundImage: 'repeating-linear-gradient(0deg, #f7931a 0, #f7931a 1px, transparent 1px, transparent 40px), repeating-linear-gradient(90deg, #f7931a 0, #f7931a 1px, transparent 1px, transparent 40px)' }} />
+
+        <div className="relative p-8 flex flex-col sm:flex-row items-center sm:items-start gap-6">
+          {/* Avatar */}
+          <div className="relative flex-shrink-0">
+            <div className="w-24 h-24 rounded-full border-2 border-btc-orange/40 overflow-hidden bg-btc-orange/10 flex items-center justify-center"
+              style={{ boxShadow: '0 0 30px rgba(247,147,26,0.18)' }}>
+              {user.profileImage
+                ? <img src={user.profileImage} alt={user.displayName} className="w-full h-full object-cover" />
+                : <span className="text-3xl font-mono font-bold text-btc-orange">{initials}</span>
+              }
+            </div>
+            {/* auth method badge */}
+            <div className="absolute -bottom-1 -right-1 w-7 h-7 rounded-full bg-[#0a0a0a] border border-white/10 flex items-center justify-center">
+              {user.authMethod === 'x' ? <Twitter size={12} className="text-sky-400" /> : <Mail size={12} className="text-btc-orange" />}
+            </div>
           </div>
-          <div className="text-center">
-            <p className="text-[10px] font-mono uppercase tracking-widest opacity-40">Access Level</p>
-            <p className="text-xs font-mono font-bold">Strategic Analyst</p>
+
+          {/* Name + username */}
+          <div className="flex-1 text-center sm:text-left">
+            <div className="flex items-center justify-center sm:justify-start gap-2 mb-1">
+              {editingName ? (
+                <div className="flex items-center gap-2">
+                  <input
+                    value={nameVal}
+                    onChange={e => setNameVal(e.target.value)}
+                    onKeyDown={e => { if (e.key === 'Enter') saveName(); if (e.key === 'Escape') setEditingName(false); }}
+                    className="bg-black/60 border border-btc-orange/40 text-white text-xl font-serif italic px-2 py-0.5 outline-none focus:border-btc-orange/80"
+                    autoFocus
+                    maxLength={50}
+                  />
+                  <button onClick={saveName} disabled={nameSaving} className="text-green-400 hover:text-green-300">
+                    {nameSaving ? <Loader2 size={14} className="animate-spin" /> : <Check size={14} />}
+                  </button>
+                  <button onClick={() => setEditingName(false)} className="text-white/30 hover:text-white/60"><XIcon size={14} /></button>
+                </div>
+              ) : (
+                <>
+                  <h1 className="text-2xl font-serif italic text-white">{nameSuccess ? '✓ Saved' : (user.displayName || user.username)}</h1>
+                  <button onClick={() => setEditingName(true)} className="text-white/20 hover:text-btc-orange/60 transition-colors">
+                    <Pencil size={12} />
+                  </button>
+                </>
+              )}
+            </div>
+            <p className="text-[11px] font-mono text-white/40">@{user.username}</p>
+
+            {/* Clearance badge */}
+            <div className={`inline-flex items-center gap-1.5 mt-3 px-2.5 py-1 border text-[10px] font-mono uppercase tracking-widest ${clearance.color} ${clearance.border} ${clearance.bg}`}>
+              <Shield size={10} />
+              {clearance.label}
+            </div>
           </div>
+
+          {/* Logout */}
+          <button onClick={onLogout}
+            className="flex items-center gap-2 px-4 py-2 border border-red-500/20 bg-red-500/5 text-red-400 text-[10px] font-mono uppercase tracking-widest hover:bg-red-500/10 hover:border-red-500/40 transition-all">
+            <LogOut size={11} /> Logout
+          </button>
         </div>
-        <button onClick={onLogout} className="flex items-center gap-2 mx-auto px-8 py-3 bg-red-600 text-white text-xs font-mono uppercase tracking-widest hover:bg-red-700 transition-colors rounded-sm">
-          <LogOut size={14} /> Logout Session
-        </button>
       </div>
+
+      {/* ── Stats Row ── */}
+      {loading ? (
+        <div className="grid grid-cols-3 gap-3">
+          {[0,1,2].map(i => <div key={i} className="border border-white/5 bg-white/[0.02] h-20 animate-pulse" />)}
+        </div>
+      ) : (
+        <div className="grid grid-cols-3 gap-3">
+          {[
+            { label: 'Reports Generated', value: reports.length,  icon: <FileText size={14} />,   color: 'text-btc-orange', border: 'border-btc-orange/20', bg: 'bg-btc-orange/5' },
+            { label: 'Posts Published',   value: postStats.posted, icon: <Send size={14} />,       color: 'text-green-400',  border: 'border-green-400/20',  bg: 'bg-green-400/5'  },
+            { label: 'Networks Live',     value: connectedCount,   icon: <Activity size={14} />,   color: 'text-purple-400', border: 'border-purple-400/20', bg: 'bg-purple-400/5' },
+          ].map(s => (
+            <div key={s.label} className={`border ${s.border} ${s.bg} p-4 text-center`}>
+              <div className={`flex justify-center mb-1 ${s.color} opacity-60`}>{s.icon}</div>
+              <p className={`text-2xl font-mono font-bold ${s.color}`}>{s.value}</p>
+              <p className="text-[9px] font-mono uppercase tracking-widest text-white/30 mt-1">{s.label}</p>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+
+        {/* ── Intelligence Breakdown ── */}
+        <div className="border border-white/8 bg-black/20 p-5 space-y-3">
+          <div className="flex items-center gap-2 mb-4">
+            <Award size={12} className="text-btc-orange/60" />
+            <p className="text-[10px] font-mono uppercase tracking-widest text-white/40">Intelligence Breakdown</p>
+          </div>
+          {Object.keys(PROFILE_TYPE_META).map(type => {
+            const count = byType[type] || 0;
+            const meta = PROFILE_TYPE_META[type];
+            const pct = (count / maxTypeCount) * 100;
+            return (
+              <div key={type} className="space-y-1">
+                <div className="flex justify-between items-center">
+                  <span className={`text-[9px] font-mono uppercase tracking-wider ${meta.color}`}>{meta.label}</span>
+                  <span className="text-[9px] font-mono text-white/30">{count}</span>
+                </div>
+                <div className="h-1 bg-white/5 overflow-hidden">
+                  <div className={`h-full ${meta.bar} transition-all duration-700`} style={{ width: `${pct}%`, opacity: count > 0 ? 1 : 0.15 }} />
+                </div>
+              </div>
+            );
+          })}
+          {reports.length === 0 && <p className="text-[10px] font-mono text-white/20 text-center py-2">No reports generated yet</p>}
+        </div>
+
+        {/* ── Connected Networks ── */}
+        <div className="border border-white/8 bg-black/20 p-5">
+          <div className="flex items-center gap-2 mb-4">
+            <Link2 size={12} className="text-btc-orange/60" />
+            <p className="text-[10px] font-mono uppercase tracking-widest text-white/40">Connected Networks</p>
+          </div>
+          <div className="space-y-2">
+            {PLATFORMS.map(({ id, label, Icon, color, border, bg }) => {
+              const acct = socialAccounts.find(a => a.platform === id);
+              return (
+                <div key={id} className={`flex items-center justify-between px-3 py-2 border ${acct ? border : 'border-white/5'} ${acct ? bg : 'bg-transparent'}`}>
+                  <div className="flex items-center gap-2">
+                    <Icon size={12} className={acct ? color : 'text-white/20'} />
+                    <span className={`text-[10px] font-mono ${acct ? 'text-white/70' : 'text-white/20'}`}>{label}</span>
+                  </div>
+                  {acct
+                    ? <span className={`text-[9px] font-mono ${color}`}>{acct.handle}</span>
+                    : <span className="text-[9px] font-mono text-white/15 uppercase tracking-wider">Not connected</span>
+                  }
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+
+      {/* ── Recent Reports ── */}
+      {reports.length > 0 && (
+        <div className="border border-white/8 bg-black/20 p-5">
+          <div className="flex items-center gap-2 mb-4">
+            <Clock size={12} className="text-btc-orange/60" />
+            <p className="text-[10px] font-mono uppercase tracking-widest text-white/40">Recent Intelligence</p>
+          </div>
+          <div className="space-y-2">
+            {reports.slice(0, 5).map((r: any) => {
+              const meta = PROFILE_TYPE_META[r.type] || PROFILE_TYPE_META.custom;
+              const title = r.content?.analysis?.overallSummary
+                ? r.content.analysis.overallSummary.slice(0, 80) + '...'
+                : r.custom_topic || r.type;
+              return (
+                <div key={r.id} className="flex items-center gap-3 py-2 border-b border-white/[0.04] last:border-0">
+                  <span className={`text-[8px] font-mono uppercase tracking-widest px-1.5 py-0.5 border ${meta.color} border-current/30 opacity-70 flex-shrink-0`}>
+                    {r.type}
+                  </span>
+                  <span className="text-[11px] text-white/50 font-mono flex-1 truncate">{title}</span>
+                  <span className="text-[9px] font-mono text-white/20 flex-shrink-0">
+                    {new Date(r.updated_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* ── Account Security ── */}
+      {user.authMethod === 'email' && (
+        <div className="border border-white/8 bg-black/20 p-5 space-y-4">
+          <div className="flex items-center gap-2">
+            <Lock size={12} className="text-btc-orange/60" />
+            <p className="text-[10px] font-mono uppercase tracking-widest text-white/40">Account Security</p>
+          </div>
+
+          <button
+            onClick={() => { setShowPwForm(!showPwForm); setPwMsg(null); }}
+            className="flex items-center gap-2 text-[10px] font-mono uppercase tracking-widest text-white/40 hover:text-btc-orange/70 transition-colors"
+          >
+            <ChevronRight size={11} className={`transition-transform ${showPwForm ? 'rotate-90' : ''}`} />
+            Change Password
+          </button>
+
+          {showPwForm && (
+            <div className="space-y-3 pl-4 border-l border-btc-orange/20">
+              {[
+                { label: 'Current Password', val: pwCurrent, set: setPwCurrent },
+                { label: 'New Password',     val: pwNew,     set: setPwNew     },
+                { label: 'Confirm New',      val: pwConfirm, set: setPwConfirm },
+              ].map(f => (
+                <div key={f.label}>
+                  <label className="text-[9px] font-mono uppercase tracking-widest text-white/30 block mb-1">{f.label}</label>
+                  <input
+                    type="password"
+                    value={f.val}
+                    onChange={e => f.set(e.target.value)}
+                    className="w-full bg-black/40 border border-white/10 text-white text-xs font-mono px-3 py-2 outline-none focus:border-btc-orange/40 transition-colors"
+                  />
+                </div>
+              ))}
+              {pwMsg && (
+                <p className={`text-[10px] font-mono ${pwMsg.ok ? 'text-green-400' : 'text-red-400'}`}>{pwMsg.text}</p>
+              )}
+              <button
+                onClick={savePassword}
+                disabled={pwSaving}
+                className="flex items-center gap-2 px-4 py-2 border border-btc-orange/30 bg-btc-orange/5 text-btc-orange text-[10px] font-mono uppercase tracking-widest hover:bg-btc-orange/10 transition-all disabled:opacity-40"
+              >
+                {pwSaving ? <Loader2 size={11} className="animate-spin" /> : <Check size={11} />}
+                Update Password
+              </button>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 };

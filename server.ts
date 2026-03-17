@@ -304,6 +304,30 @@ app.post("/api/auth/logout", (req, res) => {
   req.session.destroy(() => res.json({ success: true }));
 });
 
+app.patch("/api/auth/profile", requireAuth, (req, res) => {
+  const userId = (req.session as any).userId;
+  const { displayName } = req.body;
+  if (!displayName?.trim()) return res.status(400).json({ error: "Display name required" });
+  if (displayName.length > 50) return res.status(400).json({ error: "Display name too long (max 50 chars)" });
+  const sanitized = displayName.trim().replace(/<[^>]*>/g, '');
+  db.prepare("UPDATE users SET display_name = ? WHERE x_id = ? OR email = ?").run(sanitized, userId, userId);
+  res.json({ success: true, displayName: sanitized });
+});
+
+app.post("/api/auth/change-password", requireAuth, authLimiter, async (req, res) => {
+  const userId = (req.session as any).userId;
+  const { currentPassword, newPassword } = req.body;
+  if (!currentPassword || !newPassword) return res.status(400).json({ error: "Both passwords required" });
+  if (newPassword.length < 8) return res.status(400).json({ error: "New password must be at least 8 characters" });
+  const user = db.prepare("SELECT * FROM users WHERE email = ?").get(userId) as any;
+  if (!user?.password_hash) return res.status(400).json({ error: "Password change not available for X-login accounts" });
+  const valid = await bcrypt.compare(currentPassword, user.password_hash);
+  if (!valid) return res.status(401).json({ error: "Current password is incorrect" });
+  const newHash = await bcrypt.hash(newPassword, 12);
+  db.prepare("UPDATE users SET password_hash = ? WHERE email = ?").run(newHash, userId);
+  res.json({ success: true });
+});
+
 // ─── LinkedIn OAuth ────────────────────────────────────────────────────────────
 
 app.get("/api/auth/linkedin/url", (req, res) => {
