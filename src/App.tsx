@@ -60,6 +60,37 @@ function truncateToWords(text: string, maxWords: number): string {
   return words.slice(0, maxWords).join(' ') + '...';
 }
 
+// ─── Report Color Themes ──────────────────────────────────────────────────────
+
+const REPORT_COLORS: Record<string, { hex: string; rgb: string }> = {
+  global:       { hex: '#60a5fa', rgb: '96,165,250' },
+  crypto:       { hex: '#f7931a', rgb: '247,147,26' },
+  equities:     { hex: '#4ade80', rgb: '74,222,128' },
+  nasdaq:       { hex: '#c084fc', rgb: '192,132,252' },
+  conspiracies: { hex: '#f87171', rgb: '248,113,113' },
+  forecast:     { hex: '#facc15', rgb: '250,204,21' },
+  custom:       { hex: '#2dd4bf', rgb: '45,212,191' },
+};
+
+const getReportColor = (type?: string) =>
+  REPORT_COLORS[type ?? 'crypto'] ?? REPORT_COLORS.crypto;
+
+const makeTheme = (hex: string, rgb: string) => ({
+  hex,
+  border:      `rgba(${rgb},0.30)`,
+  borderLight: `rgba(${rgb},0.15)`,
+  bg:          `rgba(${rgb},0.05)`,
+  bgMed:       `rgba(${rgb},0.10)`,
+  text:         hex,
+  textMuted:   `rgba(${rgb},0.60)`,
+  textFaint:   `rgba(${rgb},0.40)`,
+  glow:        `0 0 20px rgba(${rgb},0.12)`,
+  glowMd:      `0 0 30px rgba(${rgb},0.18)`,
+  glowLg:      `0 0 50px rgba(${rgb},0.22)`,
+  gradLine:    `linear-gradient(to right, transparent, ${hex}99, transparent)`,
+  pill:        { backgroundColor: `rgba(${rgb},0.10)`, borderColor: `rgba(${rgb},0.25)`, color: hex },
+});
+
 // ─── ChokePoint Macro Brand ───────────────────────────────────────────────────
 
 const CPMLogo = ({ size = 32, className = "" }: { size?: number; className?: string }) => (
@@ -454,7 +485,7 @@ const SENTIMENT_FORECAST_CONFIG: Record<string, { color: string; label: string }
   'de-escalating':   { color: 'text-blue-400',   label: 'De-Escalating' },
 };
 
-const ForecastView = ({ report }: { report: ForecastReport }) => {
+const ForecastView = ({ report, accentHex = '#facc15' }: { report: ForecastReport; accentHex?: string }) => {
   const [expanded, setExpanded] = useState<number | null>(0);
   const [exportingForecast, setExportingForecast] = useState(false);
   const [exportIdx, setExportIdx] = useState(-1);
@@ -513,8 +544,8 @@ const ForecastView = ({ report }: { report: ForecastReport }) => {
   return (
     <div className="space-y-3">
       {/* Header card */}
-      <div className="bg-[#0a0a0a] border border-btc-orange/30 p-4 shadow-[0_0_30px_rgba(247,147,26,0.05)] relative overflow-hidden">
-        <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-transparent via-btc-orange to-transparent" />
+      <div className="bg-[#0a0a0a] p-4 border relative overflow-hidden" style={{ borderColor: `${accentHex}4d`, boxShadow: `0 0 30px ${accentHex}0d` }}>
+        <div className="absolute top-0 left-0 w-full h-[2px]" style={{ backgroundImage: `linear-gradient(to right, transparent, ${accentHex}99, transparent)` }} />
         <div className="flex flex-col md:flex-row justify-between items-start gap-4">
           <div className="space-y-1">
             <h2 className="text-3xl font-serif italic text-white bitcoin-glow">7-Day Market Forecast</h2>
@@ -525,13 +556,13 @@ const ForecastView = ({ report }: { report: ForecastReport }) => {
               <p className="text-[8px] font-mono uppercase opacity-60">Risk Level</p>
               <p className={cn("text-sm font-mono font-bold", risk.color)}>{report.analysis.overallRiskLevel}</p>
             </div>
-            <div className="px-3 py-1.5 border border-btc-orange/20 bg-btc-orange/5 text-center">
+            <div className="px-3 py-1.5 border text-center" style={{ borderColor: `${accentHex}33`, backgroundColor: `${accentHex}0d` }}>
               <p className="text-[8px] font-mono uppercase opacity-60">Events</p>
-              <p className="text-sm font-mono font-bold text-btc-orange">{report.events.length}</p>
+              <p className="text-sm font-mono font-bold" style={{ color: accentHex }}>{report.events.length}</p>
             </div>
           </div>
         </div>
-        <div className="mt-4 pt-4 border-t border-btc-orange/10 grid md:grid-cols-2 gap-4">
+        <div className="mt-4 pt-4 border-t grid md:grid-cols-2 gap-4" style={{ borderColor: `${accentHex}1a` }}>
           <div>
             <p className="text-[9px] font-mono uppercase tracking-widest opacity-40 mb-1">Dominant Theme</p>
             <p className="text-sm text-gray-300 font-sans leading-relaxed">{report.analysis.dominantTheme}</p>
@@ -541,15 +572,16 @@ const ForecastView = ({ report }: { report: ForecastReport }) => {
             <p className="text-sm text-gray-300 font-sans leading-relaxed">{report.analysis.watchlist}</p>
           </div>
         </div>
-        <div className="mt-3 pt-3 border-t border-btc-orange/10">
+        <div className="mt-3 pt-3 border-t" style={{ borderColor: `${accentHex}1a` }}>
           <p className="text-[9px] font-mono uppercase tracking-widest opacity-40 mb-1">Highest Impact Event</p>
-          <p className="text-sm text-btc-orange/80 font-sans leading-relaxed">{report.analysis.highestImpactEvent}</p>
+          <p className="text-sm font-sans leading-relaxed" style={{ color: `${accentHex}cc` }}>{report.analysis.highestImpactEvent}</p>
         </div>
-        <div className="mt-3 pt-3 border-t border-btc-orange/10 flex justify-end">
+        <div className="mt-3 pt-3 border-t flex justify-end" style={{ borderColor: `${accentHex}1a` }}>
           <button
             onClick={exportForecastZip}
             disabled={exportingForecast}
-            className="flex items-center gap-2 px-4 py-2 bg-btc-orange text-black text-[10px] font-mono font-bold uppercase tracking-widest hover:opacity-90 transition-opacity disabled:opacity-50"
+            className="flex items-center gap-2 px-4 py-2 text-black text-[10px] font-mono font-bold uppercase tracking-widest hover:opacity-90 transition-opacity disabled:opacity-50"
+            style={{ backgroundColor: accentHex }}
           >
             {exportingForecast
               ? <><Loader2 size={12} className="animate-spin" /> Exporting {exportIdx + 1}/{report.events.length}...</>
@@ -645,14 +677,14 @@ const ForecastView = ({ report }: { report: ForecastReport }) => {
           const probColor = event.probability >= 70 ? 'bg-green-500' : event.probability >= 40 ? 'bg-yellow-500' : 'bg-red-500';
 
           return (
-            <div key={i} className="bg-[#0a0a0a] border border-btc-orange/20 overflow-hidden hover:border-btc-orange/40 transition-colors">
+            <div key={i} className="bg-[#0a0a0a] border overflow-hidden transition-colors" style={{ borderColor: `${accentHex}33` }} onMouseEnter={e => (e.currentTarget.style.borderColor = `${accentHex}66`)} onMouseLeave={e => (e.currentTarget.style.borderColor = `${accentHex}33`)}>
               {/* Row header — always visible */}
               <button
                 className="w-full text-left p-4 flex items-center gap-4"
                 onClick={() => setExpanded(isOpen ? null : i)}
               >
                 {/* Rank */}
-                <span className="text-2xl font-mono font-bold text-btc-orange/30 w-8 shrink-0">
+                <span className="text-2xl font-mono font-bold w-8 shrink-0" style={{ color: `${accentHex}4d` }}>
                   {String(event.rank).padStart(2, '0')}
                 </span>
 
@@ -668,10 +700,10 @@ const ForecastView = ({ report }: { report: ForecastReport }) => {
                 <div className="flex-1 min-w-0">
                   <p className="text-sm font-mono font-bold text-white leading-tight">{event.title}</p>
                   <div className="flex items-center gap-2 mt-1 flex-wrap">
-                    <span className="text-[9px] font-mono uppercase tracking-widest text-btc-orange/50">{event.expectedDate}</span>
-                    <span className="text-[9px] font-mono uppercase tracking-widest text-btc-orange/20">·</span>
+                    <span className="text-[9px] font-mono uppercase tracking-widest" style={{ color: `${accentHex}80` }}>{event.expectedDate}</span>
+                    <span className="text-[9px] font-mono uppercase tracking-widest" style={{ color: `${accentHex}33` }}>·</span>
                     <span className={cn("text-[9px] font-mono uppercase tracking-widest", sentConf.color)}>{sentConf.label}</span>
-                    <span className="text-[9px] font-mono uppercase tracking-widest text-btc-orange/20">·</span>
+                    <span className="text-[9px] font-mono uppercase tracking-widest" style={{ color: `${accentHex}33` }}>·</span>
                     <span className="text-[9px] font-mono uppercase tracking-widest text-gray-500">{event.category}</span>
                   </div>
                 </div>
@@ -679,16 +711,16 @@ const ForecastView = ({ report }: { report: ForecastReport }) => {
                 {/* Tags (desktop) */}
                 <div className="hidden md:flex gap-1 flex-wrap justify-end max-w-[260px]">
                   {event.markets.slice(0, 3).map(m => (
-                    <span key={m} className="px-1.5 py-0.5 text-[8px] font-mono uppercase bg-btc-orange/10 border border-btc-orange/20 text-btc-orange/70">{m}</span>
+                    <span key={m} className="px-1.5 py-0.5 text-[8px] font-mono uppercase border" style={{ backgroundColor: `${accentHex}1a`, borderColor: `${accentHex}33`, color: `${accentHex}b3` }}>{m}</span>
                   ))}
                 </div>
 
-                <ChevronRight size={14} className={cn("shrink-0 text-btc-orange/30 transition-transform", isOpen && "rotate-90")} />
+                <ChevronRight size={14} className={cn("shrink-0 transition-transform", isOpen && "rotate-90")} style={{ color: `${accentHex}4d` }} />
               </button>
 
               {/* Expanded detail */}
               {isOpen && (
-                <div className="px-4 pb-4 space-y-4 border-t border-btc-orange/10">
+                <div className="px-4 pb-4 space-y-4 border-t" style={{ borderColor: `${accentHex}1a` }}>
                   <p className="text-sm text-gray-400 leading-relaxed pt-4">{event.summary}</p>
 
                   <div className="grid md:grid-cols-2 gap-3">
@@ -706,7 +738,7 @@ const ForecastView = ({ report }: { report: ForecastReport }) => {
                     <div>
                       <p className="text-[9px] font-mono uppercase tracking-widest opacity-40 mb-1.5">Markets</p>
                       <div className="flex flex-wrap gap-1">
-                        {event.markets.map(m => <span key={m} className="px-1.5 py-0.5 text-[9px] font-mono bg-btc-orange/10 border border-btc-orange/20 text-btc-orange/80">{m}</span>)}
+                        {event.markets.map(m => <span key={m} className="px-1.5 py-0.5 text-[9px] font-mono border" style={{ backgroundColor: `${accentHex}1a`, borderColor: `${accentHex}33`, color: `${accentHex}cc` }}>{m}</span>)}
                       </div>
                     </div>
                     <div>
@@ -725,8 +757,8 @@ const ForecastView = ({ report }: { report: ForecastReport }) => {
 
                   {event.url && (
                     <div className="flex gap-3 flex-wrap">
-                      <a href={event.url} target="_blank" rel="noopener noreferrer" className="text-[9px] font-mono text-btc-orange/50 hover:text-btc-orange transition-colors underline underline-offset-2">{event.url}</a>
-                      {event.alternateUrl && <a href={event.alternateUrl} target="_blank" rel="noopener noreferrer" className="text-[9px] font-mono text-btc-orange/30 hover:text-btc-orange/60 transition-colors underline underline-offset-2">{event.alternateUrl}</a>}
+                      <a href={event.url} target="_blank" rel="noopener noreferrer" className="text-[9px] font-mono transition-colors underline underline-offset-2" style={{ color: `${accentHex}80` }}>{event.url}</a>
+                      {event.alternateUrl && <a href={event.alternateUrl} target="_blank" rel="noopener noreferrer" className="text-[9px] font-mono transition-colors underline underline-offset-2" style={{ color: `${accentHex}4d` }}>{event.alternateUrl}</a>}
                     </div>
                   )}
                 </div>
@@ -775,6 +807,10 @@ const Dashboard = () => {
   const isForecast = activeReportRecord?.type === 'forecast';
   const forecastReport = isForecast ? activeReport as ForecastReport : null;
   const weeklyReport = !isForecast ? activeReport as WeeklyReport : null;
+
+  const activeType = activeReportRecord?.type || reportType;
+  const { hex: acHex, rgb: acRgb } = getReportColor(activeType);
+  const T = makeTheme(acHex, acRgb);
 
   const watermark = (() => {
     try { return JSON.parse(localStorage.getItem('gib_watermark') || '{}'); } catch { return {}; }
@@ -1154,7 +1190,7 @@ const Dashboard = () => {
   const theme = SLIDE_THEMES[slideTheme];
 
   return (
-    <div className="space-y-12">
+    <div className="space-y-12" style={{ '--ac': T.hex, '--ac-rgb': acRgb } as React.CSSProperties}>
       {/* Hero */}
       <section className="relative py-12 border-b border-btc-orange/20">
         <div className="max-w-3xl">
@@ -1171,7 +1207,10 @@ const Dashboard = () => {
       </section>
 
       {/* Action Bar */}
-      <div className="flex flex-col gap-4 p-6 bg-[#0a0a0a] border border-btc-orange/30 shadow-[0_0_20px_rgba(247,147,26,0.1)] relative z-20">
+      <div
+        className="flex flex-col gap-4 p-6 bg-[#0a0a0a] border relative z-20"
+        style={{ borderColor: T.border, boxShadow: T.glow }}
+      >
         <div className="flex flex-col md:flex-row items-center justify-between gap-4">
           <div className="flex items-center gap-4">
             <div className="flex bg-btc-orange/5 p-1 rounded-sm border border-btc-orange/10 flex-wrap gap-0.5">
@@ -1188,9 +1227,10 @@ const Dashboard = () => {
                   key={t.id}
                   onClick={() => setReportType(t.id)}
                   disabled={loading}
+                  style={reportType === t.id ? { backgroundColor: getReportColor(t.id).hex, color: '#000' } : {}}
                   className={cn(
                     "px-4 py-2 text-[10px] font-mono uppercase tracking-widest transition-all",
-                    reportType === t.id ? "bg-btc-orange text-black font-bold" : "text-gray-500 hover:text-btc-orange disabled:opacity-50"
+                    reportType === t.id ? "font-bold" : "text-gray-500 hover:text-white disabled:opacity-50"
                   )}
                 >
                   {t.label}
@@ -1203,7 +1243,8 @@ const Dashboard = () => {
               <button
                 onClick={handleAutoSchedulePreview}
                 disabled={autoScheduleLoading}
-                className="flex items-center gap-2 px-5 py-4 border border-btc-orange/40 text-btc-orange text-[10px] font-mono font-bold uppercase tracking-widest hover:bg-btc-orange/10 transition-all disabled:opacity-50"
+                style={{ borderColor: T.border, color: T.hex }}
+                className="flex items-center gap-2 px-5 py-4 border text-[10px] font-mono font-bold uppercase tracking-widest hover:bg-white/5 transition-all disabled:opacity-50"
                 title="Auto-schedule this report's content"
               >
                 {autoScheduleLoading ? <Loader2 size={14} className="animate-spin" /> : <Calendar size={14} />}
@@ -1217,7 +1258,8 @@ const Dashboard = () => {
             ) : (
               <button
                 onClick={generateReport}
-                className="flex items-center gap-3 px-8 py-4 bg-btc-orange text-black font-mono font-bold uppercase tracking-widest hover:shadow-[0_0_20px_rgba(247,147,26,0.4)] transition-all"
+                style={{ backgroundColor: T.hex, boxShadow: loading ? 'none' : T.glowMd }}
+                className="flex items-center gap-3 px-8 py-4 text-black font-mono font-bold uppercase tracking-widest transition-all"
               >
                 <RefreshCw size={18} /> Generate Report
               </button>
@@ -1253,9 +1295,9 @@ const Dashboard = () => {
 
       {/* Loading indicator */}
       {loading && (
-        <div className="flex items-center gap-4 p-4 bg-btc-orange/5 border border-btc-orange/20">
-          <Loader2 className="animate-spin text-btc-orange" size={18} />
-          <p className="text-xs font-mono uppercase tracking-widest text-btc-orange/60">Claude is analyzing intelligence feeds...</p>
+        <div className="flex items-center gap-4 p-4" style={{ backgroundColor: T.bg, border: `1px solid ${T.borderLight}` }}>
+          <Loader2 className="animate-spin" size={18} style={{ color: T.hex }} />
+          <p className="text-xs font-mono uppercase tracking-widest" style={{ color: T.textMuted }}>Claude is analyzing intelligence feeds...</p>
         </div>
       )}
 
@@ -1270,28 +1312,34 @@ const Dashboard = () => {
             )}
           </div>
           <div className="space-y-2">
-            {reports.map((r) => (
-              <div key={r.id} className="relative group/item">
-                <button
-                  onClick={() => setActiveReportId(r.id)}
-                  className={cn(
-                    "w-full text-left p-4 border transition-all flex flex-col gap-1 pr-10",
-                    activeReportId === r.id
-                      ? "bg-btc-orange/10 text-btc-orange border-btc-orange shadow-[0_0_10px_rgba(247,147,26,0.1)]"
-                      : "bg-[#0a0a0a] border-btc-orange/10 hover:border-btc-orange/40 text-gray-400"
-                  )}
-                >
-                  <span className="text-[10px] font-mono uppercase opacity-60">{getReportLabel(r)}</span>
-                  <span className="text-xs font-medium truncate">{new Date(r.updated_at).toLocaleDateString()}</span>
-                </button>
-                <button
-                  onClick={(e) => deleteReport(r.id, e)}
-                  className="absolute right-2 top-1/2 -translate-y-1/2 p-2 text-red-500 opacity-0 group-hover/item:opacity-40 hover:!opacity-100 transition-opacity hover:bg-red-500/10 rounded-sm z-10"
-                >
-                  <Trash2 size={14} />
-                </button>
-              </div>
-            ))}
+            {reports.map((r) => {
+              const rC = getReportColor(r.type);
+              const isActive = activeReportId === r.id;
+              return (
+                <div key={r.id} className="relative group/item">
+                  <button
+                    onClick={() => setActiveReportId(r.id)}
+                    className="w-full text-left p-4 border transition-all flex flex-col gap-1 pr-10 relative overflow-hidden"
+                    style={{
+                      backgroundColor: isActive ? `rgba(${rC.rgb},0.08)` : '#0a0a0a',
+                      borderColor: isActive ? rC.hex : `rgba(255,255,255,0.06)`,
+                      boxShadow: isActive ? `0 0 12px rgba(${rC.rgb},0.12)` : 'none',
+                    }}
+                  >
+                    {/* Left accent bar — always shows type color */}
+                    <div className="absolute left-0 top-0 bottom-0 w-[3px]" style={{ backgroundColor: rC.hex, opacity: isActive ? 1 : 0.4 }} />
+                    <span className="text-[10px] font-mono uppercase pl-3" style={{ color: rC.hex, opacity: 0.7 }}>{getReportLabel(r)}</span>
+                    <span className="text-xs font-medium truncate pl-3 text-gray-400">{new Date(r.updated_at).toLocaleDateString()}</span>
+                  </button>
+                  <button
+                    onClick={(e) => deleteReport(r.id, e)}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 p-2 text-red-500 opacity-0 group-hover/item:opacity-40 hover:!opacity-100 transition-opacity hover:bg-red-500/10 rounded-sm z-10"
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                </div>
+              );
+            })}
           </div>
         </div>
 
@@ -1303,7 +1351,7 @@ const Dashboard = () => {
                 key={activeReportId || 'forecast'}
                 initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -20 }}
               >
-                <ForecastView report={forecastReport} />
+                <ForecastView report={forecastReport} accentHex={T.hex} />
               </motion.div>
             ) : activeReport && !isForecast && weeklyReport ? (
               <motion.div
@@ -1312,22 +1360,25 @@ const Dashboard = () => {
                 className="space-y-3"
               >
                 {/* Strategic Summary */}
-                <div className="bg-[#0a0a0a] border border-btc-orange/30 p-3 space-y-3 shadow-[0_0_30px_rgba(247,147,26,0.05)] relative overflow-hidden">
-                  <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-transparent via-btc-orange to-transparent" />
+                <div
+                  className="bg-[#0a0a0a] p-3 space-y-3 border relative overflow-hidden"
+                  style={{ borderColor: T.border, boxShadow: T.glowMd }}
+                >
+                  <div className="absolute top-0 left-0 w-full h-[2px]" style={{ backgroundImage: T.gradLine }} />
 
                   <div className="flex flex-col md:flex-row justify-between items-start gap-6">
                     <div className="space-y-1">
                       <h2 className="text-3xl font-serif italic text-white bitcoin-glow">Market Assessment</h2>
-                      <p className="text-[9px] font-mono uppercase tracking-widest text-btc-orange/40">Pulse Check</p>
+                      <p className="text-[9px] font-mono uppercase tracking-widest" style={{ color: T.textFaint }}>Pulse Check</p>
                     </div>
                     <div className="flex gap-2">
-                      <div className="px-2 py-1 border border-btc-orange/20 bg-btc-orange/5 text-center">
+                      <div className="px-2 py-1 border text-center" style={T.pill}>
                         <p className="text-[8px] font-mono uppercase opacity-40">Verification</p>
-                        <p className="text-xs font-mono font-bold text-btc-orange">{weeklyReport!.analysis.verificationScore}</p>
+                        <p className="text-xs font-mono font-bold">{weeklyReport!.analysis.verificationScore}</p>
                       </div>
-                      <div className="px-2 py-1 border border-btc-orange/20 bg-btc-orange/5 text-center">
+                      <div className="px-2 py-1 border text-center" style={T.pill}>
                         <p className="text-[8px] font-mono uppercase opacity-40">Integrity</p>
-                        <p className="text-xs font-mono font-bold text-btc-orange">{weeklyReport!.analysis.integrityScore}</p>
+                        <p className="text-xs font-mono font-bold">{weeklyReport!.analysis.integrityScore}</p>
                       </div>
                     </div>
                   </div>
@@ -1345,31 +1396,31 @@ const Dashboard = () => {
                     </div>
                   )}
 
-                  <div className="pt-2 border-t border-btc-orange/10 flex flex-col gap-2">
+                  <div className="pt-2 border-t flex flex-col gap-2" style={{ borderColor: T.borderLight }}>
                     <div className="flex items-center justify-between">
-                      <p className="text-[10px] font-mono uppercase tracking-widest text-btc-orange/40">Actions</p>
+                      <p className="text-[10px] font-mono uppercase tracking-widest" style={{ color: T.textFaint }}>Actions</p>
                       <div className="flex gap-1 flex-wrap justify-end">
-                        <button onClick={() => handlePost(weeklyReport!.analysis.globalSocialPost)} className="p-2 hover:bg-btc-orange/10 rounded-full transition-colors text-btc-orange" title="Post to X">
+                        <button onClick={() => handlePost(weeklyReport!.analysis.globalSocialPost)} className="p-2 hover:bg-white/5 rounded-full transition-colors" style={{ color: T.hex }} title="Post to X">
                           <Send size={16} />
                         </button>
-                        <button onClick={() => handleSchedule(weeklyReport!.analysis.globalSocialPost)} className="p-2 hover:bg-btc-orange/10 rounded-full transition-colors text-btc-orange" title="Schedule Post">
+                        <button onClick={() => handleSchedule(weeklyReport!.analysis.globalSocialPost)} className="p-2 hover:bg-white/5 rounded-full transition-colors" style={{ color: T.hex }} title="Schedule Post">
                           <Clock size={16} />
                         </button>
-                        <button onClick={handleGenerateInstagram} className="p-2 hover:bg-btc-orange/10 rounded-full transition-colors text-btc-orange" title="Generate Instagram Asset">
+                        <button onClick={handleGenerateInstagram} className="p-2 hover:bg-white/5 rounded-full transition-colors" style={{ color: T.hex }} title="Generate Instagram Asset">
                           <Instagram size={16} />
                         </button>
-                        <button onClick={handleAudioBrief} disabled={audioLoading} className="p-2 hover:bg-btc-orange/10 rounded-full transition-colors text-btc-orange disabled:opacity-50" title="Generate Audio Brief">
+                        <button onClick={handleAudioBrief} disabled={audioLoading} className="p-2 hover:bg-white/5 rounded-full transition-colors disabled:opacity-50" style={{ color: T.hex }} title="Generate Audio Brief">
                           {audioLoading ? <Loader2 size={16} className="animate-spin" /> : <Volume2 size={16} />}
                         </button>
-                        <button onClick={handleEmailDigest} disabled={sendingEmail} className="p-2 hover:bg-btc-orange/10 rounded-full transition-colors text-btc-orange disabled:opacity-50" title="Email Digest">
+                        <button onClick={handleEmailDigest} disabled={sendingEmail} className="p-2 hover:bg-white/5 rounded-full transition-colors disabled:opacity-50" style={{ color: T.hex }} title="Email Digest">
                           {sendingEmail ? <Loader2 size={16} className="animate-spin" /> : <Mail size={16} />}
                         </button>
-                        <button onClick={handleGenerateSubstack} disabled={generatingSubstack} className="p-2 hover:bg-btc-orange/10 rounded-full transition-colors text-btc-orange disabled:opacity-50" title="Generate Substack Article">
+                        <button onClick={handleGenerateSubstack} disabled={generatingSubstack} className="p-2 hover:bg-white/5 rounded-full transition-colors disabled:opacity-50" style={{ color: T.hex }} title="Generate Substack Article">
                           {generatingSubstack ? <Loader2 size={16} className="animate-spin" /> : <FileText size={16} />}
                         </button>
                       </div>
                     </div>
-                    <div className="p-2 bg-btc-orange/5 border border-btc-orange/10 rounded-sm font-mono text-xs italic text-btc-orange/80">
+                    <div className="p-2 rounded-sm font-mono text-xs italic" style={{ backgroundColor: T.bg, border: `1px solid ${T.borderLight}`, color: T.textMuted }}>
                       "{weeklyReport!.analysis.globalSocialPost}"
                     </div>
                   </div>
@@ -1380,24 +1431,30 @@ const Dashboard = () => {
                   {weeklyReport!.headlines.map((h, i) => {
                     const sentimentStyle = h.sentiment ? (SENTIMENT_CONFIG[h.sentiment.toLowerCase()] || { color: 'text-gray-400', bg: 'bg-gray-400/10 border-gray-400/30', label: h.sentiment }) : null;
                     return (
-                      <div key={i} className="group bg-[#0a0a0a] border border-btc-orange/30 p-2 hover:shadow-[0_0_20px_rgba(247,147,26,0.1)] transition-all flex flex-col justify-between relative overflow-hidden">
+                      <div
+                        key={i}
+                        className="group bg-[#0a0a0a] border p-2 transition-all flex flex-col justify-between relative overflow-hidden"
+                        style={{ borderColor: T.border, boxShadow: undefined }}
+                        onMouseEnter={e => (e.currentTarget.style.boxShadow = `0 0 20px rgba(${acRgb},0.10)`)}
+                        onMouseLeave={e => (e.currentTarget.style.boxShadow = 'none')}
+                      >
                         <div className="absolute top-0 right-0 w-12 h-12 opacity-[0.02] pointer-events-none">
-                          <TrendingUp size={48} className="text-btc-orange" />
+                          <TrendingUp size={48} style={{ color: T.hex }} />
                         </div>
                         <div className="space-y-1.5">
                           <div className="flex items-center justify-between gap-1 flex-wrap">
-                            <span className="text-[9px] font-mono uppercase tracking-widest px-2 py-1 bg-btc-orange/10 text-btc-orange border border-btc-orange/20 rounded-sm whitespace-nowrap">{h.category}</span>
+                            <span className="text-[9px] font-mono uppercase tracking-widest px-2 py-1 border rounded-sm whitespace-nowrap" style={T.pill}>{h.category}</span>
                             <div className="flex items-center gap-1">
                               {sentimentStyle && (
                                 <span className={cn("text-[8px] font-mono uppercase tracking-widest px-1.5 py-0.5 border rounded-full", sentimentStyle.bg, sentimentStyle.color)}>
                                   {sentimentStyle.label}
                                 </span>
                               )}
-                              <a href={h.url} target="_blank" rel="noopener noreferrer" className="text-btc-orange opacity-40 hover:opacity-100 transition-opacity p-1 hover:bg-btc-orange/5 rounded-sm" title="Primary source">
+                              <a href={h.url} target="_blank" rel="noopener noreferrer" className="opacity-40 hover:opacity-100 transition-opacity p-1 hover:bg-white/5 rounded-sm" style={{ color: T.hex }} title="Primary source">
                                 <ExternalLink size={12} />
                               </a>
                               {h.alternateUrl && (
-                                <a href={h.alternateUrl} target="_blank" rel="noopener noreferrer" className="text-btc-orange/60 opacity-40 hover:opacity-100 transition-opacity p-1 hover:bg-btc-orange/5 rounded-sm" title="Alternate source">
+                                <a href={h.alternateUrl} target="_blank" rel="noopener noreferrer" className="opacity-40 hover:opacity-100 transition-opacity p-1 hover:bg-white/5 rounded-sm" style={{ color: T.hex }} title="Alternate source">
                                   <Link2 size={12} />
                                 </a>
                               )}
@@ -1407,13 +1464,13 @@ const Dashboard = () => {
                           <p className="text-[11px] leading-snug text-gray-300">{h.summary}</p>
                         </div>
 
-                        <div className="mt-1.5 pt-1.5 border-t border-btc-orange/10 flex items-center justify-between">
-                          <span className="text-[7px] font-mono uppercase tracking-widest text-btc-orange/40">#{i + 1}</span>
+                        <div className="mt-1.5 pt-1.5 border-t flex items-center justify-between" style={{ borderColor: T.borderLight }}>
+                          <span className="text-[7px] font-mono uppercase tracking-widest" style={{ color: T.textFaint }}>#{i + 1}</span>
                           <div className="flex gap-0.5">
-                            <button onClick={() => handlePost(h.summary)} className="p-1.5 hover:bg-btc-orange/10 rounded-sm transition-colors text-btc-orange" title="Post to X">
+                            <button onClick={() => handlePost(h.summary)} className="p-1.5 hover:bg-white/5 rounded-sm transition-colors" style={{ color: T.hex }} title="Post to X">
                               <Send size={12} />
                             </button>
-                            <button onClick={() => handleSchedule(h.summary)} className="p-1.5 hover:bg-btc-orange/10 rounded-sm transition-colors text-btc-orange" title="Schedule Post">
+                            <button onClick={() => handleSchedule(h.summary)} className="p-1.5 hover:bg-white/5 rounded-sm transition-colors" style={{ color: T.hex }} title="Schedule Post">
                               <Clock size={12} />
                             </button>
                           </div>
@@ -1424,9 +1481,9 @@ const Dashboard = () => {
                 </div>
               </motion.div>
             ) : (
-              <div className="h-96 flex flex-col items-center justify-center border-2 border-dashed border-btc-orange/10 rounded-sm bg-btc-orange/[0.02]">
-                <FileText className="text-btc-orange opacity-10 mb-4" size={48} />
-                <p className="text-xs font-mono uppercase tracking-widest text-btc-orange/40">No active briefing selected</p>
+              <div className="h-96 flex flex-col items-center justify-center border-2 border-dashed rounded-sm" style={{ borderColor: T.borderLight, backgroundColor: T.bg }}>
+                <FileText style={{ color: T.hex, opacity: 0.1 }} className="mb-4" size={48} />
+                <p className="text-xs font-mono uppercase tracking-widest" style={{ color: T.textFaint }}>No active briefing selected</p>
               </div>
             )}
           </AnimatePresence>
