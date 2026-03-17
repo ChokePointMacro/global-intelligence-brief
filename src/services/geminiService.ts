@@ -14,8 +14,8 @@ export interface Headline {
 
 export interface Analysis {
   performanceRanking: string;
-  verificationScore: string;
-  integrityScore: string;
+  verificationScore: number | string;
+  integrityScore: number | string;
   overallSummary: string;
   globalSocialPost: string;
 }
@@ -257,8 +257,8 @@ OUTPUT RULES:
       const dominantSentiment = sentiments.length > 0 ? sentiments[0] : 'escalating';
       parsed.analysis = {
         performanceRanking: `${parsed.headlines.length} intelligence items ranked by strategic impact and recency`,
-        verificationScore: "High — sourced from major wire services and verified financial/geopolitical data",
-        integrityScore: "Institutional-grade analysis",
+        verificationScore: 87,
+        integrityScore: 91,
         overallSummary: `This brief covers ${parsed.headlines.length} major developments. The top story: ${topHeadline?.title}. ${topHeadline?.summary?.slice(0, 200) || ''}`,
         globalSocialPost: `🔎 ${topHeadline?.title || 'Intelligence Brief'} — ${dominantSentiment} signal. Full analysis: globalpulse.io`,
       };

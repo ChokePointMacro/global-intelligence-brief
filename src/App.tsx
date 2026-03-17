@@ -1562,14 +1562,28 @@ const Dashboard = () => {
                       <p className="text-[9px] font-mono uppercase tracking-widest" style={{ color: T.textFaint }}>Pulse Check</p>
                     </div>
                     <div className="flex gap-2">
-                      <div className="px-2 py-1 border text-center" style={T.pill}>
-                        <p className="text-[8px] font-mono uppercase opacity-40">Verification</p>
-                        <p className="text-xs font-mono font-bold">{weeklyReport!.analysis.verificationScore}</p>
-                      </div>
-                      <div className="px-2 py-1 border text-center" style={T.pill}>
-                        <p className="text-[8px] font-mono uppercase opacity-40">Integrity</p>
-                        <p className="text-xs font-mono font-bold">{weeklyReport!.analysis.integrityScore}</p>
-                      </div>
+                      {[
+                        { label: 'Verification', value: weeklyReport!.analysis.verificationScore },
+                        { label: 'Integrity',    value: weeklyReport!.analysis.integrityScore },
+                      ].map(({ label, value }) => {
+                        const num = typeof value === 'number' ? value : parseInt(String(value));
+                        const pct = isNaN(num) ? null : Math.min(100, Math.max(0, num));
+                        return (
+                          <div key={label} className="px-3 py-2 border text-center min-w-[80px]" style={T.pill}>
+                            <p className="text-[8px] font-mono uppercase opacity-40 mb-1">{label}</p>
+                            {pct !== null ? (
+                              <>
+                                <p className="text-lg font-mono font-bold leading-none" style={{ color: T.hex }}>{pct}<span className="text-[10px] opacity-60">%</span></p>
+                                <div className="mt-1.5 h-0.5 w-full bg-white/10 rounded-full overflow-hidden">
+                                  <div className="h-full rounded-full transition-all" style={{ width: `${pct}%`, backgroundColor: T.hex }} />
+                                </div>
+                              </>
+                            ) : (
+                              <p className="text-xs font-mono font-bold">{value}</p>
+                            )}
+                          </div>
+                        );
+                      })}
                     </div>
                   </div>
 
