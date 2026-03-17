@@ -78,6 +78,15 @@ db.exec(`
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(user_id, platform)
   );
+
+  CREATE TABLE IF NOT EXISTS platform_credentials (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    platform TEXT NOT NULL,
+    key_name TEXT NOT NULL,
+    key_value TEXT NOT NULL,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(platform, key_name)
+  );
 `);
 
 // Migration: add custom_topic column to reports if missing

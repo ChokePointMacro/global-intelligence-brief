@@ -128,20 +128,43 @@ app.use((req, res, next) => {
   next();
 });
 
-// ─── X (Twitter) client ───────────────────────────────────────────────────────
+// ─── Platform credential helpers ───────────────────────────────────────────────
 
-const xClient = new TwitterApi({
-  clientId: process.env.X_CLIENT_ID || "",
-  clientSecret: process.env.X_CLIENT_SECRET || "",
-});
+const CRED_ENV_MAP: Record<string, Record<string, string>> = {
+  x:         { client_id: 'X_CLIENT_ID',       client_secret: 'X_CLIENT_SECRET'       },
+  instagram: { app_id:    'INSTAGRAM_APP_ID',   app_secret:    'INSTAGRAM_APP_SECRET'  },
+  linkedin:  { client_id: 'LINKEDIN_CLIENT_ID', client_secret: 'LINKEDIN_CLIENT_SECRET'},
+  threads:   { app_id:    'THREADS_APP_ID',     app_secret:    'THREADS_APP_SECRET'    },
+};
 
-const hasValidXCredentials = process.env.X_CLIENT_ID &&
-  process.env.X_CLIENT_SECRET &&
-  !process.env.X_CLIENT_ID.includes("dummy") &&
-  !process.env.X_CLIENT_SECRET.includes("dummy");
+function getPlatformCred(platform: string, key: string): string {
+  const row = db.prepare("SELECT key_value FROM platform_credentials WHERE platform = ? AND key_name = ?").get(platform, key) as any;
+  if (row?.key_value) return row.key_value;
+  const envKey = CRED_ENV_MAP[platform]?.[key];
+  return envKey ? (process.env[envKey] || '') : '';
+}
 
-if (!hasValidXCredentials) {
-  console.error("❌ X_CLIENT_ID or X_CLIENT_SECRET missing or using dummy values.");
+function hasValidCreds(platform: string): boolean {
+  if (platform === 'x') {
+    const id = getPlatformCred('x', 'client_id');
+    const sec = getPlatformCred('x', 'client_secret');
+    return !!(id && sec && !id.includes('dummy') && !sec.includes('dummy'));
+  }
+  if (platform === 'instagram') return !!(getPlatformCred('instagram', 'app_id') && getPlatformCred('instagram', 'app_secret'));
+  if (platform === 'linkedin')  return !!(getPlatformCred('linkedin',  'client_id') && getPlatformCred('linkedin',  'client_secret'));
+  if (platform === 'threads')   return !!(getPlatformCred('threads',   'app_id')    && getPlatformCred('threads',   'app_secret'));
+  return false;
+}
+
+function getXClient(): TwitterApi {
+  return new TwitterApi({
+    clientId:     getPlatformCred('x', 'client_id'),
+    clientSecret: getPlatformCred('x', 'client_secret'),
+  });
+}
+
+if (!hasValidCreds('x')) {
+  console.warn("⚠️  X credentials not configured — set them in Settings → Connected Networks.");
 }
 
 // ─── Auth helpers ──────────────────────────────────────────────────────────────
@@ -158,12 +181,12 @@ const getRedirectUri = (req: express.Request, platform = 'x') => {
 // ─── X Auth Routes ─────────────────────────────────────────────────────────────
 
 app.get("/api/auth/x/url", (req, res) => {
-  if (!hasValidXCredentials) {
-    return res.status(500).json({ error: "X OAuth credentials not configured" });
+  if (!hasValidCreds('x')) {
+    return res.status(503).json({ error: "X OAuth credentials not configured", needsConfig: true, platform: 'x' });
   }
   try {
     const redirectUri = getRedirectUri(req, 'x');
-    const { url, codeVerifier, state } = xClient.generateOAuth2AuthLink(
+    const { url, codeVerifier, state } = getXClient().generateOAuth2AuthLink(
       redirectUri,
       { scope: ["tweet.read", "tweet.write", "users.read", "offline.access"] }
     );
@@ -198,7 +221,7 @@ app.get("/auth/x/callback", async (req, res) => {
 
   try {
     const redirectUri = getRedirectUri(req, 'x');
-    const { client: loggedClient, accessToken, refreshToken, expiresIn } = await xClient.loginWithOAuth2({
+    const { client: loggedClient, accessToken, refreshToken, expiresIn } = await getXClient().loginWithOAuth2({
       code: code as string,
       codeVerifier,
       redirectUri,
@@ -304,6 +327,81 @@ app.post("/api/auth/logout", (req, res) => {
   req.session.destroy(() => res.json({ success: true }));
 });
 
+// ─── Platform Credential Management ────────────────────────────────────────────
+
+const PLATFORM_KEYS: Record<string, string[]> = {
+  x:         ['client_id', 'client_secret'],
+  instagram: ['app_id', 'app_secret'],
+  linkedin:  ['client_id', 'client_secret'],
+  threads:   ['app_id', 'app_secret'],
+};
+
+// Returns which platforms are configured (never returns actual values)
+app.get("/api/platform-credentials", requireAuth, (req, res) => {
+  const status: Record<string, { configured: boolean; keys: string[] }> = {};
+  for (const [platform, keys] of Object.entries(PLATFORM_KEYS)) {
+    status[platform] = { configured: hasValidCreds(platform), keys };
+  }
+  res.json(status);
+});
+
+// Save credentials for a platform
+app.post("/api/platform-credentials/:platform", requireAuth, (req, res) => {
+  const { platform } = req.params;
+  if (!PLATFORM_KEYS[platform]) return res.status(400).json({ error: "Unknown platform" });
+  const { credentials } = req.body;
+  if (!credentials || typeof credentials !== 'object') return res.status(400).json({ error: "credentials object required" });
+
+  const requiredKeys = PLATFORM_KEYS[platform];
+  for (const key of requiredKeys) {
+    if (!credentials[key]?.trim()) return res.status(400).json({ error: `Missing required field: ${key}` });
+  }
+
+  for (const key of requiredKeys) {
+    db.prepare(`
+      INSERT INTO platform_credentials (platform, key_name, key_value, updated_at)
+      VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT(platform, key_name) DO UPDATE SET key_value = excluded.key_value, updated_at = CURRENT_TIMESTAMP
+    `).run(platform, key, credentials[key].trim());
+  }
+
+  res.json({ success: true, configured: hasValidCreds(platform) });
+});
+
+// Clear credentials for a platform
+app.delete("/api/platform-credentials/:platform", requireAuth, (req, res) => {
+  const { platform } = req.params;
+  if (!PLATFORM_KEYS[platform]) return res.status(400).json({ error: "Unknown platform" });
+  db.prepare("DELETE FROM platform_credentials WHERE platform = ?").run(platform);
+  res.json({ success: true });
+});
+
+// Test credentials by attempting to generate an OAuth URL
+app.get("/api/platform-credentials/:platform/test", requireAuth, async (req, res) => {
+  const { platform } = req.params;
+  if (!hasValidCreds(platform)) return res.json({ ok: false, error: "Credentials not saved" });
+  try {
+    if (platform === 'x') {
+      const redirectUri = getRedirectUri(req, 'x');
+      getXClient().generateOAuth2AuthLink(redirectUri, { scope: ['tweet.read', 'users.read'] });
+      return res.json({ ok: true });
+    }
+    if (platform === 'linkedin') {
+      const clientId = getPlatformCred('linkedin', 'client_id');
+      if (clientId.length < 5) throw new Error("Client ID too short");
+      return res.json({ ok: true });
+    }
+    if (platform === 'instagram' || platform === 'threads') {
+      const appId = getPlatformCred(platform, 'app_id');
+      if (appId.length < 5) throw new Error("App ID too short");
+      return res.json({ ok: true });
+    }
+    res.json({ ok: false, error: "Unknown platform" });
+  } catch (err) {
+    res.json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 app.patch("/api/auth/profile", requireAuth, (req, res) => {
   const userId = (req.session as any).userId;
   const { displayName } = req.body;
@@ -331,8 +429,8 @@ app.post("/api/auth/change-password", requireAuth, authLimiter, async (req, res)
 // ─── LinkedIn OAuth ────────────────────────────────────────────────────────────
 
 app.get("/api/auth/linkedin/url", (req, res) => {
-  const clientId = process.env.LINKEDIN_CLIENT_ID;
-  if (!clientId) return res.status(503).json({ error: "LinkedIn not configured. Add LINKEDIN_CLIENT_ID to .env" });
+  if (!hasValidCreds('linkedin')) return res.status(503).json({ error: "LinkedIn not configured", needsConfig: true, platform: 'linkedin' });
+  const clientId = getPlatformCred('linkedin', 'client_id');
 
   const state = crypto.randomBytes(16).toString('hex');
   const redirectUri = getRedirectUri(req, 'linkedin');
@@ -362,8 +460,8 @@ app.get("/auth/linkedin/callback", async (req, res) => {
         grant_type: "authorization_code",
         code: code as string,
         redirect_uri: redirectUri,
-        client_id: process.env.LINKEDIN_CLIENT_ID!,
-        client_secret: process.env.LINKEDIN_CLIENT_SECRET!,
+        client_id: getPlatformCred('linkedin', 'client_id'),
+        client_secret: getPlatformCred('linkedin', 'client_secret'),
       }),
     });
     const tokenData = await tokenRes.json() as any;
@@ -399,8 +497,8 @@ app.get("/auth/linkedin/callback", async (req, res) => {
 // ─── Threads OAuth ─────────────────────────────────────────────────────────────
 
 app.get("/api/auth/threads/url", (req, res) => {
-  const appId = process.env.THREADS_APP_ID;
-  if (!appId) return res.status(503).json({ error: "Threads not configured. Add THREADS_APP_ID to .env" });
+  if (!hasValidCreds('threads')) return res.status(503).json({ error: "Threads not configured", needsConfig: true, platform: 'threads' });
+  const appId = getPlatformCred('threads', 'app_id');
 
   const state = crypto.randomBytes(16).toString('hex');
   const redirectUri = getRedirectUri(req, 'threads');
@@ -427,8 +525,8 @@ app.get("/auth/threads/callback", async (req, res) => {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
-        client_id: process.env.THREADS_APP_ID!,
-        client_secret: process.env.THREADS_APP_SECRET!,
+        client_id: getPlatformCred('threads', 'app_id'),
+        client_secret: getPlatformCred('threads', 'app_secret'),
         grant_type: "authorization_code",
         redirect_uri: redirectUri,
         code: code as string,
@@ -466,11 +564,11 @@ app.get("/auth/threads/callback", async (req, res) => {
 app.get("/api/auth/x/connect/url", (req, res) => {
   const userId = (req.session as any).userId;
   if (!userId) return res.status(401).json({ error: "Must be logged in to connect X" });
-  if (!hasValidXCredentials) return res.status(500).json({ error: "X OAuth credentials not configured" });
+  if (!hasValidCreds('x')) return res.status(503).json({ error: "X OAuth credentials not configured", needsConfig: true, platform: 'x' });
 
   try {
     const redirectUri = getRedirectUri(req, 'x/connect');
-    const { url, codeVerifier, state } = xClient.generateOAuth2AuthLink(
+    const { url, codeVerifier, state } = getXClient().generateOAuth2AuthLink(
       redirectUri,
       { scope: ["tweet.read", "tweet.write", "users.read", "offline.access"] }
     );
@@ -494,7 +592,7 @@ app.get("/auth/x/connect/callback", async (req, res) => {
 
   try {
     const redirectUri = getRedirectUri(req, 'x/connect');
-    const { client: loggedClient, accessToken, refreshToken, expiresIn } = await xClient.loginWithOAuth2({
+    const { client: loggedClient, accessToken, refreshToken, expiresIn } = await getXClient().loginWithOAuth2({
       code: code as string,
       codeVerifier: pending.code_verifier,
       redirectUri,
@@ -532,8 +630,8 @@ app.get("/auth/x/connect/callback", async (req, res) => {
 app.get("/api/auth/instagram/url", (req, res) => {
   const userId = (req.session as any).userId;
   if (!userId) return res.status(401).json({ error: "Must be logged in to connect Instagram" });
-  const appId = process.env.INSTAGRAM_APP_ID;
-  if (!appId) return res.status(503).json({ error: "Instagram not configured. Add INSTAGRAM_APP_ID to .env" });
+  if (!hasValidCreds('instagram')) return res.status(503).json({ error: "Instagram not configured", needsConfig: true, platform: 'instagram' });
+  const appId = getPlatformCred('instagram', 'app_id');
 
   const state = crypto.randomBytes(16).toString('hex');
   const redirectUri = getRedirectUri(req, 'instagram');
@@ -556,13 +654,15 @@ app.get("/auth/instagram/callback", async (req, res) => {
     const redirectUri = getRedirectUri(req, 'instagram');
 
     // Exchange code for short-lived token
-    const tokenUrl = `https://graph.facebook.com/v18.0/oauth/access_token?client_id=${process.env.INSTAGRAM_APP_ID}&redirect_uri=${encodeURIComponent(redirectUri)}&client_secret=${process.env.INSTAGRAM_APP_SECRET}&code=${code}`;
+    const igAppId = getPlatformCred('instagram', 'app_id');
+    const igAppSecret = getPlatformCred('instagram', 'app_secret');
+    const tokenUrl = `https://graph.facebook.com/v18.0/oauth/access_token?client_id=${igAppId}&redirect_uri=${encodeURIComponent(redirectUri)}&client_secret=${igAppSecret}&code=${code}`;
     const tokenRes = await fetch(tokenUrl);
     const tokenData = await tokenRes.json() as any;
     if (!tokenData.access_token) throw new Error(`Token exchange failed: ${JSON.stringify(tokenData)}`);
 
     // Exchange for long-lived token (60 days)
-    const llUrl = `https://graph.facebook.com/oauth/access_token?grant_type=fb_exchange_token&client_id=${process.env.INSTAGRAM_APP_ID}&client_secret=${process.env.INSTAGRAM_APP_SECRET}&fb_exchange_token=${tokenData.access_token}`;
+    const llUrl = `https://graph.facebook.com/oauth/access_token?grant_type=fb_exchange_token&client_id=${igAppId}&client_secret=${igAppSecret}&fb_exchange_token=${tokenData.access_token}`;
     const llRes = await fetch(llUrl);
     const llData = await llRes.json() as any;
     const longToken = llData.access_token || tokenData.access_token;
@@ -753,7 +853,7 @@ app.post("/api/social/post", requireAuth, postLimiter, async (req, res) => {
   // Post to X via platform_tokens (email users with connected X)
   if (platforms.includes('x')) {
     try {
-      if (!hasValidXCredentials) throw new Error("X posting not configured on this server");
+      if (!hasValidCreds('x')) throw new Error("X posting not configured on this server");
       const tokenRecord = getXTokenRecord(userId);
       if (!tokenRecord) throw new Error("X account not connected — go to Settings to connect");
       const accessToken = await refreshXToken(tokenRecord);
@@ -1123,7 +1223,7 @@ app.delete("/api/scheduled-reports/:id", requireAuth, (req, res) => {
 
 async function refreshXToken(tokenRecord: any) {
   if (tokenRecord.expires_at && tokenRecord.expires_at > Date.now() + 60000) return tokenRecord.access_token;
-  const client = new TwitterApi({ clientId: process.env.X_CLIENT_ID!, clientSecret: process.env.X_CLIENT_SECRET! });
+  const client = new TwitterApi({ clientId: getPlatformCred('x', 'client_id'), clientSecret: getPlatformCred('x', 'client_secret') });
   const { accessToken, refreshToken, expiresIn } = await client.refreshOAuth2Token(tokenRecord.refresh_token);
   const expiresAt = Date.now() + expiresIn * 1000;
   if (tokenRecord.x_id) {
@@ -1147,7 +1247,7 @@ function getXTokenRecord(userId: string): any | null {
 }
 
 app.post("/api/post-to-x", postLimiter, async (req, res) => {
-  if (!hasValidXCredentials) {
+  if (!hasValidCreds('x')) {
     return res.status(503).json({ error: "X posting not enabled on this server" });
   }
 
