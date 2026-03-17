@@ -378,6 +378,164 @@ app.get("/auth/threads/callback", async (req, res) => {
   }
 });
 
+// ─── X Connect (link X to an email-auth'd user) ────────────────────────────────
+
+app.get("/api/auth/x/connect/url", (req, res) => {
+  const userId = (req.session as any).userId;
+  if (!userId) return res.status(401).json({ error: "Must be logged in to connect X" });
+  if (!hasValidXCredentials) return res.status(500).json({ error: "X OAuth credentials not configured" });
+
+  try {
+    const redirectUri = getRedirectUri(req, 'x/connect');
+    const { url, codeVerifier, state } = xClient.generateOAuth2AuthLink(
+      redirectUri,
+      { scope: ["tweet.read", "tweet.write", "users.read", "offline.access"] }
+    );
+    db.prepare("INSERT OR REPLACE INTO pending_auth (state, code_verifier, platform) VALUES (?, ?, 'x_connect')").run(state, codeVerifier);
+    req.session.save((err) => {
+      if (err) console.error("Session save error:", err);
+      res.json({ url });
+    });
+  } catch (error) {
+    res.status(500).json({ error: "Failed to generate X auth link", details: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.get("/auth/x/connect/callback", async (req, res) => {
+  const { state, code } = req.query;
+  const userId = (req.session as any).userId;
+
+  const pending = db.prepare("SELECT code_verifier FROM pending_auth WHERE state = ? AND platform = 'x_connect'").get(state) as any;
+  if (!pending || !code) return res.status(400).send("Invalid state or missing code. Please try again.");
+  db.prepare("DELETE FROM pending_auth WHERE state = ?").run(state);
+
+  try {
+    const redirectUri = getRedirectUri(req, 'x/connect');
+    const { client: loggedClient, accessToken, refreshToken, expiresIn } = await xClient.loginWithOAuth2({
+      code: code as string,
+      codeVerifier: pending.code_verifier,
+      redirectUri,
+    });
+
+    const { data: xUser } = await loggedClient.v2.me({ "user.fields": ["profile_image_url", "username", "name"] });
+
+    const expiresAt = Date.now() + (expiresIn || 0) * 1000;
+    db.prepare(`
+      INSERT INTO platform_tokens (user_id, platform, access_token, refresh_token, handle, expires_at)
+      VALUES (?, 'x', ?, ?, ?, ?)
+      ON CONFLICT(user_id, platform) DO UPDATE SET
+        access_token = excluded.access_token,
+        refresh_token = excluded.refresh_token,
+        handle = excluded.handle,
+        expires_at = excluded.expires_at,
+        updated_at = CURRENT_TIMESTAMP
+    `).run(userId || 'anonymous', accessToken, refreshToken || '', `@${xUser.username}`, expiresAt);
+
+    res.send(`<html><body><script>
+      if (window.opener) {
+        window.opener.postMessage({ type: 'OAUTH_X_CONNECT_SUCCESS', handle: '@${xUser.username}' }, '*');
+        window.close();
+      } else { window.location.href = '/settings'; }
+    </script></body></html>`);
+  } catch (error) {
+    console.error("X connect failed:", error);
+    res.status(500).send("X connect failed: " + (error instanceof Error ? error.message : String(error)));
+  }
+});
+
+// ─── Instagram OAuth (Facebook Graph API) ──────────────────────────────────────
+
+app.get("/api/auth/instagram/url", (req, res) => {
+  const userId = (req.session as any).userId;
+  if (!userId) return res.status(401).json({ error: "Must be logged in to connect Instagram" });
+  const appId = process.env.INSTAGRAM_APP_ID;
+  if (!appId) return res.status(503).json({ error: "Instagram not configured. Add INSTAGRAM_APP_ID to .env" });
+
+  const state = Math.random().toString(36).substring(2);
+  const redirectUri = getRedirectUri(req, 'instagram');
+  db.prepare("INSERT OR REPLACE INTO pending_auth (state, code_verifier, platform) VALUES (?, '', 'instagram')").run(state);
+
+  const url = `https://www.facebook.com/v18.0/dialog/oauth?client_id=${appId}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=instagram_basic,pages_show_list,instagram_content_publish,business_management&response_type=code&state=${state}`;
+  res.json({ url });
+});
+
+app.get("/auth/instagram/callback", async (req, res) => {
+  const { code, state } = req.query;
+  const userId = (req.session as any).userId;
+
+  if (!code || !state) return res.status(400).send("Missing code or state");
+  const pending = db.prepare("SELECT state FROM pending_auth WHERE state = ? AND platform = 'instagram'").get(state) as any;
+  if (!pending) return res.status(400).send("Invalid state — please try connecting again");
+  db.prepare("DELETE FROM pending_auth WHERE state = ?").run(state);
+
+  try {
+    const redirectUri = getRedirectUri(req, 'instagram');
+
+    // Exchange code for short-lived token
+    const tokenUrl = `https://graph.facebook.com/v18.0/oauth/access_token?client_id=${process.env.INSTAGRAM_APP_ID}&redirect_uri=${encodeURIComponent(redirectUri)}&client_secret=${process.env.INSTAGRAM_APP_SECRET}&code=${code}`;
+    const tokenRes = await fetch(tokenUrl);
+    const tokenData = await tokenRes.json() as any;
+    if (!tokenData.access_token) throw new Error(`Token exchange failed: ${JSON.stringify(tokenData)}`);
+
+    // Exchange for long-lived token (60 days)
+    const llUrl = `https://graph.facebook.com/oauth/access_token?grant_type=fb_exchange_token&client_id=${process.env.INSTAGRAM_APP_ID}&client_secret=${process.env.INSTAGRAM_APP_SECRET}&fb_exchange_token=${tokenData.access_token}`;
+    const llRes = await fetch(llUrl);
+    const llData = await llRes.json() as any;
+    const longToken = llData.access_token || tokenData.access_token;
+
+    // Find Instagram Business/Creator account via Facebook Pages
+    let igUserId = '';
+    let igUsername = '';
+    let pageToken = longToken;
+
+    const pagesRes = await fetch(`https://graph.facebook.com/v18.0/me/accounts?access_token=${longToken}`);
+    const pagesData = await pagesRes.json() as any;
+
+    if (pagesData.data?.length > 0) {
+      for (const page of pagesData.data) {
+        const igRes = await fetch(`https://graph.facebook.com/v18.0/${page.id}?fields=instagram_business_account&access_token=${page.access_token}`);
+        const igData = await igRes.json() as any;
+        if (igData.instagram_business_account?.id) {
+          igUserId = igData.instagram_business_account.id;
+          pageToken = page.access_token;
+          const usernameRes = await fetch(`https://graph.facebook.com/v18.0/${igUserId}?fields=username&access_token=${pageToken}`);
+          const usernameData = await usernameRes.json() as any;
+          igUsername = usernameData.username || igUserId;
+          break;
+        }
+      }
+    }
+
+    // Fallback: get Facebook user name if no IG business account found
+    if (!igUsername) {
+      const meRes = await fetch(`https://graph.facebook.com/v18.0/me?fields=id,name&access_token=${longToken}`);
+      const meData = await meRes.json() as any;
+      igUsername = meData.name || 'Facebook User';
+    }
+
+    db.prepare(`
+      INSERT INTO platform_tokens (user_id, platform, access_token, handle, person_urn)
+      VALUES (?, 'instagram', ?, ?, ?)
+      ON CONFLICT(user_id, platform) DO UPDATE SET
+        access_token = excluded.access_token,
+        handle = excluded.handle,
+        person_urn = excluded.person_urn,
+        updated_at = CURRENT_TIMESTAMP
+    `).run(userId || 'anonymous', pageToken, igUsername, igUserId);
+
+    const displayHandle = igUserId ? `@${igUsername}` : igUsername;
+    res.send(`<html><body><script>
+      if (window.opener) {
+        window.opener.postMessage({ type: 'OAUTH_INSTAGRAM_SUCCESS', handle: '${displayHandle}' }, '*');
+        window.close();
+      } else { window.location.href = '/settings'; }
+    </script></body></html>`);
+  } catch (error) {
+    console.error("Instagram auth failed:", error);
+    res.status(500).send("Instagram auth failed: " + (error instanceof Error ? error.message : String(error)));
+  }
+});
+
 // ─── Social accounts ───────────────────────────────────────────────────────────
 
 app.get("/api/social/accounts", (req, res) => {
@@ -504,6 +662,59 @@ app.post("/api/social/post", async (req, res) => {
       results.linkedin = { success: true };
     } catch (err) {
       results.linkedin = { success: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  // Post to X via platform_tokens (email users with connected X)
+  if (platforms.includes('x')) {
+    try {
+      if (!hasValidXCredentials) throw new Error("X posting not configured on this server");
+      const tokenRecord = getXTokenRecord(userId);
+      if (!tokenRecord) throw new Error("X account not connected — go to Settings to connect");
+      const accessToken = await refreshXToken(tokenRecord);
+      const client = new TwitterApi(accessToken);
+      const result = await client.v2.tweet(text.substring(0, 280));
+      results.x = { success: true, id: result.data.id };
+    } catch (err) {
+      results.x = { success: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  // Post to Instagram (requires Business/Creator account + publicly hosted image)
+  if (platforms.includes('instagram')) {
+    try {
+      const token = db.prepare("SELECT * FROM platform_tokens WHERE user_id = ? AND platform = 'instagram'").get(userId) as any;
+      if (!token) throw new Error("Instagram not connected");
+      if (!token.person_urn) throw new Error("No Instagram Business account found. Connect a Business or Creator account.");
+
+      // Instagram Graph API only supports image/video posts — text-only not possible
+      // imageUrl must be a publicly accessible URL
+      const { imageUrl, caption } = req.body;
+      if (!imageUrl) {
+        results.instagram = { success: false, error: "Instagram requires an image. Export your slides as PNGs, host them publicly, then provide the image URL." };
+      } else {
+        // Step 1: Create media container
+        const containerRes = await fetch(`https://graph.facebook.com/v18.0/${token.person_urn}/media`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ image_url: imageUrl, caption: caption || text, access_token: token.access_token }),
+        });
+        const container = await containerRes.json() as any;
+        if (!container.id) throw new Error(container.error?.message || "Failed to create Instagram media container");
+
+        // Step 2: Publish
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        const publishRes = await fetch(`https://graph.facebook.com/v18.0/${token.person_urn}/media_publish`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ creation_id: container.id, access_token: token.access_token }),
+        });
+        const publishData = await publishRes.json() as any;
+        if (!publishRes.ok) throw new Error(publishData.error?.message || "Instagram publish failed");
+        results.instagram = { success: true, id: publishData.id };
+      }
+    } catch (err) {
+      results.instagram = { success: false, error: err instanceof Error ? err.message : String(err) };
     }
   }
 
@@ -824,13 +1035,29 @@ app.delete("/api/scheduled-reports/:id", (req, res) => {
 
 // ─── X Posting ─────────────────────────────────────────────────────────────────
 
-async function refreshXToken(user: any) {
-  if (user.expires_at > Date.now() + 60000) return user.access_token;
+async function refreshXToken(tokenRecord: any) {
+  if (tokenRecord.expires_at && tokenRecord.expires_at > Date.now() + 60000) return tokenRecord.access_token;
   const client = new TwitterApi({ clientId: process.env.X_CLIENT_ID!, clientSecret: process.env.X_CLIENT_SECRET! });
-  const { accessToken, refreshToken, expiresIn } = await client.refreshOAuth2Token(user.refresh_token);
+  const { accessToken, refreshToken, expiresIn } = await client.refreshOAuth2Token(tokenRecord.refresh_token);
   const expiresAt = Date.now() + expiresIn * 1000;
-  db.prepare(`UPDATE users SET access_token = ?, refresh_token = ?, expires_at = ? WHERE x_id = ?`).run(accessToken, refreshToken || user.refresh_token, expiresAt, user.x_id);
+  if (tokenRecord.x_id) {
+    // X-login user — update users table
+    db.prepare(`UPDATE users SET access_token = ?, refresh_token = ?, expires_at = ? WHERE x_id = ?`).run(accessToken, refreshToken || tokenRecord.refresh_token, expiresAt, tokenRecord.x_id);
+  } else {
+    // Email user with connected X — update platform_tokens
+    db.prepare(`UPDATE platform_tokens SET access_token = ?, refresh_token = ?, expires_at = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ? AND platform = 'x'`).run(accessToken, refreshToken || tokenRecord.refresh_token, expiresAt, tokenRecord.user_id);
+  }
   return accessToken;
+}
+
+// Resolve X token for any user type (X-login or email + connected X)
+function getXTokenRecord(userId: string): any | null {
+  // First: check if this is an X-login user
+  const xUser = db.prepare("SELECT * FROM users WHERE x_id = ?").get(userId) as any;
+  if (xUser?.access_token) return xUser;
+  // Second: check platform_tokens (email user with connected X)
+  const platformToken = db.prepare("SELECT *, user_id FROM platform_tokens WHERE user_id = ? AND platform = 'x'").get(userId) as any;
+  return platformToken || null;
 }
 
 app.post("/api/post-to-x", async (req, res) => {
@@ -841,15 +1068,15 @@ app.post("/api/post-to-x", async (req, res) => {
   const userId = (req.session as any).userId;
   const { text } = req.body;
 
-  if (!userId) return res.status(401).json({ error: "Not authenticated - please connect your X account" });
+  if (!userId) return res.status(401).json({ error: "Not authenticated" });
 
-  const user = db.prepare("SELECT * FROM users WHERE x_id = ?").get(userId) as any;
-  if (!user) return res.status(401).json({ error: "User data not found - please reconnect X account" });
+  const tokenRecord = getXTokenRecord(userId);
+  if (!tokenRecord) return res.status(401).json({ error: "X account not connected — go to Settings to connect your X account" });
   if (!text?.trim()) return res.status(400).json({ error: "Cannot post empty content" });
   if (text.length > 280) return res.status(400).json({ error: `Post too long: ${text.length}/280 characters` });
 
   try {
-    const accessToken = await refreshXToken(user);
+    const accessToken = await refreshXToken(tokenRecord);
     if (!accessToken) return res.status(401).json({ error: "Failed to authenticate - token is invalid" });
 
     const client = new TwitterApi(accessToken);
@@ -1043,10 +1270,10 @@ setInterval(async () => {
   try {
     const pending = db.prepare("SELECT * FROM scheduled_posts WHERE status = 'pending' AND scheduled_at <= ?").all(new Date().toISOString()) as any[];
     for (const post of pending) {
-      const user = db.prepare("SELECT * FROM users WHERE x_id = ?").get(post.user_id) as any;
-      if (!user) continue;
+      const tokenRecord = getXTokenRecord(post.user_id);
+      if (!tokenRecord) continue;
       try {
-        const accessToken = await refreshXToken(user);
+        const accessToken = await refreshXToken(tokenRecord);
         const client = new TwitterApi(accessToken);
         await client.v2.tweet(post.content);
         db.prepare("UPDATE scheduled_posts SET status = 'posted' WHERE id = ?").run(post.id);
