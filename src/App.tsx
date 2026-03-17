@@ -808,7 +808,7 @@ const Dashboard = () => {
   const forecastReport = isForecast ? activeReport as ForecastReport : null;
   const weeklyReport = !isForecast ? activeReport as WeeklyReport : null;
 
-  const activeType = activeReportRecord?.type || reportType;
+  const activeType = reportType;
   const { hex: acHex, rgb: acRgb } = getReportColor(activeType);
   const T = makeTheme(acHex, acRgb);
 
@@ -1542,14 +1542,13 @@ const Dashboard = () => {
                     </div>
                   </div>
 
-                  <div className="overflow-hidden border border-btc-orange/20">
+                  <div style={{ width: '378px', height: '473px', overflow: 'hidden', border: '1px solid rgba(255,255,255,0.08)', flexShrink: 0 }}>
                     <div
                       ref={instaAssetRef}
-                      className="aspect-[4/5] p-14 flex flex-col gap-8 overflow-hidden relative"
+                      className="p-14 flex flex-col gap-8 relative"
                       style={{
                         width: '1080px', height: '1350px',
                         transform: 'scale(0.35)', transformOrigin: 'top left',
-                        marginBottom: '-877px', marginRight: '-702px',
                         backgroundColor: theme.bg, color: theme.text,
                       }}
                     >
