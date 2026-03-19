@@ -7,6 +7,7 @@ export const REPORT_COLORS: Record<string, { hex: string; rgb: string }> = {
   forecast:     { hex: '#facc15', rgb: '250,204,21' },
   custom:       { hex: '#2dd4bf', rgb: '45,212,191' },
   china:        { hex: '#ef4444', rgb: '239,68,68' },
+  speculation:  { hex: '#e879f9', rgb: '232,121,249' },
 };
 
 export const getReportColor = (type?: string) =>

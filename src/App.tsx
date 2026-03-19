@@ -8,6 +8,9 @@ import { Profile } from './components/Profile';
 import { Compose } from './components/Compose';
 import { Schedule } from './components/Schedule';
 import { Settings } from './components/Settings';
+import { Markets } from './components/Markets';
+import { Reports } from './components/Reports';
+import { AutomatedReports } from './components/AutomatedReports';
 import type { UserData } from './types';
 
 export default function App() {
@@ -69,6 +72,9 @@ export default function App() {
           <Route path="/compose" element={<Compose user={user} />} />
           <Route path="/schedule" element={<Schedule />} />
           <Route path="/settings" element={<Settings user={user} onLogout={handleLogout} />} />
+          <Route path="/markets" element={<Markets user={user} />} />
+          <Route path="/reports" element={<Reports />} />
+          <Route path="/automated" element={<AutomatedReports />} />
         </Routes>
       </Layout>
     </BrowserRouter>

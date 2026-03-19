@@ -6,6 +6,7 @@ export interface AIResponse {
   content: string;
   provider: "gemini" | "gpt" | "claude";
   model: string;
+  warnings?: string[];
 }
 
 export interface ReportRequest {
@@ -163,15 +164,17 @@ async function generateWithClaude(prompt: string, maxTokens = 8000): Promise<AIR
     response.content[0].type === "text" ? response.content[0].text : "";
   if (!content) throw new Error("Empty response from Claude");
 
+  const warnings: string[] = [];
   if (response.stop_reason === "max_tokens") {
-    console.warn("[generateWithClaude] WARNING: Response truncated at max_tokens limit");
-    throw new Error("Claude response truncated — token limit reached. Response is incomplete.");
+    console.warn("[generateWithClaude] WARNING: Response truncated at max_tokens limit — attempting salvage");
+    warnings.push("Claude response was truncated at token limit. Some headlines or analysis may be missing.");
   }
 
   return {
     content,
     provider: "claude",
     model: "claude-sonnet-4-6",
+    warnings: warnings.length ? warnings : undefined,
   };
 }
 
@@ -197,20 +200,17 @@ async function generateWithGPT(prompt: string, maxTokens = 8000): Promise<AIResp
   const content = response.choices[0].message.content || "";
   if (!content) throw new Error("Empty response from GPT");
 
-  console.log(`[generateWithGPT] Raw response (first 300 chars):`, content.substring(0, 300));
-  console.log(`[generateWithGPT] Raw response (last 300 chars):`, content.substring(Math.max(0, content.length - 300)));
-  console.log(`[generateWithGPT] Total length: ${content.length}, finish_reason: ${response.choices[0].finish_reason}`);
-  
-  // Check if response was truncated
+  const warnings: string[] = [];
   if (response.choices[0].finish_reason === "length") {
-    console.warn("[generateWithGPT] WARNING: Response was truncated due to token limit");
-    throw new Error("GPT response truncated - token limit reached. Response is incomplete.");
+    console.warn("[generateWithGPT] WARNING: Response truncated — attempting salvage");
+    warnings.push("GPT response was truncated at token limit. Some headlines or analysis may be missing.");
   }
 
   return {
     content,
     provider: "gpt",
     model: "gpt-4o",
+    warnings: warnings.length ? warnings : undefined,
   };
 }
 
@@ -221,8 +221,6 @@ export function parseJSONResponse<T>(response: AIResponse): T {
   try {
     let jsonText = response.content.trim();
     
-    console.log(`[parseJSONResponse] Raw content length: ${jsonText.length}, first 200 chars:`, jsonText.substring(0, 200));
-    
     // Step 1: Remove markdown code blocks
     jsonText = jsonText.replace(/^```(?:json|JSON)?\s*\n?/m, "").replace(/\n?```\s*$/m, "");
     jsonText = jsonText.trim();
@@ -231,7 +229,7 @@ export function parseJSONResponse<T>(response: AIResponse): T {
     try {
       return JSON.parse(jsonText);
     } catch (e) {
-      console.log("[parseJSONResponse] Direct parse failed");
+      // Silently fail direct parse, fall through to extraction
     }
     
     // Step 3: Simple extraction - find first { or [ and last } or ]
@@ -289,13 +287,42 @@ export function parseJSONResponse<T>(response: AIResponse): T {
     }
     
     if (jsonEnd === -1) {
-      console.log(`[parseJSONResponse] Balance at end: ${balance}, last 100 chars:`, jsonText.substring(Math.max(0, jsonText.length - 100)));
-      throw new Error("Mismatched JSON brackets - no closing bracket found");
+      // Truncated response — try to repair by closing open brackets
+      console.warn("[parseJSON] Truncated JSON detected — attempting repair");
+      let repaired = jsonText.substring(jsonStart);
+      // Close any open string
+      let inStr = false;
+      let esc = false;
+      for (let i = 0; i < repaired.length; i++) {
+        if (repaired[i] === '\\' && !esc) { esc = true; continue; }
+        if (repaired[i] === '"' && !esc) inStr = !inStr;
+        esc = false;
+      }
+      if (inStr) repaired += '"';
+      // Remove trailing comma/incomplete value
+      repaired = repaired.replace(/,\s*"[^"]*$/, '').replace(/,\s*$/, '');
+      // Close open brackets
+      const stack: string[] = [];
+      let inStr2 = false; let esc2 = false;
+      for (const ch of repaired) {
+        if (ch === '\\' && !esc2) { esc2 = true; continue; }
+        if (ch === '"' && !esc2) { inStr2 = !inStr2; esc2 = false; continue; }
+        esc2 = false;
+        if (!inStr2) {
+          if (ch === '{') stack.push('}');
+          else if (ch === '[') stack.push(']');
+          else if (ch === '}' || ch === ']') stack.pop();
+        }
+      }
+      repaired += stack.reverse().join('');
+      try {
+        return JSON.parse(repaired);
+      } catch {
+        throw new Error("Truncated JSON could not be repaired");
+      }
     }
-    
+
     let extracted = jsonText.substring(jsonStart, jsonEnd);
-    console.log(`[parseJSONResponse] Extracted ${extracted.length} chars, first 150:`, extracted.substring(0, 150));
-    console.log(`[parseJSONResponse] Last 150 of extracted:`, extracted.substring(Math.max(0, extracted.length - 150)));
     
     // Step 4: Fix unescaped newlines in string values
     let fixed = "";
@@ -332,7 +359,7 @@ export function parseJSONResponse<T>(response: AIResponse): T {
     try {
       return JSON.parse(fixed);
     } catch (e) {
-      console.log("[parseJSONResponse] Parse failed after newline fix");
+      // Continue to next fix strategy
     }
     
     // Step 6: Remove trailing commas
@@ -341,7 +368,7 @@ export function parseJSONResponse<T>(response: AIResponse): T {
     try {
       return JSON.parse(fixed);
     } catch (e) {
-      console.log("[parseJSONResponse] Parse failed after comma fix");
+      // Continue to next fix strategy
     }
     
     // Step 7: Final attempt - remove any non-printable/control characters except newlines

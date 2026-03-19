@@ -12,7 +12,7 @@ import crypto from "crypto";
 import db from "./db.ts";
 import dotenv from "dotenv";
 import path from "path";
-import { generateWeeklyReport, generateInstagramCaption, generateSubstackArticle, generateForecastReport, type WeeklyReport } from "./src/services/geminiService.ts";
+import { generateWeeklyReport, generateInstagramCaption, generateSubstackArticle, generateForecastReport, generateSpeculationReport, type WeeklyReport } from "./src/services/geminiService.ts";
 
 import fs from "fs";
 
@@ -123,8 +123,11 @@ app.use(
   })
 );
 
+// Reduced logging verbosity - usually only needed in dev or for errors
 app.use((req, res, next) => {
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url} - Session: ${req.sessionID}`);
+  if (process.env.NODE_ENV !== 'production') {
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+  }
   next();
 });
 
@@ -771,6 +774,39 @@ app.post("/api/social/bluesky/connect", async (req, res) => {
   }
 });
 
+// Substack — connect via subdomain + credentials
+app.post("/api/social/substack/connect", async (req, res) => {
+  const { subdomain, email, password } = req.body;
+  const userId = (req.session as any).userId;
+  if (!userId) return res.status(401).json({ error: "Not authenticated" });
+  if (!subdomain) return res.status(400).json({ error: "Substack subdomain is required" });
+
+  try {
+    // Normalize subdomain: strip protocol and .substack.com if provided
+    const cleanSubdomain = subdomain
+      .replace(/^https?:\/\//, '')
+      .replace(/\.substack\.com\/?$/, '')
+      .trim();
+
+    if (!cleanSubdomain) return res.status(400).json({ error: "Invalid subdomain" });
+
+    // Store credentials
+    const tokenData = JSON.stringify({ email: email || '', password: password || '' });
+    db.prepare(`
+      INSERT INTO platform_tokens (user_id, platform, access_token, handle, person_urn)
+      VALUES (?, 'substack', ?, ?, '')
+      ON CONFLICT(user_id, platform) DO UPDATE SET
+        access_token = excluded.access_token,
+        handle = excluded.handle,
+        updated_at = CURRENT_TIMESTAMP
+    `).run(userId, tokenData, cleanSubdomain);
+
+    res.json({ success: true, handle: `${cleanSubdomain}.substack.com` });
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : "Substack connection failed" });
+  }
+});
+
 // ─── Multi-platform post endpoint ─────────────────────────────────────────────
 
 app.post("/api/social/post", requireAuth, postLimiter, async (req, res) => {
@@ -850,16 +886,19 @@ app.post("/api/social/post", requireAuth, postLimiter, async (req, res) => {
     }
   }
 
-  // Post to X via platform_tokens (email users with connected X)
+  // Post to X via OAuth 1.0a (free tier — uses app-level keys)
   if (platforms.includes('x')) {
     try {
-      if (!hasValidCreds('x')) throw new Error("X posting not configured on this server");
-      const tokenRecord = getXTokenRecord(userId);
-      if (!tokenRecord) throw new Error("X account not connected — go to Settings to connect");
-      const accessToken = await refreshXToken(tokenRecord);
-      const client = new TwitterApi(accessToken);
-      const result = await client.v2.tweet(text.substring(0, 280));
-      results.x = { success: true, id: result.data.id };
+      const apiKey    = process.env.X_API_KEY;
+      const apiSecret = process.env.X_API_SECRET;
+      const accToken  = process.env.X_ACCESS_TOKEN;
+      const accSecret = process.env.X_ACCESS_SECRET;
+      if (!apiKey || !apiSecret || !accToken || !accSecret) {
+        throw new Error("X OAuth 1.0a credentials not configured");
+      }
+      const client = new TwitterApi({ appKey: apiKey, appSecret: apiSecret, accessToken: accToken, accessSecret: accSecret });
+      const result = await client.v1.tweet(text.substring(0, 280));
+      results.x = { success: true, id: result.id_str };
     } catch (err) {
       results.x = { success: false, error: err instanceof Error ? err.message : String(err) };
     }
@@ -950,11 +989,13 @@ app.get("/api/debug/models", requireAuth, async (req, res) => {
   }
 });
 
+const REPORT_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes max per report
+
 app.post("/api/generate-report", requireAuth, reportGenLimiter, async (req, res) => {
   try {
     const { type, customTopic } = req.body;
 
-    if (!type || !['global', 'crypto', 'equities', 'nasdaq', 'conspiracies', 'custom', 'forecast', 'china'].includes(type)) {
+    if (!type || !['global', 'crypto', 'equities', 'nasdaq', 'conspiracies', 'custom', 'forecast', 'china', 'speculation'].includes(type)) {
       return res.status(400).json({ error: "Invalid report type" });
     }
     if (type === 'custom' && !customTopic?.trim()) {
@@ -963,20 +1004,35 @@ app.post("/api/generate-report", requireAuth, reportGenLimiter, async (req, res)
 
     console.log(`[API] Generating ${type} report...`);
 
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("REPORT_TIMEOUT")), REPORT_TIMEOUT_MS)
+    );
+
+    // Progress callback just logs server-side
+    const logProgress = (stage: string, percent: number) => {
+      console.log(`[API] ${type} progress: ${percent}% — ${stage}`);
+    };
+
+    let resultPromise: Promise<any>;
+
     if (type === 'forecast') {
-      const forecast = await generateForecastReport();
-      if (!forecast?.events?.length) return res.status(500).json({ error: "Failed to generate forecast: no events returned" });
-      console.log(`[API] Successfully generated forecast with ${forecast.events.length} events`);
-      return res.json(forecast);
+      resultPromise = generateForecastReport(logProgress);
+    } else if (type === 'speculation') {
+      resultPromise = generateSpeculationReport(logProgress);
+    } else {
+      resultPromise = generateWeeklyReport(type, customTopic, logProgress);
     }
 
-    const report = await generateWeeklyReport(type, customTopic);
+    const report = await Promise.race([resultPromise, timeoutPromise]);
 
-    if (!report?.headlines?.length) {
-      return res.status(500).json({ error: "Failed to generate report: no headlines returned" });
+    if (type === 'forecast') {
+      if (!report?.events?.length) return res.status(500).json({ error: "Failed to generate forecast: no events returned" });
+      console.log(`[API] Successfully generated forecast with ${report.events.length} events`);
+    } else {
+      if (!report?.headlines?.length) return res.status(500).json({ error: "Failed to generate report: no headlines returned" });
+      console.log(`[API] Successfully generated ${type} report with ${report.headlines.length} headlines`);
     }
 
-    console.log(`[API] Successfully generated ${type} report with ${report.headlines.length} headlines`);
     res.json(report);
   } catch (error) {
     console.error("[API] Report generation error:", error);
@@ -986,7 +1042,16 @@ app.post("/api/generate-report", requireAuth, reportGenLimiter, async (req, res)
     let userMessage = message;
     let statusCode = 500;
 
-    if (message.includes("rate limit") || message.includes("Rate limit") || message.includes("429") || message.includes("quota")) {
+    if (message === "REPORT_TIMEOUT") {
+      errorType = "TIMEOUT"; statusCode = 504;
+      userMessage = "Report generation timed out after 3 minutes. The AI provider may be slow — please try again.";
+    } else if (message.includes("AbortError") || message.includes("aborted") || message.includes("cancelled") || message.includes("canceled")) {
+      errorType = "CANCELLED"; statusCode = 499;
+      userMessage = "Report generation was cancelled.";
+    } else if (message.includes("ECONNREFUSED") || message.includes("ENOTFOUND") || message.includes("fetch failed") || message.includes("network")) {
+      errorType = "NETWORK_ERROR"; statusCode = 502;
+      userMessage = "Network error — could not reach the AI provider. Check your internet connection and try again.";
+    } else if (message.includes("rate limit") || message.includes("Rate limit") || message.includes("429") || message.includes("quota")) {
       errorType = "RATE_LIMIT"; statusCode = 429;
       userMessage = "Rate limit reached. Please upgrade your API plan or wait before retrying.";
     } else if (message.includes("invalid_api_key") || message.includes("API key") || message.includes("unauthorized") || message.includes("UNAUTHENTICATED")) {
@@ -994,7 +1059,7 @@ app.post("/api/generate-report", requireAuth, reportGenLimiter, async (req, res)
       userMessage = "API authentication failed. Please check your API keys.";
     } else if (message.includes("JSON") || message.includes("parse")) {
       errorType = "PARSING_ERROR"; statusCode = 500;
-      userMessage = "The AI returned invalid data format. This is usually temporary - please retry.";
+      userMessage = "The AI returned invalid data format. This is usually temporary — please retry.";
     } else if (message.includes("All AI providers failed")) {
       errorType = "ALL_PROVIDERS_FAILED"; statusCode = 503;
       userMessage = "All AI providers are currently unavailable. Please try again.";
@@ -1146,6 +1211,18 @@ app.post("/api/substack-article", requireAuth, reportGenLimiter, async (req, res
   }
 });
 
+// ─── Public read-only reports feed (consumed by ChokePointMacro on :3001) ──────
+// No auth required — returns only safe, public-facing fields.
+app.get("/api/public/reports", (req, res) => {
+  const reports = db.prepare("SELECT id, type, content, custom_topic, updated_at FROM reports ORDER BY updated_at DESC LIMIT 50").all() as any[];
+  const safe = reports.map(r => {
+    let content: any = {};
+    try { content = JSON.parse(r.content); } catch {}
+    return { id: r.id, type: r.type, custom_topic: r.custom_topic, updated_at: r.updated_at, content };
+  });
+  res.json({ reports: safe });
+});
+
 // ─── Report Archive ────────────────────────────────────────────────────────────
 
 app.get("/api/reports", requireAuth, (req, res) => {
@@ -1189,6 +1266,28 @@ app.delete("/api/reports/:id", requireAuth, (req, res) => {
   }
 });
 
+app.get("/api/reports/automated", (req, res) => {
+  const reports = db.prepare("SELECT * FROM reports WHERE auto_generated = 1 ORDER BY updated_at DESC").all() as any[];
+  res.json(reports.map(r => ({ ...r, content: JSON.parse(r.content) })));
+});
+
+// ─── App Settings ──────────────────────────────────────────────────────────────
+
+app.get("/api/app-settings/:key", (req, res) => {
+  const row = db.prepare("SELECT value FROM app_settings WHERE key = ?").get(req.params.key) as any;
+  res.json({ value: row?.value ?? null });
+});
+
+app.put("/api/app-settings", requireAuth, (req, res) => {
+  const { key, value } = req.body;
+  if (!key) return res.status(400).json({ error: "key required" });
+  db.prepare(`
+    INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+  `).run(key, value ?? '');
+  res.json({ success: true });
+});
+
 // ─── Report Schedules ──────────────────────────────────────────────────────────
 
 app.get("/api/scheduled-reports", requireAuth, (req, res) => {
@@ -1209,8 +1308,16 @@ app.post("/api/scheduled-reports", requireAuth, (req, res) => {
 });
 
 app.patch("/api/scheduled-reports/:id", requireAuth, (req, res) => {
-  const { enabled } = req.body;
-  db.prepare("UPDATE scheduled_reports SET enabled = ? WHERE id = ?").run(enabled ? 1 : 0, req.params.id);
+  const { enabled, schedule_time, days } = req.body;
+  if (schedule_time !== undefined || days !== undefined) {
+    const current: any = db.prepare("SELECT * FROM scheduled_reports WHERE id = ?").get(req.params.id);
+    if (!current) return res.status(404).json({ error: "Schedule not found" });
+    db.prepare("UPDATE scheduled_reports SET schedule_time = ?, days = ? WHERE id = ?")
+      .run(schedule_time ?? current.schedule_time, days ?? current.days, req.params.id);
+  }
+  if (enabled !== undefined) {
+    db.prepare("UPDATE scheduled_reports SET enabled = ? WHERE id = ?").run(enabled ? 1 : 0, req.params.id);
+  }
   res.json({ success: true });
 });
 
@@ -1494,25 +1601,34 @@ function calculateTweetSlots(baseDate: Date, tweets: any[]): Array<{ time: strin
 
 // Seed default weekly report schedule if none exist
 try {
-  const existing = db.prepare("SELECT COUNT(*) as c FROM scheduled_reports").get() as any;
-  if (existing.c === 0) {
-    const defaults = [
-      { type: 'global',       days: '5', time: '06:00' }, // Friday
-      { type: 'crypto',       days: '1', time: '06:00' }, // Monday
-      { type: 'nasdaq',       days: '2', time: '06:00' }, // Tuesday
-      { type: 'conspiracies', days: '3', time: '06:00' }, // Wednesday
-      { type: 'equities',     days: '4', time: '06:00' }, // Thursday
-      { type: 'forecast',     days: '0', time: '06:00' }, // Sunday
-    ];
-    const insert = db.prepare("INSERT INTO scheduled_reports (report_type, schedule_time, days, enabled) VALUES (?, ?, ?, 1)");
-    for (const d of defaults) insert.run(d.type, d.time, d.days);
-    console.log("[Seed] Default weekly report schedules created");
+  const allDefaults = [
+    { type: 'global',       days: '5', time: '06:00' }, // Friday
+    { type: 'crypto',       days: '1', time: '06:00' }, // Monday
+    { type: 'nasdaq',       days: '2', time: '06:00' }, // Tuesday
+    { type: 'conspiracies', days: '3', time: '06:00' }, // Wednesday
+    { type: 'equities',     days: '4', time: '06:00' }, // Thursday
+    { type: 'forecast',     days: '0', time: '06:00' }, // Sunday
+    { type: 'speculation',  days: '6', time: '06:00' }, // Saturday
+    { type: 'china',        days: '3', time: '12:00' }, // Wednesday (afternoon)
+  ];
+  const insert = db.prepare("INSERT INTO scheduled_reports (report_type, schedule_time, days, enabled) VALUES (?, ?, ?, 1)");
+  for (const d of allDefaults) {
+    const exists = db.prepare("SELECT COUNT(*) as c FROM scheduled_reports WHERE report_type = ?").get(d.type) as any;
+    if (exists.c === 0) {
+      insert.run(d.type, d.time, d.days);
+      console.log(`[Seed] Added missing schedule: ${d.type}`);
+    }
   }
 } catch (err) {
   console.error("[Seed] Failed to seed schedules:", err);
 }
 
+let isCronRunning = false; // Lock to prevent overlapping cron executions
+
 setInterval(async () => {
+  if (isCronRunning) return;
+  isCronRunning = true;
+
   // Process scheduled social posts
   try {
     const pending = db.prepare("SELECT * FROM scheduled_posts WHERE status = 'pending' AND scheduled_at <= ?").all(new Date().toISOString()) as any[];
@@ -1554,16 +1670,71 @@ setInterval(async () => {
       try {
         console.log(`[Cron] Generating scheduled ${schedule.report_type} report...`);
         const isF = schedule.report_type === 'forecast';
+        const isSpec = schedule.report_type === 'speculation';
         const report = isF
           ? await generateForecastReport()
-          : await generateWeeklyReport(schedule.report_type, schedule.custom_topic || undefined);
+          : isSpec
+            ? await generateSpeculationReport()
+            : await generateWeeklyReport(schedule.report_type, schedule.custom_topic || undefined);
         const reportId = `${schedule.report_type}-${Date.now()}`;
+        const reportJson = JSON.stringify(report);
         db.prepare(`
-          INSERT INTO reports (id, type, content, custom_topic, updated_at)
-          VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-        `).run(reportId, schedule.report_type, JSON.stringify(report), schedule.custom_topic || null);
+          INSERT INTO reports (id, type, content, custom_topic, auto_generated, updated_at)
+          VALUES (?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
+        `).run(reportId, schedule.report_type, reportJson, schedule.custom_topic || null);
         db.prepare("UPDATE scheduled_reports SET last_run = CURRENT_TIMESTAMP WHERE id = ?").run(schedule.id);
         console.log(`[Cron] ✓ Scheduled report generated: ${reportId}`);
+
+        // Auto-send email digest if configured
+        const digestEmailRow = db.prepare("SELECT value FROM app_settings WHERE key = 'digest_email'").get() as any;
+        const digestEmail = digestEmailRow?.value;
+        if (digestEmail && process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
+          try {
+            const r = report as any;
+            const headlines = r.headlines || r.events || [];
+            const summary = r.analysis?.overallSummary || r.analysis?.dominantTheme || '';
+            const headlinesHtml = headlines.slice(0, 8).map((h: any, i: number) => `
+              <tr style="border-bottom:1px solid #1a1a1a;">
+                <td style="padding:12px 8px;color:#f7931a;font-family:monospace;width:24px;">${String(i + 1).padStart(2, '0')}</td>
+                <td style="padding:12px 8px;">
+                  <p style="margin:0 0 4px;color:#ffffff;font-weight:600;">${h.title || h.expectedDate || ''}</p>
+                  ${h.summary ? `<p style="margin:0;font-size:12px;color:#888;">${h.summary.substring(0, 200)}</p>` : ''}
+                </td>
+              </tr>`).join('');
+            const typeLabel = schedule.report_type.charAt(0).toUpperCase() + schedule.report_type.slice(1);
+            const html = `
+              <div style="background:#0a0a0a;color:#e5e5e5;font-family:sans-serif;max-width:700px;margin:0 auto;padding:32px;">
+                <div style="border-bottom:1px solid rgba(247,147,26,0.3);padding-bottom:24px;margin-bottom:24px;">
+                  <p style="color:#f7931a;font-family:monospace;font-size:11px;text-transform:uppercase;letter-spacing:0.3em;margin:0 0 8px;">ChokePoint Macro — Auto Report</p>
+                  <h1 style="color:#ffffff;font-size:32px;font-style:italic;margin:0;">${typeLabel} Pulse.</h1>
+                  <p style="color:#888;font-size:12px;margin:8px 0 0;">${new Date().toLocaleDateString('en-US', { weekday:'long',year:'numeric',month:'long',day:'numeric' })}</p>
+                </div>
+                ${summary ? `<div style="background:rgba(247,147,26,0.05);border:1px solid rgba(247,147,26,0.2);padding:20px;margin-bottom:24px;">
+                  <p style="color:#f7931a;font-family:monospace;font-size:10px;text-transform:uppercase;letter-spacing:0.2em;margin:0 0 12px;">Summary</p>
+                  <p style="color:#d1d5db;line-height:1.6;margin:0;">${summary.substring(0, 600)}</p>
+                </div>` : ''}
+                <table style="width:100%;border-collapse:collapse;">${headlinesHtml}</table>
+                <div style="margin-top:32px;padding-top:16px;border-top:1px solid rgba(247,147,26,0.1);text-align:center;">
+                  <p style="color:#444;font-family:monospace;font-size:10px;text-transform:uppercase;margin:0;">ChokePoint Macro · Automated Digest</p>
+                </div>
+              </div>`;
+            const transporter = nodemailer.createTransport({
+              host: process.env.SMTP_HOST,
+              port: parseInt(process.env.SMTP_PORT || "587"),
+              secure: process.env.SMTP_PORT === "465",
+              auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+            });
+            await transporter.sendMail({
+              from: process.env.SMTP_FROM || process.env.SMTP_USER,
+              to: digestEmail,
+              subject: `${typeLabel} Brief — ${new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}`,
+              html,
+            });
+            console.log(`[Cron] ✓ Email digest sent to ${digestEmail}`);
+          } catch (emailErr) {
+            console.error(`[Cron] Email digest failed:`, emailErr);
+          }
+        }
       } catch (err) {
         console.error(`[Cron] Failed to generate scheduled report ${schedule.id}:`, err);
       }
@@ -1571,7 +1742,479 @@ setInterval(async () => {
   } catch (err) {
     console.error("Scheduled reports task error:", err);
   }
+  
+  isCronRunning = false;
 }, 60000);
+
+// ─── Watchlist ────────────────────────────────────────────────────────────────
+
+app.get("/api/watchlist", requireAuth, (req, res) => {
+  const userId = (req.session as any).userId;
+  const rows = db.prepare("SELECT symbol, name, type, added_at FROM watchlist WHERE user_id = ? ORDER BY added_at ASC").all(userId);
+  res.json(rows);
+});
+
+app.post("/api/watchlist", requireAuth, (req, res) => {
+  const userId = (req.session as any).userId;
+  const { symbol, name, type } = req.body;
+  if (!symbol) return res.status(400).json({ error: "symbol required" });
+  try {
+    db.prepare("INSERT OR IGNORE INTO watchlist (user_id, symbol, name, type) VALUES (?, ?, ?, ?)").run(userId, symbol.toUpperCase(), name || symbol, type || "EQUITY");
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+app.delete("/api/watchlist/:symbol", requireAuth, (req, res) => {
+  const userId = (req.session as any).userId;
+  db.prepare("DELETE FROM watchlist WHERE user_id = ? AND symbol = ?").run(userId, req.params.symbol.toUpperCase());
+  res.json({ success: true });
+});
+
+// ─── Markets / Live Data (Public.com) ─────────────────────────────────────────
+
+let publicAccessToken: string | null = null;
+let publicTokenExpiry = 0;
+
+// Price history for 24h change calculation: symbol → [{price, ts}]
+const priceHistory: Record<string, { price: number; ts: number }[]> = {};
+const HISTORY_THROTTLE = 60 * 1000; // Only store 1 point per minute to save memory
+
+async function getPublicToken(): Promise<string> {
+  if (publicAccessToken && Date.now() < publicTokenExpiry) return publicAccessToken;
+  const res = await fetch("https://api.public.com/userapiauthservice/personal/access-tokens", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ validityInMinutes: 60, secret: process.env.PUBLIC_SECRET_KEY }),
+  });
+  const body = await res.text();
+  if (!res.ok) throw new Error(`Public.com token exchange failed ${res.status}: ${body.slice(0, 200)}`);
+  const data = JSON.parse(body) as any;
+  publicAccessToken = data.accessToken;
+  publicTokenExpiry = Date.now() + 55 * 60 * 1000;
+  return publicAccessToken!;
+}
+
+const MARKET_INSTRUMENTS = [
+  { symbol: "BTC",  type: "CRYPTO", name: "Bitcoin",      isCrypto: true },
+  { symbol: "SPX",  type: "INDEX",  name: "S&P 500",      isIndex:  true },
+  { symbol: "NDX",  type: "INDEX",  name: "Nasdaq-100",   isIndex:  true },
+  { symbol: "MSTR", type: "EQUITY", name: "MicroStrategy"                },
+  { symbol: "TSLA", type: "EQUITY", name: "Tesla"                        },
+  { symbol: "MSFT", type: "EQUITY", name: "Microsoft"                    },
+  { symbol: "META", type: "EQUITY", name: "Meta"                         },
+  { symbol: "AAPL", type: "EQUITY", name: "Apple"                        },
+  { symbol: "AMZN", type: "EQUITY", name: "Amazon"                       },
+  { symbol: "NVDA", type: "EQUITY", name: "Nvidia"                       },
+  { symbol: "AMD",  type: "EQUITY", name: "AMD"                          },
+];
+
+app.get("/api/markets", async (req, res) => {
+  try {
+    const token     = await getPublicToken();
+    const accountId = process.env.PUBLIC_ACCOUNT_ID!;
+
+    const pRes = await fetch(
+      `https://api.public.com/userapigateway/marketdata/${accountId}/quotes`,
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ instruments: MARKET_INSTRUMENTS.map(i => ({ symbol: i.symbol, type: i.type })) }),
+      }
+    );
+
+    if (!pRes.ok) {
+      const err = await pRes.text();
+      throw new Error(`Public.com quotes failed ${pRes.status}: ${err.slice(0, 200)}`);
+    }
+
+    const pData = await pRes.json() as any;
+    const list: any[] = pData.quotes || [];
+
+    // Build quote map keyed by instrument symbol
+    const quoteMap: Record<string, any> = {};
+    for (const q of list) {
+      const sym = q.instrument?.symbol ?? q.symbol;
+      if (sym) quoteMap[sym] = q;
+    }
+
+    const now = Date.now();
+    const WINDOW = 25 * 60 * 60 * 1000; // 25 hours
+
+    const result = MARKET_INSTRUMENTS.map(inst => {
+      const q     = quoteMap[inst.symbol] || {};
+      const price = q.last != null ? parseFloat(q.last) : null;
+
+      // Update price history
+      if (price != null) {
+        const history = priceHistory[inst.symbol] || (priceHistory[inst.symbol] = []);
+        const lastEntry = history[history.length - 1];
+        
+        // Optimization: Only push if enough time passed to avoid array bloat on high traffic
+        if (!lastEntry || now - lastEntry.ts > HISTORY_THROTTLE) {
+          history.push({ price, ts: now });
+        }
+        // Trim entries older than 25h
+        priceHistory[inst.symbol] = priceHistory[inst.symbol].filter(e => now - e.ts < WINDOW);
+      }
+
+      // 24h change: compare with oldest entry ≥ 23h ago, else first available
+      let change: number | null = null;
+      let changePercent: number | null = null;
+      const hist = priceHistory[inst.symbol] || [];
+      if (price != null && hist.length > 1) {
+        const old = hist.find(e => now - e.ts >= 23 * 60 * 60 * 1000) ?? hist[0];
+        if (old && old.price) {
+          change = price - old.price;
+          changePercent = (change / old.price) * 100;
+        }
+      }
+
+      const bid    = q.bid    != null ? parseFloat(q.bid)    : null;
+      const ask    = q.ask    != null ? parseFloat(q.ask)    : null;
+      const spread = bid != null && ask != null ? ask - bid : null;
+
+      return {
+        symbol:        inst.symbol,
+        name:          inst.name,
+        type:          inst.type,
+        isCrypto:      (inst as any).isCrypto || false,
+        isIndex:       (inst as any).isIndex  || false,
+        price,
+        change,
+        changePercent,
+        bid,
+        ask,
+        spread,
+        volume:        q.volume != null ? Number(q.volume) : null,
+        lastTimestamp: q.lastTimestamp ?? null,
+        outcome:       q.outcome ?? null,
+      };
+    });
+
+    res.json(result);
+  } catch (err) {
+    console.error("[Markets] Error:", err);
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// ─── Market History — 30-day candles (Yahoo Finance v8) ───────────────────────
+
+const YAHOO_MAP: Record<string, string> = {
+  BTC: "BTC-USD", SPX: "^GSPC", NDX: "^NDX",
+  MSTR: "MSTR", TSLA: "TSLA", MSFT: "MSFT",
+  META: "META", AAPL: "AAPL", AMZN: "AMZN", NVDA: "NVDA", AMD: "AMD",
+};
+
+app.get("/api/markets/history", async (_req, res) => {
+  try {
+    const results = await Promise.all(
+      Object.entries(YAHOO_MAP).map(async ([sym, yahooSym]) => {
+        try {
+          const r = await fetch(
+            `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSym)}?interval=1d&range=1mo`,
+            { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" } }
+          );
+          if (!r.ok) return { symbol: sym, candles: [], pivotLevels: null };
+          const j = await r.json() as any;
+          const result = j.chart?.result?.[0];
+          if (!result) return { symbol: sym, candles: [], pivotLevels: null };
+          const timestamps: number[] = result.timestamp || [];
+          const q = result.indicators?.quote?.[0] || {};
+          const candles = timestamps.map((t, i) => ({
+            t: t * 1000, o: q.open?.[i], h: q.high?.[i], l: q.low?.[i], c: q.close?.[i], v: q.volume?.[i],
+          })).filter((c: any) => c.o != null && c.h != null && c.l != null && c.c != null);
+
+          const last = candles[candles.length - 1] as any;
+          const pivotLevels = last ? (() => {
+            const p = (last.h + last.l + last.c) / 3;
+            return {
+              p, r1: 2*p - last.l, r2: p + (last.h - last.l), r3: last.h + 2*(p - last.l),
+              s1: 2*p - last.h, s2: p - (last.h - last.l), s3: last.l - 2*(last.h - p),
+            };
+          })() : null;
+
+          return { symbol: sym, candles, pivotLevels };
+        } catch { return { symbol: sym, candles: [], pivotLevels: null }; }
+      })
+    );
+    res.json(results);
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// ─── Options — most traded contracts (Public.com option-chain) ────────────────
+
+function nextMonthlyExpiry(): string {
+  const now = new Date();
+  for (let mo = 0; mo <= 3; mo++) {
+    const d = new Date(now.getFullYear(), now.getMonth() + mo, 1);
+    let fri = 0;
+    while (fri < 3) { if (d.getDay() === 5) fri++; if (fri < 3) d.setDate(d.getDate() + 1); }
+    if (d.getTime() - now.getTime() > 7 * 864e5) return d.toISOString().split("T")[0];
+  }
+  return "";
+}
+
+const EQUITY_SYMS = ["MSTR", "TSLA", "MSFT", "META", "AAPL", "AMZN", "NVDA", "AMD"];
+let optionsCache: any = null;
+let optionsCacheTime = 0;
+
+app.get("/api/markets/options", async (_req, res) => {
+  try {
+    if (optionsCache && Date.now() - optionsCacheTime < 5 * 60 * 1000) return res.json(optionsCache);
+
+    const token   = await getPublicToken();
+    const acctId  = process.env.PUBLIC_ACCOUNT_ID!;
+    const expiry  = nextMonthlyExpiry();
+
+    const results = await Promise.all(
+      EQUITY_SYMS.map(async (sym) => {
+        try {
+          const r = await fetch(
+            `https://api.public.com/userapigateway/marketdata/${acctId}/option-chain`,
+            {
+              method: "POST",
+              headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+              body: JSON.stringify({ instrument: { symbol: sym, type: "EQUITY" }, expirationDate: expiry }),
+            }
+          );
+          if (!r.ok) return { symbol: sym, expiry, contracts: [] };
+          const data = await r.json() as any;
+          const calls = (data.calls || []).map((o: any) => ({ ...o, side: "CALL" }));
+          const puts  = (data.puts  || []).map((o: any) => ({ ...o, side: "PUT" }));
+          const top = [...calls, ...puts]
+            .filter((o: any) => (o.volume || 0) > 0)
+            .sort((a: any, b: any) => (b.volume || 0) - (a.volume || 0))
+            .slice(0, 8)
+            .map((o: any) => {
+              const osiSym: string = o.instrument?.symbol || "";
+              const strike = osiSym.length >= 8 ? parseInt(osiSym.slice(-8)) / 1000 : null;
+              return {
+                symbol: osiSym, side: o.side, strike,
+                last:  o.last  != null ? parseFloat(o.last)  : null,
+                bid:   o.bid   != null ? parseFloat(o.bid)   : null,
+                ask:   o.ask   != null ? parseFloat(o.ask)   : null,
+                volume: o.volume || 0,
+                openInterest: o.openInterest || 0,
+              };
+            });
+          return { symbol: sym, expiry, contracts: top };
+        } catch { return { symbol: sym, expiry, contracts: [] }; }
+      })
+    );
+
+    optionsCache = results;
+    optionsCacheTime = Date.now();
+    res.json(results);
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// ─── Market Insights — AI-generated analysis from live data ──────────────────
+
+let insightsCache: { text: string; ts: number } | null = null;
+const INSIGHTS_TTL = 10 * 60 * 1000; // 10 minutes
+
+app.get("/api/markets/insights", async (_req, res) => {
+  if (insightsCache && Date.now() - insightsCache.ts < INSIGHTS_TTL) {
+    return res.json({ text: insightsCache.text, cached: true, generatedAt: new Date(insightsCache.ts).toISOString() });
+  }
+
+  try {
+    // Gather live prices
+    const token     = await getPublicToken();
+    const accountId = process.env.PUBLIC_ACCOUNT_ID!;
+    const pRes = await fetch(
+      `https://api.public.com/userapigateway/marketdata/${accountId}/quotes`,
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ instruments: MARKET_INSTRUMENTS.map(i => ({ symbol: i.symbol, type: i.type })) }),
+      }
+    );
+    const pData = pRes.ok ? await pRes.json() as any : { quotes: [] };
+    const quoteMap: Record<string, any> = {};
+    for (const q of (pData.quotes || [])) {
+      const sym = q.instrument?.symbol ?? q.symbol;
+      if (sym) quoteMap[sym] = q;
+    }
+
+    // Gather 30-day history + pivots
+    const historyData = await Promise.all(
+      Object.entries(YAHOO_MAP).map(async ([sym, yahooSym]) => {
+        try {
+          const r = await fetch(
+            `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSym)}?interval=1d&range=1mo`,
+            { headers: { "User-Agent": "Mozilla/5.0" } }
+          );
+          if (!r.ok) return { sym, open30: null, close30: null, hi30: null, lo30: null, pivot: null };
+          const j = await r.json() as any;
+          const result = j.chart?.result?.[0];
+          if (!result) return { sym, open30: null, close30: null, hi30: null, lo30: null, pivot: null };
+          const ts: number[] = result.timestamp || [];
+          const q2 = result.indicators?.quote?.[0] || {};
+          const candles = ts.map((t, i) => ({
+            o: q2.open?.[i], h: q2.high?.[i], l: q2.low?.[i], c: q2.close?.[i],
+          })).filter((c: any) => c.o != null);
+          if (!candles.length) return { sym, open30: null, close30: null, hi30: null, lo30: null, pivot: null };
+          const last  = candles[candles.length - 1] as any;
+          const first = candles[0] as any;
+          const hi30  = Math.max(...candles.map((c: any) => c.h));
+          const lo30  = Math.min(...candles.map((c: any) => c.l));
+          const p = (last.h + last.l + last.c) / 3;
+          return {
+            sym, open30: first.o, close30: last.c, hi30, lo30,
+            pivot: { p, r1: 2*p - last.l, s1: 2*p - last.h },
+          };
+        } catch { return { sym, open30: null, close30: null, hi30: null, lo30: null, pivot: null }; }
+      })
+    );
+
+    // Build a compact data snapshot for the prompt
+    const lines = MARKET_INSTRUMENTS.map(inst => {
+      const q    = quoteMap[inst.symbol] || {};
+      const price = q.last != null ? parseFloat(q.last) : null;
+      const h    = historyData.find(d => d.sym === inst.symbol);
+      const pct30 = h?.open30 && price ? ((price - h.open30) / h.open30 * 100).toFixed(1) : "?";
+      const pivot = h?.pivot ? `P=${h.pivot.p.toFixed(0)} S1=${h.pivot.s1.toFixed(0)} R1=${h.pivot.r1.toFixed(0)}` : "";
+      const priceStr = price != null ? (inst.isIndex ? price.toFixed(0) : `$${price.toFixed(2)}`) : "N/A";
+      const rangeStr = h?.hi30 ? `30d range $${h.lo30?.toFixed(0)}–$${h.hi30?.toFixed(0)}` : "";
+      return `${inst.symbol} (${inst.name}): ${priceStr} | ${pct30}% vs 30d ago | ${rangeStr} | ${pivot}`;
+    });
+
+    const now = new Date().toUTCString();
+    const prompt = `You are a sharp, concise macro/markets analyst. Today is ${now}.
+
+Here is live market data:
+${lines.join('\n')}
+
+Write a tight, actionable market insights brief (aim for ~300 words). Structure it as:
+1. **Overall Tone** — one sentence: risk-on, risk-off, or mixed? Why?
+2. **Key Setups** — 3–5 bullet points, each covering a specific instrument or theme. Call out pivot levels, breakout/breakdown risks, relative strength/weakness, and what to watch.
+3. **Watch List** — 2–3 specific price levels or catalysts that will define the next move.
+
+Be direct. No filler. Use the actual numbers from the data. Format in markdown.`;
+
+    const anthropic = new (await import("@anthropic-ai/sdk")).default();
+    const msg = await anthropic.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 600,
+      messages: [{ role: "user", content: prompt }],
+    });
+
+    const text = (msg.content[0] as any).text as string;
+    insightsCache = { text, ts: Date.now() };
+    res.json({ text, cached: false, generatedAt: new Date().toISOString() });
+  } catch (err) {
+    console.error("[Insights]", err);
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// ─── Ticker Lookup — arbitrary symbol on demand ───────────────────────────────
+
+app.get("/api/markets/lookup", async (req, res) => {
+  const raw  = ((req.query.symbol as string) || "").trim().toUpperCase();
+  const type = ((req.query.type  as string) || "EQUITY").toUpperCase();
+  if (!raw) return res.status(400).json({ error: "symbol required" });
+
+  try {
+    const token     = await getPublicToken();
+    const accountId = process.env.PUBLIC_ACCOUNT_ID!;
+
+    // Try the supplied type first; if that gets no quote, try the other two
+    const tryTypes = type === "CRYPTO"
+      ? ["CRYPTO", "EQUITY", "INDEX"]
+      : type === "INDEX"
+        ? ["INDEX", "EQUITY", "CRYPTO"]
+        : ["EQUITY", "CRYPTO", "INDEX"];
+
+    let quoteData: any = null;
+    let resolvedType = type;
+
+    for (const t of tryTypes) {
+      const qRes = await fetch(
+        `https://api.public.com/userapigateway/marketdata/${accountId}/quotes`,
+        {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ instruments: [{ symbol: raw, type: t }] }),
+        }
+      );
+      if (!qRes.ok) continue;
+      const qData = await qRes.json() as any;
+      const q = (qData.quotes || [])[0];
+      if (q && (q.last != null || q.bid != null || q.ask != null)) {
+        quoteData = q;
+        resolvedType = t;
+        break;
+      }
+    }
+
+    if (!quoteData) return res.status(404).json({ error: `No quote found for ${raw}` });
+
+    const price  = quoteData.last  != null ? parseFloat(quoteData.last)  : null;
+    const bid    = quoteData.bid   != null ? parseFloat(quoteData.bid)   : null;
+    const ask    = quoteData.ask   != null ? parseFloat(quoteData.ask)   : null;
+    const spread = bid != null && ask != null ? ask - bid : null;
+
+    const tile = {
+      symbol:        raw,
+      name:          quoteData.instrument?.description || raw,
+      type:          resolvedType,
+      isCrypto:      resolvedType === "CRYPTO",
+      isIndex:       resolvedType === "INDEX",
+      price,
+      change:        null,
+      changePercent: null,
+      bid,
+      ask,
+      spread,
+      volume:        quoteData.volume != null ? Number(quoteData.volume) : null,
+      lastTimestamp: quoteData.lastTimestamp ?? null,
+    };
+
+    // Fetch 30-day candle history from Yahoo Finance
+    const yahooSym = resolvedType === "CRYPTO" ? `${raw}-USD` : raw;
+    let candles: any[] = [];
+    let pivotLevels: any = null;
+    try {
+      const yRes = await fetch(
+        `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSym)}?interval=1d&range=1mo`,
+        { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" } }
+      );
+      if (yRes.ok) {
+        const yData = await yRes.json() as any;
+        const result = yData.chart?.result?.[0];
+        if (result) {
+          const timestamps: number[] = result.timestamp || [];
+          const q2 = result.indicators?.quote?.[0] || {};
+          candles = timestamps.map((t: number, i: number) => ({
+            t: t * 1000, o: q2.open?.[i], h: q2.high?.[i], l: q2.low?.[i], c: q2.close?.[i],
+          })).filter((c: any) => c.o != null && c.h != null && c.l != null && c.c != null);
+          const last = candles[candles.length - 1] as any;
+          if (last) {
+            const p = (last.h + last.l + last.c) / 3;
+            pivotLevels = {
+              p, r1: 2*p - last.l, r2: p + (last.h - last.l), r3: last.h + 2*(p - last.l),
+              s1: 2*p - last.h, s2: p - (last.h - last.l), s3: last.l - 2*(last.h - p),
+            };
+          }
+        }
+      }
+    } catch { /* history is optional */ }
+
+    res.json({ tile, candles, pivotLevels });
+  } catch (err) {
+    console.error("[Lookup]", err);
+    res.status(500).json({ error: String(err) });
+  }
+});
 
 // ─── Vite / Static ─────────────────────────────────────────────────────────────
 

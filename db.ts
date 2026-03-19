@@ -87,14 +87,34 @@ db.exec(`
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(platform, key_name)
   );
+
+  CREATE TABLE IF NOT EXISTS watchlist (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    symbol TEXT NOT NULL,
+    name TEXT,
+    type TEXT,
+    added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, symbol)
+  );
+
+  CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
 `);
 
-// Migration: add custom_topic column to reports if missing
+// Migration: add custom_topic and auto_generated columns to reports if missing
 try {
   const cols = db.prepare("PRAGMA table_info(reports)").all() as any[];
   if (!cols.some(c => c.name === 'custom_topic')) {
     db.exec("ALTER TABLE reports ADD COLUMN custom_topic TEXT");
     console.log("Migrated reports table: added custom_topic column");
+  }
+  if (!cols.some(c => c.name === 'auto_generated')) {
+    db.exec("ALTER TABLE reports ADD COLUMN auto_generated INTEGER DEFAULT 0");
+    console.log("Migrated reports table: added auto_generated column");
   }
 } catch (err) {
   console.error("Reports migration error:", err);

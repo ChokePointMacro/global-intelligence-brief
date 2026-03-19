@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Link } from 'react-router-dom';
 import { AnimatePresence, motion } from 'motion/react';
-import { ChevronDown, User, Send, Calendar, Settings as SettingsIcon, LogOut } from 'lucide-react';
+import { ChevronDown, User, Send, Calendar, Settings as SettingsIcon, LogOut, BarChart2, FileText } from 'lucide-react';
 import { cn } from '../lib/utils';
 import type { UserData } from '../types';
 
@@ -49,9 +49,11 @@ export const Dropdown = ({ user, onLogout }: { user: UserData; onLogout: () => v
             </div>
             <div className="p-1">
               {[
-                { to: '/profile', icon: <User size={14} />, label: 'Profile' },
-                { to: '/compose', icon: <Send size={14} />, label: 'Compose' },
-                { to: '/schedule', icon: <Calendar size={14} />, label: 'Schedule' },
+                { to: '/profile',  icon: <User size={14} />,        label: 'Profile'  },
+                { to: '/markets',  icon: <BarChart2 size={14} />,   label: 'Markets'  },
+                { to: '/reports',  icon: <FileText size={14} />,    label: 'Reports'  },
+                { to: '/compose',  icon: <Send size={14} />,        label: 'Compose'  },
+                { to: '/schedule', icon: <Calendar size={14} />,    label: 'Schedule' },
                 { to: '/settings', icon: <SettingsIcon size={14} />, label: 'Settings' },
               ].map(({ to, icon, label }) => (
                 <Link

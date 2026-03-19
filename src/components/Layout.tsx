@@ -33,6 +33,9 @@ export const Layout = ({ children, user, onLogout, onLogin }: {
           <div className="flex items-center gap-6">
             <nav className="flex items-center gap-4 sm:gap-6 border-r border-btc-orange/20 pr-4 sm:pr-6">
               <Link to="/" className="text-[10px] font-mono uppercase tracking-widest hover:text-btc-orange transition-colors hidden sm:inline">Briefing</Link>
+              <Link to="/markets" className="text-[10px] font-mono uppercase tracking-widest hover:text-btc-orange transition-colors hidden sm:inline">Markets</Link>
+              <Link to="/reports" className="text-[10px] font-mono uppercase tracking-widest hover:text-btc-orange transition-colors hidden sm:inline">Reports</Link>
+              <Link to="/automated" className="text-[10px] font-mono uppercase tracking-widest hover:text-btc-orange transition-colors hidden sm:inline">Automated</Link>
               {user && <>
                 <Link to="/compose" className="text-[10px] font-mono uppercase tracking-widest hover:text-btc-orange transition-colors">Compose</Link>
                 <Link to="/schedule" className="text-[10px] font-mono uppercase tracking-widest hover:text-btc-orange transition-colors hidden sm:inline">Schedule</Link>

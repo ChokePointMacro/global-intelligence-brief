@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
-import { Twitter, Linkedin, AtSign, MessageSquare, Loader2, Send, Clock, Check, X as XIcon } from 'lucide-react';
+import { Twitter, Linkedin, AtSign, MessageSquare, Loader2, Send, Clock, Check, X as XIcon, Copy } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { apiFetch } from '../lib/api';
 import { BackButton } from './BackButton';
@@ -13,6 +13,7 @@ export const Compose = ({ user }: { user: UserData | null }) => {
   const [platforms, setPlatforms] = useState<string[]>(['x']);
   const [socialAccounts, setSocialAccounts] = useState<SocialAccount[]>([]);
   const [postResults, setPostResults] = useState<Record<string, { success: boolean; error?: string }> | null>(null);
+  const [copied, setCopied] = useState(false);
   const navigate = useNavigate();
 
   useEffect(() => {
@@ -27,10 +28,8 @@ export const Compose = ({ user }: { user: UserData | null }) => {
     }
   }, []);
 
-  const isConnected = (platform: string) => {
-    if (platform === 'x') return !!user;
-    return socialAccounts.some(a => a.platform === platform);
-  };
+  const isConnected = (platform: string) =>
+    socialAccounts.some(a => a.platform === platform);
 
   const togglePlatform = (platform: string) => {
     setPlatforms(prev => prev.includes(platform) ? prev.filter(p => p !== platform) : [...prev, platform]);
@@ -38,34 +37,25 @@ export const Compose = ({ user }: { user: UserData | null }) => {
 
   const handlePost = async () => {
     if (!content.trim()) return alert("Cannot post empty content.");
+    if (platforms.length === 0) return alert("Select at least one platform.");
     setLoading(true);
     setPostResults(null);
-    const results: Record<string, { success: boolean; error?: string }> = {};
 
-    if (platforms.includes('x')) {
-      if (!user) { results.x = { success: false, error: "X not connected" }; }
-      else {
-        const res = await apiFetch('/api/post-to-x', { method: 'POST', body: JSON.stringify({ text: content }) });
-        const data = await res.json();
-        results.x = res.ok && data.success ? { success: true } : { success: false, error: data.error || 'Failed' };
-      }
-    }
-
-    const otherPlatforms = platforms.filter(p => p !== 'x');
-    if (otherPlatforms.length > 0) {
-      const res = await apiFetch('/api/social/post', { method: 'POST', body: JSON.stringify({ text: content, platforms: otherPlatforms }) });
-      const data = await res.json();
-      if (data.results) Object.assign(results, data.results);
-    }
+    const res = await apiFetch('/api/social/post', {
+      method: 'POST',
+      body: JSON.stringify({ text: content, platforms }),
+    });
+    const data = await res.json();
+    const results = data.results || {};
 
     setPostResults(results);
-    const allSuccess = Object.values(results).every(r => r.success);
-    if (allSuccess) { setTimeout(() => { setContent(''); navigate('/'); }, 1500); }
+    const allSuccess = Object.values(results).every((r: any) => r.success);
+    if (allSuccess) setTimeout(() => { setContent(''); navigate('/'); }, 1500);
     setLoading(false);
   };
 
   const handleSchedule = async () => {
-    if (!user) return alert("Please connect your X account first.");
+    if (!isConnected('x')) return alert("Connect your X account in Settings first.");
     const dateStr = prompt("Enter scheduled date/time (YYYY-MM-DD HH:mm):", new Date(Date.now() + 3600000).toISOString().substring(0, 16).replace('T', ' '));
     if (!dateStr) return;
     setLoading(true);
@@ -129,6 +119,18 @@ export const Compose = ({ user }: { user: UserData | null }) => {
         <div className="flex justify-between items-center">
           <span className="text-[10px] font-mono uppercase opacity-40 text-btc-orange/60">{content.length} / 280</span>
           <div className="flex gap-4">
+            <button
+              onClick={() => {
+                navigator.clipboard.writeText(content);
+                setCopied(true);
+                setTimeout(() => setCopied(false), 2000);
+              }}
+              disabled={!content}
+              className="flex items-center gap-2 px-4 py-3 border border-white/10 text-gray-400 text-xs font-mono uppercase tracking-widest hover:border-white/30 hover:text-white transition-colors disabled:opacity-30"
+            >
+              {copied ? <Check size={14} className="text-emerald-400" /> : <Copy size={14} />}
+              {copied ? 'Copied' : 'Copy'}
+            </button>
             <button
               onClick={handleSchedule}
               disabled={!content || loading}

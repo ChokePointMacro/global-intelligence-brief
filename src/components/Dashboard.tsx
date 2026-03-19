@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import {
   FileText, TrendingUp, ExternalLink, Loader2, RefreshCw, Clock,
   ChevronRight, ChevronLeft, Copy, Send, Calendar, Trash2, Instagram,
-  Download, Volume2, Mail, Plus, Link2, X as XIcon, Check,
+  Download, Volume2, Plus, Link2, X as XIcon, Check,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import Markdown from 'react-markdown';
@@ -56,6 +56,10 @@ export const Dashboard = () => {
   const [reports, setReports] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
   const [loadingError, setLoadingError] = useState<string | null>(null);
+  const [loadingStage, setLoadingStage] = useState('');
+  const [loadingPercent, setLoadingPercent] = useState(0);
+  const [reportSources, setReportSources] = useState<any[]>([]);
+  const [reportWarnings, setReportWarnings] = useState<string[]>([]);
   const [activeReportId, setActiveReportId] = useState<string | null>(null);
   const [reportType, setReportType] = useState('global');
   const [customTopic, setCustomTopic] = useState('');
@@ -68,8 +72,6 @@ export const Dashboard = () => {
   const [slideTheme, setSlideTheme] = useState<SlideThemeName>('dark');
   const [audioLoading, setAudioLoading] = useState(false);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
-  const [emailTo, setEmailTo] = useState('');
-  const [sendingEmail, setSendingEmail] = useState(false);
   const [substackArticle, setSubstackArticle] = useState('');
   const [generatingSubstack, setGeneratingSubstack] = useState(false);
   const [showSubstackModal, setShowSubstackModal] = useState(false);
@@ -107,7 +109,7 @@ export const Dashboard = () => {
 
   const getReportLabel = (r: any) => {
     if (r.type === 'custom') return r.custom_topic ? truncateToWords(r.custom_topic, 4) : 'Custom';
-    const labels: Record<string, string> = { equities: 'S&P 500', nasdaq: 'Nasdaq-100', crypto: 'Crypto', conspiracies: 'Conspiracies', global: 'Global', forecast: '7-Day Forecast', china: 'China Supply Chain' };
+    const labels: Record<string, string> = { equities: 'S&P 500', nasdaq: 'Nasdaq-100', crypto: 'Crypto', conspiracies: 'Conspiracies', speculation: 'Speculation', global: 'Global', forecast: '7-Day Forecast', china: 'China Supply Chain' };
     return labels[r.type] || 'Global';
   };
 
@@ -195,8 +197,24 @@ export const Dashboard = () => {
     }
     setLoading(true);
     setLoadingError(null);
+    setLoadingStage('Starting...');
+    setLoadingPercent(0);
+    setReportSources([]);
+    setReportWarnings([]);
     setAudioUrl(null);
     abortControllerRef.current = new AbortController();
+
+    // Simulate progress bar stages
+    const progressInterval = setInterval(() => {
+      setLoadingPercent(prev => {
+        if (prev < 15) { setLoadingStage('Fetching news sources...'); return prev + 3; }
+        if (prev < 30) { setLoadingStage('Filtering & scoring articles...'); return prev + 2; }
+        if (prev < 50) { setLoadingStage('Sending to AI provider...'); return prev + 1; }
+        if (prev < 85) { setLoadingStage('AI generating report...'); return prev + 0.5; }
+        if (prev < 92) { setLoadingStage('Parsing AI response...'); return prev + 0.3; }
+        return prev;
+      });
+    }, 800);
 
     try {
       const response = await apiFetch('/api/generate-report', {
@@ -212,6 +230,15 @@ export const Dashboard = () => {
 
       const report = await response.json();
       const isForecastType = reportType === 'forecast';
+
+      // Extract metadata before saving
+      const sources = report._sources || [];
+      const warnings = report._warnings || [];
+      delete report._sources;
+      delete report._warnings;
+      setReportSources(sources);
+      setReportWarnings(warnings);
+
       if (isForecastType && !report.events?.length) throw new Error("No forecast events generated. Please try again.");
       if (!isForecastType && !report.headlines?.length) throw new Error("No headlines generated. Please try again.");
       if (!report.analysis) throw new Error("No analysis generated. Please try again.");
@@ -224,6 +251,9 @@ export const Dashboard = () => {
       await fetchReports();
       setActiveReportId(id);
       setLoadingError(null);
+      clearInterval(progressInterval);
+      setLoadingPercent(100);
+      setLoadingStage('Complete');
 
       if ('Notification' in window && Notification.permission === 'granted') {
         new Notification('Report Ready — Global Pulse', {
@@ -235,12 +265,17 @@ export const Dashboard = () => {
       if (err instanceof Error) {
         if (err.name === "AbortError" || err.message.includes("AbortError")) {
           errorMessage = "Report generation was cancelled.";
+        } else if (err.message.includes("timed out") || err.message.includes("TIMEOUT")) {
+          errorMessage = "Report generation timed out. The AI provider may be overloaded — please try again in a moment.";
+        } else if (err.message.includes("Failed to fetch") || err.message.includes("NetworkError") || err.message.includes("network")) {
+          errorMessage = "Network error — could not reach the server. Check your connection and try again.";
         } else {
           errorMessage = err.message || errorMessage;
         }
       }
       setLoadingError(errorMessage);
     } finally {
+      clearInterval(progressInterval);
       setLoading(false);
     }
   };
@@ -347,26 +382,6 @@ export const Dashboard = () => {
     }
   };
 
-  const handleEmailDigest = async () => {
-    if (!activeReportId) return;
-    const to = emailTo.trim() || prompt("Enter recipient email:");
-    if (!to) return;
-    if (emailTo !== to) setEmailTo(to);
-    setSendingEmail(true);
-    try {
-      const res = await apiFetch('/api/email-digest', {
-        method: 'POST',
-        body: JSON.stringify({ reportId: activeReportId, to }),
-      });
-      const data = await res.json();
-      if (res.ok) alert("✓ Email digest sent to " + to);
-      else alert("Email failed: " + data.error);
-    } catch (err) {
-      alert("Email error: " + (err instanceof Error ? err.message : String(err)));
-    } finally {
-      setSendingEmail(false);
-    }
-  };
 
   const handleGenerateSubstack = async () => {
     if (!activeReportId) return;
@@ -538,6 +553,7 @@ export const Dashboard = () => {
                 { id: 'equities', label: 'S&P 500' },
                 { id: 'nasdaq', label: 'Nasdaq-100' },
                 { id: 'conspiracies', label: 'Conspiracies' },
+                { id: 'speculation', label: 'Speculation' },
                 { id: 'forecast', label: '7-Day Forecast' },
                 { id: 'china', label: 'China S.C.' },
                 { id: 'custom', label: 'Custom' },
@@ -611,9 +627,34 @@ export const Dashboard = () => {
       )}
 
       {loading && (
-        <div className="flex items-center gap-4 p-4" style={{ backgroundColor: T.bg, border: `1px solid ${T.borderLight}` }}>
-          <Loader2 className="animate-spin" size={18} style={{ color: T.hex }} />
-          <p className="text-xs font-mono uppercase tracking-widest" style={{ color: T.textMuted }}>Claude is analyzing intelligence feeds...</p>
+        <div className="p-4 space-y-3" style={{ backgroundColor: T.bg, border: `1px solid ${T.borderLight}` }}>
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <Loader2 className="animate-spin" size={16} style={{ color: T.hex }} />
+              <p className="text-xs font-mono uppercase tracking-widest" style={{ color: T.textMuted }}>{loadingStage || 'Initializing...'}</p>
+            </div>
+            <span className="text-xs font-mono font-bold" style={{ color: T.hex }}>{loadingPercent}%</span>
+          </div>
+          <div className="w-full h-1.5 bg-black/40 rounded-full overflow-hidden">
+            <motion.div
+              className="h-full rounded-full"
+              style={{ backgroundColor: T.hex }}
+              initial={{ width: 0 }}
+              animate={{ width: `${loadingPercent}%` }}
+              transition={{ duration: 0.5, ease: 'easeOut' }}
+            />
+          </div>
+          {reportSources.length > 0 && (
+            <div className="flex flex-wrap gap-2 pt-1">
+              {reportSources.map((s: any, i: number) => (
+                <span key={i} className="flex items-center gap-1.5 text-[9px] font-mono uppercase tracking-wider px-2 py-1 border border-white/5 bg-black/30">
+                  <span className={`w-1.5 h-1.5 rounded-full ${s.status === 'ok' ? 'bg-emerald-400' : s.status === 'timeout' ? 'bg-amber-400' : 'bg-red-400'}`} />
+                  {s.name}
+                  {s.articles != null && s.status === 'ok' && <span className="opacity-40">({s.articles})</span>}
+                </span>
+              ))}
+            </div>
+          )}
         </div>
       )}
 
@@ -863,9 +904,7 @@ export const Dashboard = () => {
                         <button onClick={handleAudioBrief} disabled={audioLoading} className="p-2 hover:bg-white/5 rounded-full transition-colors disabled:opacity-50" style={{ color: T.hex }} title="Generate Audio Brief">
                           {audioLoading ? <Loader2 size={16} className="animate-spin" /> : <Volume2 size={16} />}
                         </button>
-                        <button onClick={handleEmailDigest} disabled={sendingEmail} className="p-2 hover:bg-white/5 rounded-full transition-colors disabled:opacity-50" style={{ color: T.hex }} title="Email Digest">
-                          {sendingEmail ? <Loader2 size={16} className="animate-spin" /> : <Mail size={16} />}
-                        </button>
+
                         <button onClick={handleGenerateSubstack} disabled={generatingSubstack} className="p-2 hover:bg-white/5 rounded-full transition-colors disabled:opacity-50" style={{ color: T.hex }} title="Generate Substack Article">
                           {generatingSubstack ? <Loader2 size={16} className="animate-spin" /> : <FileText size={16} />}
                         </button>
@@ -940,6 +979,45 @@ export const Dashboard = () => {
           </AnimatePresence>
         </div>
       </div>
+
+      {/* Warnings & Source Status */}
+      {(reportWarnings.length > 0 || reportSources.length > 0) && !loading && (
+        <div className="space-y-3 mt-4">
+          {reportWarnings.length > 0 && (
+            <div className="p-4 bg-amber-500/5 border border-amber-500/20 space-y-2">
+              <p className="text-[10px] font-mono uppercase tracking-widest text-amber-500/60">Report Warnings</p>
+              {reportWarnings.map((w, i) => (
+                <p key={i} className="text-xs font-mono text-amber-400/80 flex items-start gap-2">
+                  <span className="text-amber-500 mt-0.5">--</span> {w}
+                </p>
+              ))}
+            </div>
+          )}
+          {reportSources.length > 0 && (
+            <div className="p-4 bg-[#0a0a0a] border border-white/5 space-y-3">
+              <p className="text-[10px] font-mono uppercase tracking-widest text-white/20">Source Status</p>
+              <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-2">
+                {reportSources.map((s: any, i: number) => (
+                  <div key={i} className="flex items-center gap-2 p-2 border border-white/5 bg-black/30">
+                    <span className={cn(
+                      "w-2 h-2 rounded-full shrink-0",
+                      s.status === 'ok' ? 'bg-emerald-400 shadow-[0_0_4px_rgba(52,211,153,0.5)]' :
+                      s.status === 'timeout' ? 'bg-amber-400 shadow-[0_0_4px_rgba(251,191,36,0.5)]' :
+                      'bg-red-400 shadow-[0_0_4px_rgba(248,113,113,0.5)]'
+                    )} />
+                    <div className="min-w-0">
+                      <p className="text-[10px] font-mono text-white/60 truncate">{s.name}</p>
+                      <p className="text-[8px] font-mono text-white/25">
+                        {s.status === 'ok' ? `${s.articles ?? '?'} articles` : s.status === 'timeout' ? 'Timed out' : 'Failed'}
+                      </p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Instagram Modal */}
       <AnimatePresence>
