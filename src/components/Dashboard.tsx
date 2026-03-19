@@ -99,6 +99,18 @@ export const Dashboard = () => {
   const forecastReport = isForecast ? activeReport as ForecastReport : null;
   const weeklyReport = !isForecast ? activeReport as WeeklyReport : null;
 
+  // Load sources/warnings from stored report when switching
+  useEffect(() => {
+    if (activeReport) {
+      const content = activeReport as any;
+      setReportSources(content._sources || []);
+      setReportWarnings(content._warnings || []);
+    } else {
+      setReportSources([]);
+      setReportWarnings([]);
+    }
+  }, [activeReportId]);
+
   const activeType = reportType;
   const { hex: acHex, rgb: acRgb } = getReportColor(activeType);
   const T = makeTheme(acHex, acRgb);
@@ -231,11 +243,9 @@ export const Dashboard = () => {
       const report = await response.json();
       const isForecastType = reportType === 'forecast';
 
-      // Extract metadata before saving
+      // Extract metadata — keep in report content so it persists
       const sources = report._sources || [];
       const warnings = report._warnings || [];
-      delete report._sources;
-      delete report._warnings;
       setReportSources(sources);
       setReportWarnings(warnings);
 

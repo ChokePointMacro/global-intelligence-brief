@@ -36,6 +36,8 @@ export const Layout = ({ children, user, onLogout, onLogin }: {
               <Link to="/markets" className="text-[10px] font-mono uppercase tracking-widest hover:text-btc-orange transition-colors hidden sm:inline">Markets</Link>
               <Link to="/reports" className="text-[10px] font-mono uppercase tracking-widest hover:text-btc-orange transition-colors hidden sm:inline">Reports</Link>
               <Link to="/automated" className="text-[10px] font-mono uppercase tracking-widest hover:text-btc-orange transition-colors hidden sm:inline">Automated</Link>
+              <Link to="/terminal" className="text-[10px] font-mono uppercase tracking-widest hover:text-btc-orange transition-colors hidden sm:inline">Terminal</Link>
+              <Link to="/trade-flow" className="text-[10px] font-mono uppercase tracking-widest hover:text-btc-orange transition-colors hidden sm:inline">Trade Flow</Link>
               {user && <>
                 <Link to="/compose" className="text-[10px] font-mono uppercase tracking-widest hover:text-btc-orange transition-colors">Compose</Link>
                 <Link to="/schedule" className="text-[10px] font-mono uppercase tracking-widest hover:text-btc-orange transition-colors hidden sm:inline">Schedule</Link>

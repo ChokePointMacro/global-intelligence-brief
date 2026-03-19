@@ -31,6 +31,17 @@ interface OptionsRec { symbol: string; expiry: string; contracts: Contract[]; }
 
 interface CustomEntry { tile: Tile; candles: Candle[]; pivotLevels: Pivots | null; }
 
+type TimeframeKey = '1d' | '1w' | '1m' | '3m' | '6m' | '1y';
+
+const TIMEFRAMES: { key: TimeframeKey; label: string }[] = [
+  { key: '1d', label: '1D' },
+  { key: '1w', label: '1W' },
+  { key: '1m', label: '1M' },
+  { key: '3m', label: '3M' },
+  { key: '6m', label: '6M' },
+  { key: '1y', label: '1Y' },
+];
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 const REFRESH = 30_000;
@@ -74,37 +85,301 @@ async function safeFetch(path: string): Promise<any> {
   }
 }
 
-// ─── Mini Candlestick Background ─────────────────────────────────────────────
+// ─── Bollinger Band Calculation ───────────────────────────────────────────────
 
-const CandleBg = ({ candles }: { candles: Candle[] }) => {
-  if (!candles.length) return null;
-  const W = 400; const H = 100;
-  const lo = Math.min(...candles.map(c => c.l));
-  const hi = Math.max(...candles.map(c => c.h));
+interface BollingerData {
+  sma: (number | null)[];
+  upper: (number | null)[];
+  lower: (number | null)[];
+}
+
+function calcBollinger(candles: Candle[], period = 20, mult = 2): BollingerData {
+  const closes = candles.map(c => c.c);
+  const sma: (number | null)[] = [];
+  const upper: (number | null)[] = [];
+  const lower: (number | null)[] = [];
+
+  for (let i = 0; i < closes.length; i++) {
+    if (i < period - 1) {
+      sma.push(null); upper.push(null); lower.push(null);
+      continue;
+    }
+    const slice = closes.slice(i - period + 1, i + 1);
+    const mean = slice.reduce((a, b) => a + b, 0) / period;
+    const variance = slice.reduce((a, b) => a + (b - mean) ** 2, 0) / period;
+    const sd = Math.sqrt(variance);
+    sma.push(mean);
+    upper.push(mean + mult * sd);
+    lower.push(mean - mult * sd);
+  }
+  return { sma, upper, lower };
+}
+
+// ─── CandleChart (Proper Foreground SVG) ──────────────────────────────────────
+
+const ZOOM_STEPS = [0.02, 0.05, 0.1, 0.2, 0.35, 0.5, 0.75, 1.0];
+
+const CandleChart = ({
+  candles,
+  price,
+  height = 200,
+  timeframe,
+  onTimeframeChange,
+  showTimeframeSelector = true,
+  pivots,
+  opts,
+}: {
+  candles: Candle[];
+  price: number | null;
+  height?: number;
+  timeframe: TimeframeKey;
+  onTimeframeChange: (tf: TimeframeKey) => void;
+  showTimeframeSelector?: boolean;
+  pivots?: Pivots | null;
+  opts?: OptionsRec | null;
+}) => {
+  const [zoomIdx, setZoomIdx] = useState(2); // default 0.1 (index 2)
+  if (!candles.length) {
+    return (
+      <div className="flex flex-col h-full">
+        <div className="flex-1 flex items-center justify-center text-[9px] font-mono text-gray-700" style={{ minHeight: height }}>
+          No chart data
+        </div>
+        {showTimeframeSelector && (
+          <TimeframeSelector active={timeframe} onChange={onTimeframeChange} />
+        )}
+      </div>
+    );
+  }
+
+  const W = 600;
+  const H = height;
+  const PAD_TOP = 8;
+  const PAD_BOT = 20;
+  const PAD_LEFT = 4;
+  const PAD_RIGHT = 50;
+  const chartW = W - PAD_LEFT - PAD_RIGHT;
+  const chartH = H - PAD_TOP - PAD_BOT;
+
+  const bollinger = calcBollinger(candles);
+
+  // Price range from candle data + bollinger only (not pivots/options — those clip naturally)
+  const coreVals: number[] = [];
+  candles.forEach((c, i) => {
+    coreVals.push(c.h, c.l);
+    if (bollinger.upper[i] != null) coreVals.push(bollinger.upper[i]!);
+    if (bollinger.lower[i] != null) coreVals.push(bollinger.lower[i]!);
+  });
+  if (price != null) coreVals.push(price);
+
+  const lo = Math.min(...coreVals);
+  const hi = Math.max(...coreVals);
   const rng = hi - lo || 1;
-  const sy = (v: number) => H - ((v - lo) / rng) * H;
+  const zoomPad = rng * ZOOM_STEPS[zoomIdx];
+  const yMin = lo - zoomPad;
+  const yMax = hi + zoomPad;
+  const yRng = yMax - yMin;
+
+  const sy = (v: number) => PAD_TOP + chartH - ((v - yMin) / yRng) * chartH;
   const n = candles.length;
-  const cw = Math.max(2, W / n - 1);
+  const gap = 1;
+  const cw = Math.max(1.5, (chartW - (n - 1) * gap) / n);
+  const sx = (i: number) => PAD_LEFT + i * (cw + gap);
+
+  // Y-axis labels (4 levels)
+  const yLabels: number[] = [];
+  for (let i = 0; i <= 3; i++) {
+    yLabels.push(yMin + (yRng * i) / 3);
+  }
+
+  // X-axis date labels (5 labels)
+  const xLabels: { x: number; label: string }[] = [];
+  const step = Math.max(1, Math.floor(n / 5));
+  for (let i = 0; i < n; i += step) {
+    const d = new Date(candles[i].t);
+    let label: string;
+    if (timeframe === '1d') {
+      label = d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+    } else if (timeframe === '1w') {
+      label = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    } else {
+      label = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    }
+    xLabels.push({ x: sx(i) + cw / 2, label });
+  }
+
+  // Bollinger band path
+  const bbPoints: { x: number; upper: number; lower: number; sma: number }[] = [];
+  candles.forEach((_, i) => {
+    if (bollinger.sma[i] != null) {
+      bbPoints.push({
+        x: sx(i) + cw / 2,
+        upper: sy(bollinger.upper[i]!),
+        lower: sy(bollinger.lower[i]!),
+        sma: sy(bollinger.sma[i]!),
+      });
+    }
+  });
+
+  const bbAreaPath = bbPoints.length > 1
+    ? `M${bbPoints.map(p => `${p.x},${p.upper}`).join(' L')} L${[...bbPoints].reverse().map(p => `${p.x},${p.lower}`).join(' L')} Z`
+    : '';
+  const smaPath = bbPoints.length > 1
+    ? `M${bbPoints.map(p => `${p.x},${p.sma}`).join(' L')}`
+    : '';
+
+  // Format price for y-axis
+  const fmtY = (v: number) => {
+    if (v >= 10000) return v.toFixed(0);
+    if (v >= 100) return v.toFixed(1);
+    if (v >= 1) return v.toFixed(2);
+    return v.toFixed(4);
+  };
 
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none"
-      className="absolute inset-0 w-full h-full pointer-events-none" style={{ opacity: 0.18 }}>
-      {candles.map((c, i) => {
-        const x = i * (cw + 1);
-        const up = c.c >= c.o;
-        const col = up ? '#10b981' : '#ef4444';
-        const by = Math.min(sy(c.o), sy(c.c));
-        const bh = Math.max(1, Math.abs(sy(c.o) - sy(c.c)));
-        return (
-          <g key={i}>
-            <line x1={x + cw/2} y1={sy(c.h)} x2={x + cw/2} y2={sy(c.l)} stroke={col} strokeWidth={0.7} />
-            <rect x={x} y={by} width={cw} height={bh} fill={col} />
-          </g>
-        );
-      })}
-    </svg>
+    <div className="flex flex-col h-full">
+      <div className="flex-1 relative" style={{ minHeight: height }}>
+        <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="xMidYMid meet" className="w-full h-full">
+          {/* Bollinger band area */}
+          {bbAreaPath && (
+            <path d={bbAreaPath} fill="rgba(247,147,26,0.06)" stroke="none" />
+          )}
+          {/* SMA line */}
+          {smaPath && (
+            <path d={smaPath} fill="none" stroke="rgba(247,147,26,0.3)" strokeWidth={1} />
+          )}
+          {/* Upper/lower band lines */}
+          {bbPoints.length > 1 && (
+            <>
+              <path d={`M${bbPoints.map(p => `${p.x},${p.upper}`).join(' L')}`}
+                fill="none" stroke="rgba(247,147,26,0.15)" strokeWidth={0.5} strokeDasharray="3,3" />
+              <path d={`M${bbPoints.map(p => `${p.x},${p.lower}`).join(' L')}`}
+                fill="none" stroke="rgba(247,147,26,0.15)" strokeWidth={0.5} strokeDasharray="3,3" />
+            </>
+          )}
+
+          {/* Candles */}
+          {candles.map((c, i) => {
+            const x = sx(i);
+            const up = c.c >= c.o;
+            const col = up ? '#10b981' : '#ef4444';
+            const by = Math.min(sy(c.o), sy(c.c));
+            const bh = Math.max(0.5, Math.abs(sy(c.o) - sy(c.c)));
+            return (
+              <g key={i}>
+                <line x1={x + cw/2} y1={sy(c.h)} x2={x + cw/2} y2={sy(c.l)} stroke={col} strokeWidth={0.5} />
+                <rect x={x} y={by} width={cw} height={bh} fill={col} />
+              </g>
+            );
+          })}
+
+          {/* Pivot levels — horizontal lines (S3-R3) */}
+          {pivots && PLABELS.map(({ k, l, col }) => {
+            const v = pivots[k as keyof Pivots];
+            const y = sy(v);
+            if (y < PAD_TOP || y > PAD_TOP + chartH) return null;
+            return (
+              <g key={k}>
+                <line x1={PAD_LEFT} y1={y} x2={PAD_LEFT + chartW} y2={y}
+                  stroke={col} strokeWidth={0.5} strokeDasharray="6,4" opacity={0.5} />
+                <text x={PAD_LEFT + 2} y={y - 2}
+                  fontSize={6} fontFamily="monospace" fill={col} opacity={0.7}>{l}</text>
+              </g>
+            );
+          })}
+
+          {/* Options strike levels — horizontal lines */}
+          {opts?.contracts?.slice(0, 6).map((c, i) => {
+            if (c.strike == null) return null;
+            const y = sy(c.strike);
+            if (y < PAD_TOP || y > PAD_TOP + chartH) return null;
+            const col = c.side === 'CALL' ? '#10b981' : '#ef4444';
+            return (
+              <g key={`opt-${i}`}>
+                <line x1={PAD_LEFT} y1={y} x2={PAD_LEFT + chartW} y2={y}
+                  stroke={col} strokeWidth={0.5} strokeDasharray="3,5" opacity={0.4} />
+                <text x={PAD_LEFT + 2} y={y - 2}
+                  fontSize={6} fontFamily="monospace" fill={col} opacity={0.6}>
+                  {c.side[0]}${c.strike.toFixed(0)}
+                </text>
+              </g>
+            );
+          })}
+
+          {/* Current price marker */}
+          {price != null && (
+            <>
+              <line x1={PAD_LEFT} y1={sy(price)} x2={PAD_LEFT + chartW} y2={sy(price)}
+                stroke="#f7931a" strokeWidth={0.5} strokeDasharray="4,3" />
+              <rect x={PAD_LEFT + chartW + 2} y={sy(price) - 7} width={PAD_RIGHT - 6} height={14}
+                fill="#f7931a" rx={2} />
+              <text x={PAD_LEFT + chartW + PAD_RIGHT / 2} y={sy(price) + 3}
+                textAnchor="middle" fontSize={8} fontFamily="monospace" fill="#000" fontWeight="bold">
+                {fmtY(price)}
+              </text>
+            </>
+          )}
+
+          {/* Y-axis labels */}
+          {yLabels.map((v, i) => (
+            <text key={i} x={W - 4} y={sy(v) + 3}
+              textAnchor="end" fontSize={7} fontFamily="monospace" fill="#555">
+              {fmtY(v)}
+            </text>
+          ))}
+
+          {/* X-axis labels */}
+          {xLabels.map((item, i) => (
+            <text key={i} x={item.x} y={H - 4}
+              textAnchor="middle" fontSize={7} fontFamily="monospace" fill="#555">
+              {item.label}
+            </text>
+          ))}
+
+          {/* Axis lines */}
+          <line x1={PAD_LEFT} y1={PAD_TOP} x2={PAD_LEFT} y2={PAD_TOP + chartH}
+            stroke="#222" strokeWidth={0.5} />
+          <line x1={PAD_LEFT} y1={PAD_TOP + chartH} x2={PAD_LEFT + chartW} y2={PAD_TOP + chartH}
+            stroke="#222" strokeWidth={0.5} />
+        </svg>
+        {/* Y-axis zoom controls */}
+        <div className="absolute right-0 top-1/2 -translate-y-1/2 flex flex-col gap-0.5 mr-0.5">
+          <button
+            onClick={() => setZoomIdx(i => Math.min(i + 1, ZOOM_STEPS.length - 1))}
+            title="Expand range"
+            className="w-5 h-5 flex items-center justify-center bg-black/70 border border-white/10 text-gray-500 hover:text-btc-orange hover:border-btc-orange/40 text-[10px] font-mono font-bold transition-colors"
+          >−</button>
+          <button
+            onClick={() => setZoomIdx(i => Math.max(i - 1, 0))}
+            title="Consolidate range"
+            className="w-5 h-5 flex items-center justify-center bg-black/70 border border-white/10 text-gray-500 hover:text-btc-orange hover:border-btc-orange/40 text-[10px] font-mono font-bold transition-colors"
+          >+</button>
+        </div>
+      </div>
+      {showTimeframeSelector && (
+        <TimeframeSelector active={timeframe} onChange={onTimeframeChange} />
+      )}
+    </div>
   );
 };
+
+// ─── Timeframe Selector ───────────────────────────────────────────────────────
+
+const TimeframeSelector = ({ active, onChange }: { active: TimeframeKey; onChange: (tf: TimeframeKey) => void }) => (
+  <div className="flex items-center gap-1 mt-1.5">
+    {TIMEFRAMES.map(({ key, label }) => (
+      <button key={key} onClick={() => onChange(key)}
+        className={cn(
+          'px-2 py-0.5 text-[8px] font-mono uppercase tracking-wider rounded-full transition-colors',
+          active === key
+            ? 'bg-btc-orange text-black font-bold'
+            : 'text-gray-600 hover:text-btc-orange/70 hover:bg-white/[0.03]'
+        )}>
+        {label}
+      </button>
+    ))}
+  </div>
+);
 
 // ─── Pivot Bar ────────────────────────────────────────────────────────────────
 
@@ -160,7 +435,7 @@ const OptionsSection = ({ contracts, expiry }: { contracts: Contract[]; expiry: 
   return (
     <div className="mt-3 pt-3 border-t border-white/5 space-y-1.5">
       <div className="flex items-center justify-between">
-        <p className="text-[8px] font-mono uppercase tracking-widest text-btc-orange/40">Most Traded Options</p>
+        <p className="text-[8px] font-mono uppercase tracking-widest text-btc-orange/40">Price Summary</p>
         <p className="text-[7px] font-mono text-gray-600">Exp {expiry}</p>
       </div>
       <div className="space-y-1">
@@ -187,10 +462,15 @@ const OptionsSection = ({ contracts, expiry }: { contracts: Contract[]; expiry: 
   );
 };
 
-// ─── Tile Card ────────────────────────────────────────────────────────────────
+// ─── Tile Card (Horizontal Split Layout) ──────────────────────────────────────
+
+const OVERLAY_TIMEFRAMES: { key: TimeframeKey; label: string }[] = [
+  { key: '1d', label: '1D' }, { key: '1w', label: '1W' }, { key: '1m', label: '1M' },
+  { key: '3m', label: '3M' }, { key: '6m', label: '6M' }, { key: '1y', label: '1Y' },
+];
 
 const TileCard = ({
-  tile, candles, pivots, opts, watched, onToggleWatch,
+  tile, candles: initialCandles, pivots: initialPivots, opts, watched, onToggleWatch,
 }: {
   tile: Tile;
   candles: Candle[];
@@ -199,92 +479,211 @@ const TileCard = ({
   watched: boolean;
   onToggleWatch: () => void;
 }) => {
+  const [timeframe, setTimeframe] = useState<TimeframeKey>('1m');
+  const [localCandles, setLocalCandles] = useState<Candle[]>(initialCandles);
+  const [loading, setLoading] = useState(false);
+
+  // Independent overlay timeframe for pivots/options levels on chart
+  const [overlayTf, setOverlayTf] = useState<TimeframeKey>('1m');
+  const [overlayPivots, setOverlayPivots] = useState<Pivots | null>(initialPivots);
+
+  // Update overlay pivots when initial pivots change (parent refresh)
+  useEffect(() => {
+    if (overlayTf === '1m') setOverlayPivots(initialPivots);
+  }, [initialPivots, overlayTf]);
+
+  const handleOverlayTfChange = useCallback(async (tf: TimeframeKey) => {
+    setOverlayTf(tf);
+    if (tf === '1m') {
+      setOverlayPivots(initialPivots);
+      return;
+    }
+    const data = await safeFetch(`/api/markets/history?symbol=${encodeURIComponent(tile.symbol)}&range=${tf}`);
+    if (data?.pivotLevels) setOverlayPivots(data.pivotLevels);
+  }, [tile.symbol, initialPivots]);
+
+  // Update local candles when initial candles change (from parent refresh)
+  useEffect(() => {
+    if (timeframe === '1m') {
+      setLocalCandles(initialCandles);
+    }
+  }, [initialCandles, timeframe]);
+
+  const handleTimeframeChange = useCallback(async (tf: TimeframeKey) => {
+    setTimeframe(tf);
+    if (tf === '1m') {
+      setLocalCandles(initialCandles);
+      return;
+    }
+    setLoading(true);
+    const data = await safeFetch(`/api/markets/history?symbol=${encodeURIComponent(tile.symbol)}&range=${tf}`);
+    setLoading(false);
+    if (data && data.candles) {
+      setLocalCandles(data.candles);
+    }
+  }, [tile.symbol, initialCandles]);
+
   const hasChange = tile.changePercent != null;
   const up = (tile.changePercent ?? 0) >= 0;
   const border = hasChange
     ? (up ? 'border-emerald-500/20 hover:border-emerald-500/40' : 'border-red-500/20 hover:border-red-500/40')
     : 'border-white/5 hover:border-white/10';
 
-  return (
-    <div className={cn('relative bg-[#0a0a0a] border p-4 transition-colors overflow-hidden flex flex-col', border)}>
-      <CandleBg candles={candles} />
+  const isEquity = !tile.isCrypto && !tile.isIndex;
 
-      <div className="relative flex-1 flex flex-col">
-        {/* Header */}
-        <div className="flex items-start justify-between mb-3">
-          <div>
-            <p className="text-[9px] font-mono uppercase tracking-widest text-gray-600">{tile.name}</p>
-            <p className="text-[10px] font-mono font-bold text-white mt-0.5">{tile.symbol}</p>
+  return (
+    <div className={cn('relative bg-[#0a0a0a] border p-4 transition-colors overflow-hidden', border)}>
+      <div className="flex gap-4 h-full">
+        {/* LEFT SIDE (~1/3) */}
+        <div className="w-1/3 min-w-[140px] flex flex-col shrink-0">
+          {/* Header */}
+          <div className="flex items-start justify-between mb-2">
+            <div>
+              <p className="text-[9px] font-mono uppercase tracking-widest text-gray-600 truncate">{tile.name}</p>
+              <p className="text-[10px] font-mono font-bold text-white mt-0.5">{tile.symbol}</p>
+            </div>
+            <div className="flex items-center gap-1">
+              <button onClick={onToggleWatch} title={watched ? 'Remove from watchlist' : 'Add to watchlist'}
+                className={cn('p-1 transition-colors', watched ? 'text-btc-orange' : 'text-gray-700 hover:text-btc-orange/60')}>
+                <Star size={11} fill={watched ? 'currentColor' : 'none'} />
+              </button>
+              {hasChange && (
+                <div className={cn('p-1 border',
+                  up ? 'border-emerald-500/20 bg-emerald-500/5' : 'border-red-500/20 bg-red-500/5'
+                )}>
+                  {up ? <TrendingUp size={10} className="text-emerald-400" /> : <TrendingDown size={10} className="text-red-400" />}
+                </div>
+              )}
+            </div>
           </div>
-          <div className="flex items-center gap-1.5">
-            <button onClick={onToggleWatch} title={watched ? 'Remove from watchlist' : 'Add to watchlist'}
-              className={cn('p-1 transition-colors', watched ? 'text-btc-orange' : 'text-gray-700 hover:text-btc-orange/60')}>
-              <Star size={11} fill={watched ? 'currentColor' : 'none'} />
-            </button>
-            {hasChange && (
-              <div className={cn('p-1.5 border',
-                up ? 'border-emerald-500/20 bg-emerald-500/5' : 'border-red-500/20 bg-red-500/5'
-              )}>
-                {up ? <TrendingUp size={11} className="text-emerald-400" /> : <TrendingDown size={11} className="text-red-400" />}
+
+          {/* Price */}
+          <p className="text-xl font-mono font-bold text-white leading-none">
+            {fp(tile.price, tile.isIndex)}
+          </p>
+          {hasChange ? (
+            <p className={cn('text-[9px] font-mono font-bold mt-1', up ? 'text-emerald-400' : 'text-red-400')}>
+              {up ? '+' : ''}{tile.isIndex
+                ? (tile.change?.toFixed(2) ?? '—')
+                : (tile.change != null ? `$${Math.abs(tile.change).toFixed(2)}` : '—')
+              }&nbsp;
+              <span className="opacity-70">({up ? '+' : ''}{tile.changePercent?.toFixed(2)}%)</span>
+            </p>
+          ) : (
+            <p className="text-[8px] font-mono text-gray-600 mt-1">tracking...</p>
+          )}
+
+          {/* Bid / Ask / Vol */}
+          <div className="flex items-center gap-0 mt-2 pt-2 border-t border-white/5">
+            <div className="flex-1">
+              <p className="text-[7px] font-mono uppercase text-gray-600">Bid</p>
+              <p className="text-[8px] font-mono text-gray-300 mt-px truncate">{tile.bid != null ? fp(tile.bid, tile.isIndex) : '—'}</p>
+            </div>
+            <div className="w-px h-6 bg-btc-orange/30 mx-2 shrink-0" />
+            <div className="flex-1">
+              <p className="text-[7px] font-mono uppercase text-gray-600">Ask</p>
+              <p className="text-[8px] font-mono text-gray-300 mt-px truncate">{tile.ask != null ? fp(tile.ask, tile.isIndex) : '—'}</p>
+            </div>
+            <div className="w-px h-6 bg-btc-orange/30 mx-2 shrink-0" />
+            <div className="flex-1">
+              <p className="text-[7px] font-mono uppercase text-gray-600">Vol</p>
+              <p className="text-[8px] font-mono text-gray-300 mt-px truncate">{fv(tile.volume)}</p>
+            </div>
+          </div>
+
+          {/* Pivot levels — crypto + indices on left side */}
+          {overlayPivots && (tile.isCrypto || tile.isIndex) && (
+            <PivotSection pivots={overlayPivots} price={tile.price} isIdx={tile.isIndex} />
+          )}
+
+          {/* Options — equities on left side */}
+          {isEquity && opts && opts.contracts.length > 0 && (
+            <OptionsSection contracts={opts.contracts} expiry={opts.expiry} />
+          )}
+
+          {/* Overlay timeframe dropdown */}
+          {((tile.isCrypto || tile.isIndex) && overlayPivots) || (isEquity && opts?.contracts?.length) ? (
+            <div className="flex items-center gap-1.5 mt-2">
+              <span className="text-[7px] font-mono uppercase text-gray-600 tracking-wider">
+                {isEquity ? 'Options / Levels' : 'Pivot Levels'}
+              </span>
+              <select
+                value={overlayTf}
+                onChange={e => handleOverlayTfChange(e.target.value as TimeframeKey)}
+                className="px-1.5 py-0.5 bg-black border border-white/10 text-[8px] font-mono text-gray-400 uppercase focus:outline-none focus:border-btc-orange/40"
+              >
+                {OVERLAY_TIMEFRAMES.map(({ key, label }) => (
+                  <option key={key} value={key}>{label}</option>
+                ))}
+              </select>
+            </div>
+          ) : null}
+
+          {tile.lastTimestamp && (
+            <p className="text-[7px] font-mono text-gray-700 mt-auto pt-2">{ft(tile.lastTimestamp)}</p>
+          )}
+        </div>
+
+        {/* RIGHT SIDE (~2/3) */}
+        <div className="flex-1 flex flex-col min-w-0">
+          <div className="flex-1 relative">
+            {loading && (
+              <div className="absolute inset-0 flex items-center justify-center bg-black/50 z-10">
+                <Loader2 size={14} className="animate-spin text-btc-orange/40" />
               </div>
             )}
+            <CandleChart
+              candles={localCandles}
+              price={tile.price}
+              height={200}
+              timeframe={timeframe}
+              onTimeframeChange={handleTimeframeChange}
+              pivots={(tile.isCrypto || tile.isIndex) ? overlayPivots : undefined}
+              opts={isEquity ? opts : undefined}
+            />
           </div>
         </div>
-
-        {/* Price */}
-        <p className="text-2xl font-mono font-bold text-white leading-none">
-          {fp(tile.price, tile.isIndex)}
-        </p>
-        {hasChange ? (
-          <p className={cn('text-[10px] font-mono font-bold mt-1', up ? 'text-emerald-400' : 'text-red-400')}>
-            {up ? '+' : ''}{tile.isIndex
-              ? (tile.change?.toFixed(2) ?? '—')
-              : (tile.change != null ? `$${Math.abs(tile.change).toFixed(2)}` : '—')
-            }&nbsp;
-            <span className="opacity-70">({up ? '+' : ''}{tile.changePercent?.toFixed(2)}%)</span>
-          </p>
-        ) : (
-          <p className="text-[9px] font-mono text-gray-600 mt-1">tracking…</p>
-        )}
-
-        {/* Bid / Ask / Vol row */}
-        <div className="grid grid-cols-3 gap-1 mt-3 pt-2 border-t border-white/5">
-          {[
-            { l: 'Bid', v: tile.bid  != null ? fp(tile.bid,  tile.isIndex) : '—' },
-            { l: 'Ask', v: tile.ask  != null ? fp(tile.ask,  tile.isIndex) : '—' },
-            { l: 'Vol', v: fv(tile.volume) },
-          ].map(({ l, v }) => (
-            <div key={l}>
-              <p className="text-[7px] font-mono uppercase text-gray-600">{l}</p>
-              <p className="text-[9px] font-mono text-gray-300 mt-px">{v}</p>
-            </div>
-          ))}
-        </div>
-
-        {/* Pivot levels — crypto + indices */}
-        {pivots && (tile.isCrypto || tile.isIndex) && (
-          <PivotSection pivots={pivots} price={tile.price} isIdx={tile.isIndex} />
-        )}
-
-        {/* Options — equities */}
-        {opts && !tile.isCrypto && !tile.isIndex && opts.contracts.length > 0 && (
-          <OptionsSection contracts={opts.contracts} expiry={opts.expiry} />
-        )}
-
-        {tile.lastTimestamp && (
-          <p className="text-[7px] font-mono text-gray-700 mt-2">{ft(tile.lastTimestamp)}</p>
-        )}
       </div>
     </div>
   );
 };
 
-// ─── Bitcoin Hero ─────────────────────────────────────────────────────────────
+// ─── Bitcoin Hero (Horizontal Split) ──────────────────────────────────────────
 
-const BtcHero = ({ tile, candles, pivots, watched, onToggleWatch }: {
+const BtcHero = ({ tile, candles: initialCandles, pivots: initialPivots, watched, onToggleWatch }: {
   tile: Tile; candles: Candle[]; pivots: Pivots | null;
   watched: boolean; onToggleWatch: () => void;
 }) => {
+  const [timeframe, setTimeframe] = useState<TimeframeKey>('1m');
+  const [localCandles, setLocalCandles] = useState<Candle[]>(initialCandles);
+  const [loading, setLoading] = useState(false);
+  const [overlayTf, setOverlayTf] = useState<TimeframeKey>('1m');
+  const [overlayPivots, setOverlayPivots] = useState<Pivots | null>(initialPivots);
+
+  useEffect(() => {
+    if (timeframe === '1m') setLocalCandles(initialCandles);
+  }, [initialCandles, timeframe]);
+
+  useEffect(() => {
+    if (overlayTf === '1m') setOverlayPivots(initialPivots);
+  }, [initialPivots, overlayTf]);
+
+  const handleTimeframeChange = useCallback(async (tf: TimeframeKey) => {
+    setTimeframe(tf);
+    if (tf === '1m') { setLocalCandles(initialCandles); return; }
+    setLoading(true);
+    const data = await safeFetch(`/api/markets/history?symbol=BTC&range=${tf}`);
+    setLoading(false);
+    if (data && data.candles) setLocalCandles(data.candles);
+  }, [initialCandles]);
+
+  const handleOverlayTfChange = useCallback(async (tf: TimeframeKey) => {
+    setOverlayTf(tf);
+    if (tf === '1m') { setOverlayPivots(initialPivots); return; }
+    const data = await safeFetch(`/api/markets/history?symbol=BTC&range=${tf}`);
+    if (data?.pivotLevels) setOverlayPivots(data.pivotLevels);
+  }, [initialPivots]);
+
   const up = (tile.changePercent ?? 0) >= 0;
   const hasChange = tile.changePercent != null;
 
@@ -293,28 +692,27 @@ const BtcHero = ({ tile, candles, pivots, watched, onToggleWatch }: {
       up ? 'bg-[#0a0a0a] border-btc-orange/40 shadow-[0_0_40px_rgba(247,147,26,0.08)]'
          : 'bg-[#0a0a0a] border-red-500/30'
     )}>
-      <CandleBg candles={candles} />
       <div className={cn('absolute inset-0 pointer-events-none', up
         ? 'bg-gradient-to-br from-btc-orange/5 to-transparent'
         : 'bg-gradient-to-br from-red-500/5 to-transparent'
       )} />
 
-      <div className="relative">
-        {/* Top row */}
-        <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-4">
+      <div className="relative flex gap-6">
+        {/* LEFT SIDE */}
+        <div className="w-1/3 min-w-[200px] shrink-0 flex flex-col">
           <div className="space-y-2">
             <div className="flex items-center gap-3">
-              <div className="w-9 h-9 rounded-full bg-btc-orange flex items-center justify-center text-black font-bold text-base shadow-[0_0_12px_rgba(247,147,26,0.5)]">₿</div>
+              <div className="w-9 h-9 rounded-full bg-btc-orange flex items-center justify-center text-black font-bold text-base shadow-[0_0_12px_rgba(247,147,26,0.5)]">B</div>
               <div>
                 <p className="text-[10px] font-mono uppercase tracking-widest text-btc-orange/70">Bitcoin</p>
-                <p className="text-[9px] font-mono text-gray-600">BTC-USD · Public.com</p>
+                <p className="text-[9px] font-mono text-gray-600">BTC-USD</p>
               </div>
               <button onClick={onToggleWatch} title={watched ? 'Remove from watchlist' : 'Add to watchlist'}
                 className={cn('ml-1 p-1 transition-colors', watched ? 'text-btc-orange' : 'text-gray-700 hover:text-btc-orange/60')}>
                 <Star size={14} fill={watched ? 'currentColor' : 'none'} />
               </button>
             </div>
-            <p className="text-5xl font-mono font-bold text-white tracking-tight">{fp(tile.price)}</p>
+            <p className="text-4xl font-mono font-bold text-white tracking-tight">{fp(tile.price)}</p>
             {hasChange ? (
               <div className={cn('flex items-center gap-2 text-sm font-mono font-bold', up ? 'text-emerald-400' : 'text-red-400')}>
                 {up ? <TrendingUp size={15} /> : <TrendingDown size={15} />}
@@ -323,38 +721,79 @@ const BtcHero = ({ tile, candles, pivots, watched, onToggleWatch }: {
                 <span className="text-[9px] font-normal text-gray-600">session</span>
               </div>
             ) : (
-              <p className="text-xs font-mono text-gray-600">Accumulating session change…</p>
+              <p className="text-xs font-mono text-gray-600">Accumulating session change...</p>
             )}
           </div>
 
-          <div className="grid grid-cols-3 gap-5">
-            {[{ l: 'Bid', v: fp(tile.bid) }, { l: 'Ask', v: fp(tile.ask) },
-              { l: 'Spread', v: tile.spread != null ? `$${tile.spread.toFixed(2)}` : '—' }
-            ].map(({ l, v }) => (
-              <div key={l} className="text-center">
-                <p className="text-[8px] font-mono uppercase text-gray-600">{l}</p>
-                <p className="text-sm font-mono font-bold text-white mt-0.5">{v}</p>
+          <div className="flex items-center gap-0 mt-4 pt-3 border-t border-btc-orange/10">
+            <div className="flex-1">
+              <p className="text-[8px] font-mono uppercase text-gray-600">Bid</p>
+              <p className="text-sm font-mono font-bold text-white mt-0.5">{fp(tile.bid)}</p>
+            </div>
+            <div className="w-px h-8 bg-btc-orange/30 mx-3 shrink-0" />
+            <div className="flex-1">
+              <p className="text-[8px] font-mono uppercase text-gray-600">Ask</p>
+              <p className="text-sm font-mono font-bold text-white mt-0.5">{fp(tile.ask)}</p>
+            </div>
+            <div className="w-px h-8 bg-btc-orange/30 mx-3 shrink-0" />
+            <div className="flex-1">
+              <p className="text-[8px] font-mono uppercase text-gray-600">Spread</p>
+              <p className="text-sm font-mono font-bold text-white mt-0.5">{tile.spread != null ? `$${tile.spread.toFixed(2)}` : '—'}</p>
+            </div>
+          </div>
+
+          {/* Volume + timestamp */}
+          <div className="flex items-center gap-6 mt-3 pt-3 border-t border-btc-orange/10">
+            {tile.volume != null && tile.volume > 0 && (
+              <div><p className="text-[8px] font-mono uppercase text-gray-600">Volume</p><p className="text-xs font-mono text-gray-300">{fv(tile.volume)}</p></div>
+            )}
+            {tile.lastTimestamp && (
+              <div><p className="text-[8px] font-mono uppercase text-gray-600">Last Trade</p><p className="text-xs font-mono text-gray-400">{ft(tile.lastTimestamp)}</p></div>
+            )}
+            <div className="ml-auto flex items-center gap-1.5">
+              <Activity size={10} className="text-btc-orange animate-pulse" />
+              <span className="text-[9px] font-mono text-btc-orange/60 uppercase">Live</span>
+            </div>
+          </div>
+
+          {/* Pivot levels */}
+          {overlayPivots && <PivotSection pivots={overlayPivots} price={tile.price} isIdx={false} />}
+
+          {/* Pivot overlay timeframe */}
+          {overlayPivots && (
+            <div className="flex items-center gap-1.5 mt-2">
+              <span className="text-[7px] font-mono uppercase text-gray-600 tracking-wider">Pivot Levels</span>
+              <select
+                value={overlayTf}
+                onChange={e => handleOverlayTfChange(e.target.value as TimeframeKey)}
+                className="px-1.5 py-0.5 bg-black border border-white/10 text-[8px] font-mono text-gray-400 uppercase focus:outline-none focus:border-btc-orange/40"
+              >
+                {OVERLAY_TIMEFRAMES.map(({ key, label }) => (
+                  <option key={key} value={key}>{label}</option>
+                ))}
+              </select>
+            </div>
+          )}
+        </div>
+
+        {/* RIGHT SIDE - Full Chart */}
+        <div className="flex-1 min-w-0 flex flex-col">
+          <div className="flex-1 relative">
+            {loading && (
+              <div className="absolute inset-0 flex items-center justify-center bg-black/50 z-10">
+                <Loader2 size={16} className="animate-spin text-btc-orange/40" />
               </div>
-            ))}
+            )}
+            <CandleChart
+              candles={localCandles}
+              price={tile.price}
+              height={300}
+              timeframe={timeframe}
+              onTimeframeChange={handleTimeframeChange}
+              pivots={overlayPivots}
+            />
           </div>
         </div>
-
-        {/* Volume + timestamp */}
-        <div className="flex items-center gap-6 mt-4 pt-3 border-t border-btc-orange/10">
-          {tile.volume != null && tile.volume > 0 && (
-            <div><p className="text-[8px] font-mono uppercase text-gray-600">Volume</p><p className="text-xs font-mono text-gray-300">{fv(tile.volume)}</p></div>
-          )}
-          {tile.lastTimestamp && (
-            <div><p className="text-[8px] font-mono uppercase text-gray-600">Last Trade</p><p className="text-xs font-mono text-gray-400">{ft(tile.lastTimestamp)}</p></div>
-          )}
-          <div className="ml-auto flex items-center gap-1.5">
-            <Activity size={10} className="text-btc-orange animate-pulse" />
-            <span className="text-[9px] font-mono text-btc-orange/60 uppercase">Live</span>
-          </div>
-        </div>
-
-        {/* Pivot levels */}
-        {pivots && <PivotSection pivots={pivots} price={tile.price} isIdx={false} />}
       </div>
     </div>
   );
@@ -376,7 +815,7 @@ function renderInsightsMd(md: string): React.ReactNode {
       const parts = content.split(/\*\*(.*?)\*\*/g);
       return (
         <div key={i} className="flex gap-2 text-[11px] font-mono text-gray-300 leading-relaxed">
-          <span className="text-btc-orange/50 mt-px shrink-0">›</span>
+          <span className="text-btc-orange/50 mt-px shrink-0">&rsaquo;</span>
           <span>{parts.map((p, j) => j % 2 === 1 ? <strong key={j} className="text-white">{p}</strong> : p)}</span>
         </div>
       );
@@ -433,7 +872,7 @@ const InsightsPanel = () => {
           <Sparkles size={12} className="text-btc-orange" />
           <span className="text-[11px] font-mono uppercase tracking-widest text-btc-orange/80">Current Insights</span>
           {age !== null && !loading && (
-            <span className="text-[9px] font-mono text-gray-600">· {age === 0 ? 'just now' : `${age}m ago`}</span>
+            <span className="text-[9px] font-mono text-gray-600">&middot; {age === 0 ? 'just now' : `${age}m ago`}</span>
           )}
           {loading && <Loader2 size={10} className="animate-spin text-btc-orange/40" />}
         </div>
@@ -451,14 +890,14 @@ const InsightsPanel = () => {
           ) : loading && !text ? (
             <div className="pt-4 flex items-center gap-2 text-gray-600">
               <Loader2 size={12} className="animate-spin text-btc-orange/40" />
-              <span className="text-[10px] font-mono">Analyzing live market data…</span>
+              <span className="text-[10px] font-mono">Analyzing live market data...</span>
             </div>
           ) : text ? (
             <div className="pt-3 space-y-0.5">
               {renderInsightsMd(text)}
               <div className="flex items-center justify-between mt-4 pt-3 border-t border-white/5">
                 <span className="text-[8px] font-mono text-gray-700">
-                  Generated {generatedAt ? new Date(generatedAt).toLocaleTimeString() : ''} · refreshes every 10 min
+                  Generated {generatedAt ? new Date(generatedAt).toLocaleTimeString() : ''} &middot; refreshes every 10 min
                 </span>
                 <button onClick={() => fetchInsights(true)} disabled={loading}
                   className="flex items-center gap-1 text-[9px] font-mono text-gray-600 hover:text-btc-orange transition-colors">
@@ -555,7 +994,7 @@ export const Markets = ({ user }: { user: UserData | null }) => {
     setAddError(null);
     const data = await safeFetch(`/api/markets/lookup?symbol=${encodeURIComponent(sym)}&type=${addType}`);
     setAddLoading(false);
-    if (!data) { setAddError(`Could not find ${sym} — check symbol and type`); return; }
+    if (!data) { setAddError(`Could not find ${sym} -- check symbol and type`); return; }
     setCustomEntries(prev => {
       const next = [...prev, data as CustomEntry];
       saveCustomSymbols(next.map(e => e.tile.symbol));
@@ -610,7 +1049,7 @@ export const Markets = ({ user }: { user: UserData | null }) => {
           <div>
             <h1 className="text-3xl font-serif italic text-white bitcoin-glow">Live Markets</h1>
             <p className="text-[10px] font-mono uppercase tracking-widest text-btc-orange/40 mt-1">
-              Prices via Public.com · Candles & Pivots via Yahoo Finance · Options via Public.com
+              Prices via Public.com &middot; Candles &amp; Pivots via Yahoo Finance &middot; Options via Public.com
             </p>
           </div>
           <div className="flex items-center gap-2">
@@ -618,7 +1057,7 @@ export const Markets = ({ user }: { user: UserData | null }) => {
               <div className="text-right">
                 <p className="text-[9px] font-mono uppercase text-gray-600">Updated</p>
                 <p className="text-[10px] font-mono text-gray-400">{lastUp.toLocaleTimeString()}</p>
-                <p className="text-[9px] font-mono text-btc-orange/40">↻ {countdown}s</p>
+                <p className="text-[9px] font-mono text-btc-orange/40">&orarr; {countdown}s</p>
               </div>
             )}
             <button onClick={() => { setShowAddBar(v => !v); setAddError(null); }}
@@ -680,12 +1119,12 @@ export const Markets = ({ user }: { user: UserData | null }) => {
       {loading ? (
         <div className="py-32 flex flex-col items-center gap-3">
           <RefreshCw size={20} className="animate-spin text-btc-orange/40" />
-          <p className="text-[10px] font-mono uppercase tracking-widest text-gray-600">Loading market data…</p>
+          <p className="text-[10px] font-mono uppercase tracking-widest text-gray-600">Loading market data...</p>
         </div>
       ) : (
         <div className="space-y-6">
 
-          {/* ── Watchlist ── */}
+          {/* -- Watchlist -- */}
           {user ? (
             watchedTiles.length > 0 ? (
               <div>
@@ -693,7 +1132,7 @@ export const Markets = ({ user }: { user: UserData | null }) => {
                   <Star size={10} className="text-btc-orange" fill="currentColor" />
                   <p className="text-[9px] font-mono uppercase tracking-widest text-btc-orange/60">Watchlist</p>
                 </div>
-                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+                <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
                   {watchedTiles.map(t => (
                     <TileCard key={t.symbol} tile={t}
                       candles={histMap[t.symbol]?.candles ?? []}
@@ -739,7 +1178,7 @@ export const Markets = ({ user }: { user: UserData | null }) => {
 
           <div>
             <p className="text-[9px] font-mono uppercase tracking-widest text-gray-600 mb-3">Equities</p>
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
               {equities.map(t => (
                 <TileCard key={t.symbol} tile={t}
                   candles={histMap[t.symbol]?.candles ?? []}
@@ -752,11 +1191,11 @@ export const Markets = ({ user }: { user: UserData | null }) => {
             </div>
           </div>
 
-          {/* ── Custom Tickers ── */}
+          {/* -- Custom Tickers -- */}
           {customEntries.length > 0 && (
             <div>
               <p className="text-[9px] font-mono uppercase tracking-widest text-gray-600 mb-3">Custom</p>
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
                 {customEntries.map(({ tile: t, candles, pivotLevels }) => (
                   <div key={t.symbol} className="relative group">
                     <TileCard

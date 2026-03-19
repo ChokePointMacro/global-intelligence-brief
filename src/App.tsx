@@ -11,6 +11,8 @@ import { Settings } from './components/Settings';
 import { Markets } from './components/Markets';
 import { Reports } from './components/Reports';
 import { AutomatedReports } from './components/AutomatedReports';
+import { Terminal } from './components/Terminal';
+import { TradeFlow } from './components/TradeFlow';
 import type { UserData } from './types';
 
 export default function App() {
@@ -75,6 +77,8 @@ export default function App() {
           <Route path="/markets" element={<Markets user={user} />} />
           <Route path="/reports" element={<Reports />} />
           <Route path="/automated" element={<AutomatedReports />} />
+          <Route path="/terminal" element={<Terminal />} />
+          <Route path="/trade-flow" element={<TradeFlow />} />
         </Routes>
       </Layout>
     </BrowserRouter>
