@@ -1,11 +1,43 @@
 import React, { useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
-import { AnimatePresence } from 'motion/react';
+import { Link, useNavigate, useLocation } from 'react-router-dom';
+import { AnimatePresence, motion } from 'motion/react';
+import { Menu, X } from 'lucide-react';
 import { CPMLogo } from './CPMLogo';
 import { Dropdown } from './Dropdown';
 import { AuthModal } from './AuthModal';
 import MatrixBackground from './MatrixBackground';
 import type { UserData } from '../types';
+
+const NAV_ITEMS = [
+  { to: '/', label: 'Briefing' },
+  { to: '/markets', label: 'Markets' },
+  { to: '/reports', label: 'Reports' },
+  { to: '/automated', label: 'Automated' },
+  { to: '/terminal', label: 'Terminal' },
+  { to: '/trade-flow', label: 'Trade Flow' },
+];
+
+const AUTH_NAV_ITEMS = [
+  { to: '/compose', label: 'Compose' },
+  { to: '/schedule', label: 'Schedule' },
+];
+
+function NavLink({ to, label, active, onClick }: { to: string; label: string; active: boolean; onClick?: () => void }) {
+  return (
+    <Link
+      to={to}
+      onClick={onClick}
+      className={`text-[10px] font-mono uppercase tracking-widest transition-colors ${
+        active
+          ? 'text-btc-orange'
+          : 'text-gray-400 hover:text-btc-orange'
+      }`}
+    >
+      {label}
+      {active && <span className="block h-[1px] bg-btc-orange mt-0.5 shadow-[0_0_4px_#f7931a]" />}
+    </Link>
+  );
+}
 
 export const Layout = ({ children, user, onLogout, onLogin }: {
   children: React.ReactNode;
@@ -14,7 +46,16 @@ export const Layout = ({ children, user, onLogout, onLogin }: {
   onLogin: (u: UserData) => void;
 }) => {
   const navigate = useNavigate();
+  const location = useLocation();
   const [showAuthModal, setShowAuthModal] = useState(false);
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+
+  const isActive = (path: string) => {
+    if (path === '/') return location.pathname === '/';
+    return location.pathname.startsWith(path);
+  };
+
+  const allNavItems = [...NAV_ITEMS, ...(user ? AUTH_NAV_ITEMS : [])];
 
   return (
     <div className="min-h-screen bg-[#0a0a0a] text-gray-300 font-sans selection:bg-btc-orange selection:text-black relative overflow-x-hidden">
@@ -30,19 +71,21 @@ export const Layout = ({ children, user, onLogout, onLogin }: {
             </div>
           </button>
 
-          <div className="flex items-center gap-6">
-            <nav className="flex items-center gap-4 sm:gap-6 border-r border-btc-orange/20 pr-4 sm:pr-6">
-              <Link to="/" className="text-[10px] font-mono uppercase tracking-widest hover:text-btc-orange transition-colors hidden sm:inline">Briefing</Link>
-              <Link to="/markets" className="text-[10px] font-mono uppercase tracking-widest hover:text-btc-orange transition-colors hidden sm:inline">Markets</Link>
-              <Link to="/reports" className="text-[10px] font-mono uppercase tracking-widest hover:text-btc-orange transition-colors hidden sm:inline">Reports</Link>
-              <Link to="/automated" className="text-[10px] font-mono uppercase tracking-widest hover:text-btc-orange transition-colors hidden sm:inline">Automated</Link>
-              <Link to="/terminal" className="text-[10px] font-mono uppercase tracking-widest hover:text-btc-orange transition-colors hidden sm:inline">Terminal</Link>
-              <Link to="/trade-flow" className="text-[10px] font-mono uppercase tracking-widest hover:text-btc-orange transition-colors hidden sm:inline">Trade Flow</Link>
-              {user && <>
-                <Link to="/compose" className="text-[10px] font-mono uppercase tracking-widest hover:text-btc-orange transition-colors">Compose</Link>
-                <Link to="/schedule" className="text-[10px] font-mono uppercase tracking-widest hover:text-btc-orange transition-colors hidden sm:inline">Schedule</Link>
-              </>}
+          <div className="flex items-center gap-4 sm:gap-6">
+            {/* Desktop nav */}
+            <nav className="hidden md:flex items-center gap-5 border-r border-btc-orange/20 pr-5">
+              {allNavItems.map(item => (
+                <NavLink key={item.to} to={item.to} label={item.label} active={isActive(item.to)} />
+              ))}
             </nav>
+
+            {/* Mobile menu button */}
+            <button
+              onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
+              className="md:hidden text-gray-400 hover:text-btc-orange transition-colors p-1"
+            >
+              {mobileMenuOpen ? <X size={20} /> : <Menu size={20} />}
+            </button>
 
             {user ? (
               <Dropdown user={user} onLogout={onLogout} />
@@ -56,6 +99,31 @@ export const Layout = ({ children, user, onLogout, onLogin }: {
             )}
           </div>
         </div>
+
+        {/* Mobile nav dropdown */}
+        <AnimatePresence>
+          {mobileMenuOpen && (
+            <motion.nav
+              initial={{ height: 0, opacity: 0 }}
+              animate={{ height: 'auto', opacity: 1 }}
+              exit={{ height: 0, opacity: 0 }}
+              transition={{ duration: 0.2 }}
+              className="md:hidden overflow-hidden border-t border-btc-orange/10 bg-[#0a0a0a]/98 backdrop-blur-md"
+            >
+              <div className="px-4 py-3 flex flex-wrap gap-x-6 gap-y-2">
+                {allNavItems.map(item => (
+                  <NavLink
+                    key={item.to}
+                    to={item.to}
+                    label={item.label}
+                    active={isActive(item.to)}
+                    onClick={() => setMobileMenuOpen(false)}
+                  />
+                ))}
+              </div>
+            </motion.nav>
+          )}
+        </AnimatePresence>
       </header>
 
       <AnimatePresence>
@@ -82,7 +150,7 @@ export const Layout = ({ children, user, onLogout, onLogin }: {
               <div className="w-1.5 h-1.5 bg-btc-orange rounded-full animate-pulse shadow-[0_0_5px_#f7931a]" />
               <span className="text-[10px] font-mono text-btc-orange/70">Live Feed Active</span>
             </div>
-            <p className="text-[9px] font-mono uppercase tracking-widest opacity-30">© 2026 ChokePoint Macro</p>
+            <p className="text-[9px] font-mono uppercase tracking-widest opacity-30">&copy; 2026 ChokePoint Macro</p>
           </div>
         </div>
       </footer>

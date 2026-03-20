@@ -1,7 +1,8 @@
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import session from "express-session";
-import cookieParser from "cookie-parser";
+// cookie-parser not needed — express-session handles cookies directly
+// import cookieParser from "cookie-parser";
 import SQLiteStoreFactory from "connect-sqlite3";
 import { TwitterApi } from "twitter-api-v2";
 import nodemailer from "nodemailer";
@@ -109,8 +110,8 @@ app.use(
   session({
     store: new SQLiteStore({ dir: './sessions', db: 'sessions.sqlite' }),
     secret: process.env.SESSION_SECRET || "gib-secret",
-    resave: true,
-    saveUninitialized: true,
+    resave: false,
+    saveUninitialized: false,
     rolling: true,
     proxy: true,
     name: 'gib.sid',
@@ -172,13 +173,15 @@ if (!hasValidCreds('x')) {
 
 // ─── Auth helpers ──────────────────────────────────────────────────────────────
 
-const getRedirectUri = (req: express.Request, platform = 'x') => {
-  if (process.env.APP_URL) {
-    return `${process.env.APP_URL}/auth/${platform}/callback`;
-  }
+const getAppOrigin = (req: express.Request): string => {
+  if (process.env.APP_URL) return process.env.APP_URL;
   const protocol = req.headers['x-forwarded-proto'] || 'https';
   const host = req.headers.host;
-  return `${protocol}://${host}/auth/${platform}/callback`;
+  return `${protocol}://${host}`;
+};
+
+const getRedirectUri = (req: express.Request, platform = 'x') => {
+  return `${getAppOrigin(req)}/auth/${platform}/callback`;
 };
 
 // ─── X Auth Routes ─────────────────────────────────────────────────────────────
@@ -252,9 +255,10 @@ app.get("/auth/x/callback", async (req, res) => {
     req.session.save((err) => {
       if (err) console.error("Session save error:", err);
       const sid = JSON.stringify(req.sessionID);
+      const origin = JSON.stringify(getAppOrigin(req));
       res.send(`<html><body><script>
         if (window.opener) {
-          window.opener.postMessage({ type: 'OAUTH_AUTH_SUCCESS', sessionId: ${sid} }, '*');
+          window.opener.postMessage({ type: 'OAUTH_AUTH_SUCCESS', sessionId: ${sid} }, ${origin});
           window.close();
         } else { window.location.href = '/'; }
       </script></body></html>`);
@@ -487,8 +491,9 @@ app.get("/auth/linkedin/callback", async (req, res) => {
         updated_at = CURRENT_TIMESTAMP
     `).run(userId, tokenData.access_token, userInfo.name || '', userInfo.sub || '', Date.now() + (tokenData.expires_in || 3600) * 1000);
 
+    const origin = JSON.stringify(getAppOrigin(req));
     res.send(`<html><body><script>
-      if (window.opener) { window.opener.postMessage({ type: 'OAUTH_LINKEDIN_SUCCESS' }, '*'); window.close(); }
+      if (window.opener) { window.opener.postMessage({ type: 'OAUTH_LINKEDIN_SUCCESS' }, ${origin}); window.close(); }
       else { window.location.href = '/settings'; }
     </script></body></html>`);
   } catch (error) {
@@ -552,8 +557,9 @@ app.get("/auth/threads/callback", async (req, res) => {
         updated_at = CURRENT_TIMESTAMP
     `).run(userId, tokenData.access_token, userInfo.username || '', userInfo.id || '');
 
+    const origin = JSON.stringify(getAppOrigin(req));
     res.send(`<html><body><script>
-      if (window.opener) { window.opener.postMessage({ type: 'OAUTH_THREADS_SUCCESS' }, '*'); window.close(); }
+      if (window.opener) { window.opener.postMessage({ type: 'OAUTH_THREADS_SUCCESS' }, ${origin}); window.close(); }
       else { window.location.href = '/settings'; }
     </script></body></html>`);
   } catch (error) {
@@ -616,9 +622,10 @@ app.get("/auth/x/connect/callback", async (req, res) => {
     `).run(userId || 'anonymous', accessToken, refreshToken || '', `@${xUser.username}`, expiresAt);
 
     const xHandle = JSON.stringify('@' + xUser.username);
+    const origin = JSON.stringify(getAppOrigin(req));
     res.send(`<html><body><script>
       if (window.opener) {
-        window.opener.postMessage({ type: 'OAUTH_X_CONNECT_SUCCESS', handle: ${xHandle} }, '*');
+        window.opener.postMessage({ type: 'OAUTH_X_CONNECT_SUCCESS', handle: ${xHandle} }, ${origin});
         window.close();
       } else { window.location.href = '/settings'; }
     </script></body></html>`);
@@ -712,9 +719,10 @@ app.get("/auth/instagram/callback", async (req, res) => {
 
     const displayHandle = igUserId ? `@${igUsername}` : igUsername;
     const igHandleJson = JSON.stringify(displayHandle);
+    const origin = JSON.stringify(getAppOrigin(req));
     res.send(`<html><body><script>
       if (window.opener) {
-        window.opener.postMessage({ type: 'OAUTH_INSTAGRAM_SUCCESS', handle: ${igHandleJson} }, '*');
+        window.opener.postMessage({ type: 'OAUTH_INSTAGRAM_SUCCESS', handle: ${igHandleJson} }, ${origin});
         window.close();
       } else { window.location.href = '/settings'; }
     </script></body></html>`);
@@ -977,12 +985,15 @@ app.post("/api/social/post", requireAuth, postLimiter, async (req, res) => {
 
 // ─── Report Generation ─────────────────────────────────────────────────────────
 
-app.get("/api/debug/models", requireAuth, async (req, res) => {
+app.get("/api/debug/models", requireAuth, async (_req, res) => {
   try {
     const { GoogleGenAI } = await import("@google/genai");
     const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
     const response = await ai.models.list();
-    const models = response.models.map(m => m.name);
+    const models: string[] = [];
+    for await (const m of response) {
+      if (m.name) models.push(m.name);
+    }
     res.json({ models });
   } catch (error) {
     res.status(500).json({ error: String(error) });
@@ -1152,9 +1163,9 @@ app.post("/api/email-digest", requireAuth, emailLimiter, async (req, res) => {
       <tr style="border-bottom:1px solid #1a1a1a;">
         <td style="padding:12px 8px;color:#f7931a;font-family:monospace;width:24px;">${String(i + 1).padStart(2, '0')}</td>
         <td style="padding:12px 8px;">
-          <p style="margin:0 0 4px;color:#ffffff;font-weight:600;">${h.title}</p>
-          <span style="font-size:11px;color:#888;font-family:monospace;text-transform:uppercase;">${h.category}</span>
-          ${h.sentiment ? `<span style="margin-left:8px;font-size:10px;color:#f7931a;font-family:monospace;">${h.sentiment}</span>` : ''}
+          <p style="margin:0 0 4px;color:#ffffff;font-weight:600;">${escapeHtml(h.title)}</p>
+          <span style="font-size:11px;color:#888;font-family:monospace;text-transform:uppercase;">${escapeHtml(h.category)}</span>
+          ${h.sentiment ? `<span style="margin-left:8px;font-size:10px;color:#f7931a;font-family:monospace;">${escapeHtml(h.sentiment)}</span>` : ''}
         </td>
       </tr>`).join('');
 
@@ -1167,7 +1178,7 @@ app.post("/api/email-digest", requireAuth, emailLimiter, async (req, res) => {
         </div>
         <div style="background:rgba(247,147,26,0.05);border:1px solid rgba(247,147,26,0.2);padding:20px;margin-bottom:24px;">
           <p style="color:#f7931a;font-family:monospace;font-size:10px;text-transform:uppercase;letter-spacing:0.2em;margin:0 0 12px;">Strategic Summary</p>
-          <p style="color:#d1d5db;line-height:1.6;margin:0;">${report.analysis.overallSummary.substring(0, 600)}...</p>
+          <p style="color:#d1d5db;line-height:1.6;margin:0;">${escapeHtml(report.analysis.overallSummary.substring(0, 600))}...</p>
         </div>
         <table style="width:100%;border-collapse:collapse;">
           ${headlinesHtml}
@@ -1395,13 +1406,13 @@ app.post("/api/schedule-post", requireAuth, (req, res) => {
   res.json({ success: true });
 });
 
-app.get("/api/scheduled-posts", (req, res) => {
+app.get("/api/scheduled-posts", requireAuth, (req, res) => {
   const userId = (req.session as any).userId;
   const posts = db.prepare("SELECT * FROM scheduled_posts WHERE user_id = ? ORDER BY scheduled_at ASC").all(userId);
   res.json(posts);
 });
 
-app.delete("/api/scheduled-posts/:id", (req, res) => {
+app.delete("/api/scheduled-posts/:id", requireAuth, (req, res) => {
   db.prepare("DELETE FROM scheduled_posts WHERE id = ? AND user_id = ?").run(req.params.id, (req.session as any).userId);
   res.json({ success: true });
 });
@@ -1450,9 +1461,8 @@ app.post("/api/auto-schedule/preview", requireAuth, (req, res) => {
   res.json({ reportType, nextDate: nextDate.toISOString(), items });
 });
 
-app.post("/api/auto-schedule/confirm", (req, res) => {
+app.post("/api/auto-schedule/confirm", requireAuth, (req, res) => {
   const userId = (req.session as any).userId;
-  if (!userId) return res.status(401).json({ error: "Not authenticated" });
 
   const { items } = req.body;
   if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "No items provided" });
@@ -1481,6 +1491,26 @@ if (!fs.existsSync(CONTEXT_DIR)) fs.mkdirSync(CONTEXT_DIR, { recursive: true });
 const sanitizeFilename = (name: string) =>
   name.replace(/[^a-zA-Z0-9-_]/g, '-').replace(/-+/g, '-').slice(0, 80) + '.md';
 
+// Safely resolve a context file path; throws if the result escapes CONTEXT_DIR
+function safeContextPath(filename: string): string {
+  const safeName = path.basename(filename.endsWith('.md') ? filename : filename + '.md');
+  const resolved = path.resolve(CONTEXT_DIR, safeName);
+  if (!resolved.startsWith(CONTEXT_DIR + path.sep) && resolved !== CONTEXT_DIR) {
+    throw new Error('Invalid filename');
+  }
+  return resolved;
+}
+
+// Escape HTML to prevent XSS in email templates
+function escapeHtml(str: string): string {
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 app.get("/api/context-files", requireAuth, (req, res) => {
   try {
     const files = fs.readdirSync(CONTEXT_DIR)
@@ -1500,36 +1530,42 @@ app.get("/api/context-files", requireAuth, (req, res) => {
 });
 
 app.get("/api/context-files/:name", requireAuth, (req, res) => {
-  const filename = req.params.name.endsWith('.md') ? req.params.name : req.params.name + '.md';
-  const filePath = path.join(CONTEXT_DIR, path.basename(filename));
-  if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'File not found' });
-  res.json({ name: path.basename(filePath), content: fs.readFileSync(filePath, 'utf-8') });
+  try {
+    const filePath = safeContextPath(req.params.name);
+    if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'File not found' });
+    res.json({ name: path.basename(filePath), content: fs.readFileSync(filePath, 'utf-8') });
+  } catch { return res.status(400).json({ error: 'Invalid filename' }); }
 });
 
 app.post("/api/context-files", requireAuth, (req, res) => {
   const { name, content } = req.body;
   if (!name?.trim() || !content?.trim()) return res.status(400).json({ error: 'name and content required' });
-  const filename = sanitizeFilename(name.trim().replace(/\.md$/, ''));
-  const filePath = path.join(CONTEXT_DIR, filename);
-  fs.writeFileSync(filePath, content.trim());
-  res.json({ success: true, name: filename });
+  try {
+    const filename = sanitizeFilename(name.trim().replace(/\.md$/, ''));
+    const filePath = safeContextPath(filename);
+    fs.writeFileSync(filePath, content.trim());
+    res.json({ success: true, name: filename });
+  } catch { return res.status(400).json({ error: 'Invalid filename' }); }
 });
 
 app.patch("/api/context-files/:name", requireAuth, (req, res) => {
-  const filename = req.params.name.endsWith('.md') ? req.params.name : req.params.name + '.md';
-  const filePath = path.join(CONTEXT_DIR, path.basename(filename));
   const { content } = req.body;
   if (!content?.trim()) return res.status(400).json({ error: 'content required' });
-  fs.writeFileSync(filePath, content.trim());
-  res.json({ success: true });
+  try {
+    const filePath = safeContextPath(req.params.name);
+    if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'File not found' });
+    fs.writeFileSync(filePath, content.trim());
+    res.json({ success: true });
+  } catch { return res.status(400).json({ error: 'Invalid filename' }); }
 });
 
 app.delete("/api/context-files/:name", requireAuth, (req, res) => {
-  const filename = req.params.name.endsWith('.md') ? req.params.name : req.params.name + '.md';
-  const filePath = path.join(CONTEXT_DIR, path.basename(filename));
-  if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'File not found' });
-  fs.unlinkSync(filePath);
-  res.json({ success: true });
+  try {
+    const filePath = safeContextPath(req.params.name);
+    if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'File not found' });
+    fs.unlinkSync(filePath);
+    res.json({ success: true });
+  } catch { return res.status(400).json({ error: 'Invalid filename' }); }
 });
 
 app.get("/api/debug/session", (req, res) => {
@@ -1625,6 +1661,14 @@ try {
 
 let isCronRunning = false; // Lock to prevent overlapping cron executions
 
+// Clean up stale pending_auth records older than 1 hour (abandoned OAuth flows)
+setInterval(() => {
+  try {
+    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    db.prepare("DELETE FROM pending_auth WHERE created_at < ?").run(oneHourAgo);
+  } catch { /* non-critical */ }
+}, 15 * 60 * 1000); // every 15 minutes
+
 setInterval(async () => {
   if (isCronRunning) return;
   isCronRunning = true;
@@ -1697,8 +1741,8 @@ setInterval(async () => {
               <tr style="border-bottom:1px solid #1a1a1a;">
                 <td style="padding:12px 8px;color:#f7931a;font-family:monospace;width:24px;">${String(i + 1).padStart(2, '0')}</td>
                 <td style="padding:12px 8px;">
-                  <p style="margin:0 0 4px;color:#ffffff;font-weight:600;">${h.title || h.expectedDate || ''}</p>
-                  ${h.summary ? `<p style="margin:0;font-size:12px;color:#888;">${h.summary.substring(0, 200)}</p>` : ''}
+                  <p style="margin:0 0 4px;color:#ffffff;font-weight:600;">${escapeHtml(h.title || h.expectedDate || '')}</p>
+                  ${h.summary ? `<p style="margin:0;font-size:12px;color:#888;">${escapeHtml(h.summary.substring(0, 200))}</p>` : ''}
                 </td>
               </tr>`).join('');
             const typeLabel = schedule.report_type.charAt(0).toUpperCase() + schedule.report_type.slice(1);
@@ -1706,12 +1750,12 @@ setInterval(async () => {
               <div style="background:#0a0a0a;color:#e5e5e5;font-family:sans-serif;max-width:700px;margin:0 auto;padding:32px;">
                 <div style="border-bottom:1px solid rgba(247,147,26,0.3);padding-bottom:24px;margin-bottom:24px;">
                   <p style="color:#f7931a;font-family:monospace;font-size:11px;text-transform:uppercase;letter-spacing:0.3em;margin:0 0 8px;">ChokePoint Macro — Auto Report</p>
-                  <h1 style="color:#ffffff;font-size:32px;font-style:italic;margin:0;">${typeLabel} Pulse.</h1>
+                  <h1 style="color:#ffffff;font-size:32px;font-style:italic;margin:0;">${escapeHtml(typeLabel)} Pulse.</h1>
                   <p style="color:#888;font-size:12px;margin:8px 0 0;">${new Date().toLocaleDateString('en-US', { weekday:'long',year:'numeric',month:'long',day:'numeric' })}</p>
                 </div>
                 ${summary ? `<div style="background:rgba(247,147,26,0.05);border:1px solid rgba(247,147,26,0.2);padding:20px;margin-bottom:24px;">
                   <p style="color:#f7931a;font-family:monospace;font-size:10px;text-transform:uppercase;letter-spacing:0.2em;margin:0 0 12px;">Summary</p>
-                  <p style="color:#d1d5db;line-height:1.6;margin:0;">${summary.substring(0, 600)}</p>
+                  <p style="color:#d1d5db;line-height:1.6;margin:0;">${escapeHtml(summary.substring(0, 600))}</p>
                 </div>` : ''}
                 <table style="width:100%;border-collapse:collapse;">${headlinesHtml}</table>
                 <div style="margin-top:32px;padding-top:16px;border-top:1px solid rgba(247,147,26,0.1);text-align:center;">
@@ -1921,6 +1965,43 @@ function yahooParams(rangeKey: string): { interval: string; range: string } {
   return RANGE_MAP[rangeKey] || RANGE_MAP["1m"];
 }
 
+// Shared helper: parse Yahoo Finance chart response into candles + pivot levels
+function parseYahooCandles(chartResult: any): { candles: any[]; pivotLevels: any } {
+  const timestamps: number[] = chartResult.timestamp || [];
+  const q = chartResult.indicators?.quote?.[0] || {};
+  const candles = timestamps
+    .map((t: number, i: number) => ({
+      t: t * 1000, o: q.open?.[i], h: q.high?.[i], l: q.low?.[i], c: q.close?.[i], v: q.volume?.[i],
+    }))
+    .filter((c: any) => c.o != null && c.h != null && c.l != null && c.c != null);
+
+  let pivotLevels: any = null;
+  if (candles.length > 0) {
+    const periodH = Math.max(...candles.map((c: any) => c.h));
+    const periodL = Math.min(...candles.map((c: any) => c.l));
+    const periodC = (candles[candles.length - 1] as any).c;
+    const p = (periodH + periodL + periodC) / 3;
+    pivotLevels = {
+      p, r1: 2*p - periodL, r2: p + (periodH - periodL), r3: periodH + 2*(p - periodL),
+      s1: 2*p - periodH, s2: p - (periodH - periodL), s3: periodL - 2*(periodH - p),
+    };
+  }
+  return { candles, pivotLevels };
+}
+
+// Fetch candles for a single Yahoo symbol, returning empty result on failure
+async function fetchYahooCandles(yahooSym: string, interval: string, range: string): Promise<{ candles: any[]; pivotLevels: any }> {
+  const r = await fetch(
+    `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSym)}?interval=${interval}&range=${range}`,
+    { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" } }
+  );
+  if (!r.ok) return { candles: [], pivotLevels: null };
+  const j = await r.json() as any;
+  const result = j.chart?.result?.[0];
+  if (!result) return { candles: [], pivotLevels: null };
+  return parseYahooCandles(result);
+}
+
 app.get("/api/markets/history", async (req, res) => {
   try {
     const rangeKey = ((req.query.range as string) || "1m").toLowerCase();
@@ -1931,26 +2012,7 @@ app.get("/api/markets/history", async (req, res) => {
     if (singleSymbol) {
       const yahooSym = YAHOO_MAP[singleSymbol] || singleSymbol;
       try {
-        const r = await fetch(
-          `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSym)}?interval=${interval}&range=${range}`,
-          { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" } }
-        );
-        if (!r.ok) return res.json({ symbol: singleSymbol, candles: [], pivotLevels: null });
-        const j = await r.json() as any;
-        const result = j.chart?.result?.[0];
-        if (!result) return res.json({ symbol: singleSymbol, candles: [], pivotLevels: null });
-        const timestamps: number[] = result.timestamp || [];
-        const q = result.indicators?.quote?.[0] || {};
-        const candles = timestamps.map((t, i) => ({
-          t: t * 1000, o: q.open?.[i], h: q.high?.[i], l: q.low?.[i], c: q.close?.[i], v: q.volume?.[i],
-        })).filter((c: any) => c.o != null && c.h != null && c.l != null && c.c != null);
-        const pivotLevels = candles.length > 0 ? (() => {
-          const periodH = Math.max(...candles.map((c: any) => c.h));
-          const periodL = Math.min(...candles.map((c: any) => c.l));
-          const periodC = (candles[candles.length - 1] as any).c;
-          const p = (periodH + periodL + periodC) / 3;
-          return { p, r1: 2*p - periodL, r2: p + (periodH - periodL), r3: periodH + 2*(p - periodL), s1: 2*p - periodH, s2: p - (periodH - periodL), s3: periodL - 2*(periodH - p) };
-        })() : null;
+        const { candles, pivotLevels } = await fetchYahooCandles(yahooSym, interval, range);
         return res.json({ symbol: singleSymbol, candles, pivotLevels });
       } catch { return res.json({ symbol: singleSymbol, candles: [], pivotLevels: null }); }
     }
@@ -1958,31 +2020,7 @@ app.get("/api/markets/history", async (req, res) => {
     const results = await Promise.all(
       Object.entries(YAHOO_MAP).map(async ([sym, yahooSym]) => {
         try {
-          const r = await fetch(
-            `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSym)}?interval=${interval}&range=${range}`,
-            { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" } }
-          );
-          if (!r.ok) return { symbol: sym, candles: [], pivotLevels: null };
-          const j = await r.json() as any;
-          const result = j.chart?.result?.[0];
-          if (!result) return { symbol: sym, candles: [], pivotLevels: null };
-          const timestamps: number[] = result.timestamp || [];
-          const q = result.indicators?.quote?.[0] || {};
-          const candles = timestamps.map((t, i) => ({
-            t: t * 1000, o: q.open?.[i], h: q.high?.[i], l: q.low?.[i], c: q.close?.[i], v: q.volume?.[i],
-          })).filter((c: any) => c.o != null && c.h != null && c.l != null && c.c != null);
-
-          const pivotLevels = candles.length > 0 ? (() => {
-            const periodH = Math.max(...candles.map((c: any) => c.h));
-            const periodL = Math.min(...candles.map((c: any) => c.l));
-            const periodC = (candles[candles.length - 1] as any).c;
-            const p = (periodH + periodL + periodC) / 3;
-            return {
-              p, r1: 2*p - periodL, r2: p + (periodH - periodL), r3: periodH + 2*(p - periodL),
-              s1: 2*p - periodH, s2: p - (periodH - periodL), s3: periodL - 2*(periodH - p),
-            };
-          })() : null;
-
+          const { candles, pivotLevels } = await fetchYahooCandles(yahooSym, interval, range);
           return { symbol: sym, candles, pivotLevels };
         } catch { return { symbol: sym, candles: [], pivotLevels: null }; }
       })
@@ -2004,35 +2042,10 @@ app.get("/api/markets/history/:symbol", async (req, res) => {
     // Check YAHOO_MAP first, then fallback to the symbol itself (or CRYPTO convention)
     let yahooSym = YAHOO_MAP[sym];
     if (!yahooSym) {
-      // Try crypto convention
-      yahooSym = sym.includes("-") ? sym : sym;
+      yahooSym = sym;
     }
 
-    const r = await fetch(
-      `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSym)}?interval=${interval}&range=${range}`,
-      { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" } }
-    );
-    if (!r.ok) return res.json({ symbol: sym, candles: [], pivotLevels: null });
-    const j = await r.json() as any;
-    const result = j.chart?.result?.[0];
-    if (!result) return res.json({ symbol: sym, candles: [], pivotLevels: null });
-    const timestamps: number[] = result.timestamp || [];
-    const q = result.indicators?.quote?.[0] || {};
-    const candles = timestamps.map((t, i) => ({
-      t: t * 1000, o: q.open?.[i], h: q.high?.[i], l: q.low?.[i], c: q.close?.[i], v: q.volume?.[i],
-    })).filter((c: any) => c.o != null && c.h != null && c.l != null && c.c != null);
-
-    const pivotLevels = candles.length > 0 ? (() => {
-      const periodH = Math.max(...candles.map((c: any) => c.h));
-      const periodL = Math.min(...candles.map((c: any) => c.l));
-      const periodC = (candles[candles.length - 1] as any).c;
-      const p = (periodH + periodL + periodC) / 3;
-      return {
-        p, r1: 2*p - periodL, r2: p + (periodH - periodL), r3: periodH + 2*(p - periodL),
-        s1: 2*p - periodH, s2: p - (periodH - periodL), s3: periodL - 2*(periodH - p),
-      };
-    })() : null;
-
+    const { candles, pivotLevels } = await fetchYahooCandles(yahooSym, interval, range);
     res.json({ symbol: sym, candles, pivotLevels });
   } catch (err) {
     res.status(500).json({ error: String(err) });
@@ -2279,31 +2292,9 @@ app.get("/api/markets/lookup", async (req, res) => {
     let candles: any[] = [];
     let pivotLevels: any = null;
     try {
-      const yRes = await fetch(
-        `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSym)}?interval=${lkInterval}&range=${lkRange}`,
-        { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" } }
-      );
-      if (yRes.ok) {
-        const yData = await yRes.json() as any;
-        const result = yData.chart?.result?.[0];
-        if (result) {
-          const timestamps: number[] = result.timestamp || [];
-          const q2 = result.indicators?.quote?.[0] || {};
-          candles = timestamps.map((t: number, i: number) => ({
-            t: t * 1000, o: q2.open?.[i], h: q2.high?.[i], l: q2.low?.[i], c: q2.close?.[i],
-          })).filter((c: any) => c.o != null && c.h != null && c.l != null && c.c != null);
-          if (candles.length > 0) {
-            const periodH = Math.max(...candles.map((c: any) => c.h));
-            const periodL = Math.min(...candles.map((c: any) => c.l));
-            const periodC = (candles[candles.length - 1] as any).c;
-            const p = (periodH + periodL + periodC) / 3;
-            pivotLevels = {
-              p, r1: 2*p - periodL, r2: p + (periodH - periodL), r3: periodH + 2*(p - periodL),
-              s1: 2*p - periodH, s2: p - (periodH - periodL), s3: periodL - 2*(periodH - p),
-            };
-          }
-        }
-      }
+      const history = await fetchYahooCandles(yahooSym, lkInterval, lkRange);
+      candles = history.candles;
+      pivotLevels = history.pivotLevels;
     } catch { /* history is optional */ }
 
     res.json({ tile, candles, pivotLevels });

@@ -5,7 +5,7 @@
   --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
   --font-serif: "Cormorant Garamond", serif;
-  
+
   --color-btc-orange: #f7931a;
   --color-matrix-bg: #0a0a0a;
 }
@@ -13,6 +13,28 @@
 @layer base {
   body {
     @apply bg-matrix-bg text-gray-300 antialiased;
+  }
+
+  /* Custom scrollbar — matches the dark terminal aesthetic */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: rgba(247, 147, 26, 0.2);
+    border-radius: 3px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(247, 147, 26, 0.4);
+  }
+
+  /* Focus-visible for keyboard accessibility */
+  *:focus-visible {
+    outline: 1px solid rgba(247, 147, 26, 0.6);
+    outline-offset: 2px;
   }
 }
 

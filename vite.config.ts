@@ -7,11 +7,9 @@ export default defineConfig(({mode}) => {
   const env = loadEnv(mode, '.', '');
   return {
     plugins: [react(), tailwindcss()],
-    define: {
-      'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY),
-      'process.env.OPENAI_API_KEY': JSON.stringify(env.OPENAI_API_KEY),
-      'process.env.ANTHROPIC_API_KEY': JSON.stringify(env.ANTHROPIC_API_KEY),
-    },
+    // SECURITY: API keys must NEVER be exposed to the frontend bundle.
+    // All AI calls are routed through the backend server endpoints.
+    define: {},
     resolve: {
       alias: {
         '@': path.resolve(__dirname, '.'),
