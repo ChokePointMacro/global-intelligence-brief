@@ -120,6 +120,39 @@ try {
   console.error("Reports migration error:", err);
 }
 
+// Migration: add source_url to scheduled_posts.
+// The source link is posted as a REPLY, never in the post body — X cuts reach ~30-50% on
+// posts containing external links, so the body stays clean and the citation sits one level
+// down where it costs nothing in distribution.
+try {
+  const cols = db.prepare("PRAGMA table_info(scheduled_posts)").all() as any[];
+  if (!cols.some(c => c.name === 'source_url')) {
+    db.exec("ALTER TABLE scheduled_posts ADD COLUMN source_url TEXT");
+    console.log("Migrated scheduled_posts table: added source_url column");
+  }
+} catch (err) {
+  console.error("scheduled_posts migration error:", err);
+}
+
+// Migration: publisher safety/idempotency columns.
+// status flows pending -> posting -> posted|failed. The intermediate 'posting' claim is
+// what stops a crash mid-flight from re-posting the same tweet on the next cron tick.
+try {
+  const cols = db.prepare("PRAGMA table_info(scheduled_posts)").all() as any[];
+  const add = (name: string, ddl: string) => {
+    if (!cols.some(c => c.name === name)) {
+      db.exec(`ALTER TABLE scheduled_posts ADD COLUMN ${ddl}`);
+      console.log(`Migrated scheduled_posts table: added ${name} column`);
+    }
+  };
+  add('posted_tweet_id', 'posted_tweet_id TEXT');
+  add('last_error', 'last_error TEXT');
+  add('attempts', 'attempts INTEGER DEFAULT 0');
+  add('claimed_at', 'claimed_at DATETIME');
+} catch (err) {
+  console.error("scheduled_posts safety migration error:", err);
+}
+
 // Migration: add platform column to pending_auth if missing
 try {
   const cols = db.prepare("PRAGMA table_info(pending_auth)").all() as any[];

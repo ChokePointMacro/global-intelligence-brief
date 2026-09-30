@@ -8,3 +8,12 @@ coverage/
 !.env.example
 *.sqlite
 sessions/
+
+# runtime logs (structured JSONL from src/services/log.ts)
+logs/
+*.jsonl
+
+# local scratch
+tmp-*.ts
+.env.bak-*
+.env.bak2-*

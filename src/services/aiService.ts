@@ -9,6 +9,25 @@ export interface AIResponse {
   warnings?: string[];
 }
 
+// Rate limit snapshots captured from API responses
+export interface RateLimitData {
+  limitRequests?: number;
+  limitTokens?: number;
+  remainingRequests?: number;
+  remainingTokens?: number;
+  resetRequests?: string;
+  resetTokens?: string;
+  inputTokensUsed?: number;
+  outputTokensUsed?: number;
+  lastCallAt?: string;
+  lastModel?: string;
+}
+
+export const rateLimits: Record<string, RateLimitData> = {
+  anthropic: {},
+  gemini: {},
+};
+
 export interface ReportRequest {
   type: "global" | "crypto" | "equities" | "conspiracies";
   topicFocus: string;
@@ -128,6 +147,14 @@ async function generateWithGemini(prompt: string): Promise<AIResponse> {
       const content = response.text || "";
       if (!content) throw new Error("Empty response from Gemini");
 
+      // Capture Gemini usage data
+      rateLimits.gemini = {
+        inputTokensUsed: (response as any).usageMetadata?.promptTokenCount,
+        outputTokensUsed: (response as any).usageMetadata?.candidatesTokenCount,
+        lastCallAt: new Date().toISOString(),
+        lastModel: model,
+      };
+
       return {
         content,
         provider: "gemini",
@@ -148,7 +175,7 @@ async function generateWithGemini(prompt: string): Promise<AIResponse> {
 async function generateWithClaude(prompt: string, maxTokens = 8000): Promise<AIResponse> {
   const client = getAnthropic();
 
-  const response = await client.messages.create({
+  const { data: response, response: raw } = await client.messages.create({
     model: "claude-sonnet-4-6",
     max_tokens: maxTokens,
     messages: [
@@ -158,7 +185,21 @@ async function generateWithClaude(prompt: string, maxTokens = 8000): Promise<AIR
       },
     ],
     system: "You are a professional analyst. Return ONLY valid JSON with no additional text or markdown.",
-  });
+  }).withResponse();
+
+  // Capture rate limit headers
+  rateLimits.anthropic = {
+    limitRequests: parseInt(raw.headers.get('x-ratelimit-limit-requests') || '') || undefined,
+    limitTokens: parseInt(raw.headers.get('x-ratelimit-limit-tokens') || '') || undefined,
+    remainingRequests: parseInt(raw.headers.get('x-ratelimit-remaining-requests') || '') || undefined,
+    remainingTokens: parseInt(raw.headers.get('x-ratelimit-remaining-tokens') || '') || undefined,
+    resetRequests: raw.headers.get('x-ratelimit-reset-requests') || undefined,
+    resetTokens: raw.headers.get('x-ratelimit-reset-tokens') || undefined,
+    inputTokensUsed: response.usage?.input_tokens,
+    outputTokensUsed: response.usage?.output_tokens,
+    lastCallAt: new Date().toISOString(),
+    lastModel: "claude-sonnet-4-6",
+  };
 
   const content =
     response.content[0].type === "text" ? response.content[0].text : "";

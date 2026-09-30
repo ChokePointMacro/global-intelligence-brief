@@ -503,12 +503,18 @@ export const Dashboard = () => {
       instaFolder.file('report-summary.txt', summaryLines);
 
       weeklyReport!.headlines.forEach((h, i) => {
-        const tweetContent = [h.socialPost, '', `Source: ${h.url}`].join('\n');
+        const tweetContent = [h.socialPostWithTags || h.socialPost, '', `Source: ${h.url}`].join('\n');
         tweetsFolder.file(`${date}-${String(i + 1).padStart(2, '0')}-${slugify(h.title)}.txt`, tweetContent);
       });
 
       const allTweets = weeklyReport!.headlines
-        .map((h, i) => `--- Tweet ${String(i + 1).padStart(2, '0')} [${h.category}] ---\n${h.socialPost}\n${h.url}`)
+        .map((h, i) => [
+          `--- Tweet ${String(i + 1).padStart(2, '0')} [${h.category}] ---`,
+          h.socialPostWithTags || h.socialPost,
+          h.url,
+          h.audience ? `# targets: ${h.audience}` : '',
+          h.hashtagRationale ? `# why: ${h.hashtagRationale}` : '',
+        ].filter(Boolean).join('\n'))
         .join('\n\n');
       tweetsFolder.file('all-tweets.txt', allTweets);
 

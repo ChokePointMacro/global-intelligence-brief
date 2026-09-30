@@ -14,6 +14,9 @@ import db from "./db.ts";
 import dotenv from "dotenv";
 import path from "path";
 import { generateWeeklyReport, generateInstagramCaption, generateSubstackArticle, generateForecastReport, generateSpeculationReport, type WeeklyReport } from "./src/services/geminiService.ts";
+import { rateLimits as aiRateLimits } from "./src/services/aiService.ts";
+import { DEFAULT_WEIGHTS, normaliseWeights, scorePost as scoreSample } from "./src/services/scoring.ts";
+import { log, errInfo, installProcessHandlers } from "./src/services/log.ts";
 
 import fs from "fs";
 
@@ -21,6 +24,29 @@ dotenv.config();
 
 const app = express();
 const PORT = 3000;
+
+// ─── Connection Rate Limit Tracker ────────────────────────────────────────────
+
+interface RateLimitSnapshot {
+  limitRequests?: number;
+  limitTokens?: number;
+  remainingRequests?: number;
+  remainingTokens?: number;
+  resetRequests?: string;
+  resetTokens?: string;
+  inputTokensUsed?: number;
+  outputTokensUsed?: number;
+  lastCallAt?: string;
+  lastModel?: string;
+  lastError?: string;
+}
+
+const connectionTracker: Record<string, RateLimitSnapshot> = {
+  anthropic: {},
+  gemini: {},
+  x: {},
+  public: {},
+};
 
 // ─── Startup Security Checks ───────────────────────────────────────────────────
 
@@ -84,9 +110,30 @@ const emailLimiter = rateLimit({
   message: { error: "Email rate limit exceeded. Maximum 5 emails per hour." },
 });
 
+// ─── Local single-user mode ────────────────────────────────────────────────────
+// This runs only on the owner's machine as the posting/automation engine. There is
+// no multi-user story and it is never forward-facing, so the login gate is bypassed
+// and every request runs as the owner. Two things keep that safe: the server binds
+// to loopback only (see app.listen), and LOCAL_MODE=false in .env restores the gate.
+const LOCAL_MODE = process.env.LOCAL_MODE !== 'false';
+const LOCAL_USER_ID = process.env.LOCAL_USER_ID || 'm@aol.com';
+
+if (LOCAL_MODE) {
+  // The X token row is keyed by user_id, so the owner row must exist for the
+  // connect flow and /api/auth/me to have something to join against.
+  const owner = db.prepare("SELECT id FROM users WHERE email = ?").get(LOCAL_USER_ID) as any;
+  if (!owner) {
+    db.prepare("INSERT INTO users (email, username, display_name) VALUES (?, ?, ?)")
+      .run(LOCAL_USER_ID, LOCAL_USER_ID.split('@')[0], 'Operator');
+    console.log(`[local-mode] created owner row for ${LOCAL_USER_ID}`);
+  }
+  console.log(`[local-mode] auth bypassed — every request runs as ${LOCAL_USER_ID}`);
+}
+
 // ─── Auth Middleware ───────────────────────────────────────────────────────────
 
 const requireAuth = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (LOCAL_MODE) return next();
   if (!(req.session as any).userId) return res.status(401).json({ error: "Not authenticated" });
   next();
 };
@@ -124,6 +171,16 @@ app.use(
   })
 );
 
+// Local mode: stamp every request as the owner. Downstream code reads the user off
+// the session, so setting it here means the X connect flow, posting, and scheduling
+// all keep working unchanged instead of needing an auth refactor.
+app.use((req, _res, next) => {
+  if (LOCAL_MODE && (req.session as any).userId !== LOCAL_USER_ID) {
+    (req.session as any).userId = LOCAL_USER_ID;
+  }
+  next();
+});
+
 // Reduced logging verbosity - usually only needed in dev or for errors
 app.use((req, res, next) => {
   if (process.env.NODE_ENV !== 'production') {
@@ -152,7 +209,10 @@ function hasValidCreds(platform: string): boolean {
   if (platform === 'x') {
     const id = getPlatformCred('x', 'client_id');
     const sec = getPlatformCred('x', 'client_secret');
-    return !!(id && sec && !id.includes('dummy') && !sec.includes('dummy'));
+    // A secret is optional: X "Native App" / "Single page App" types are public
+    // clients that have no secret at all and authenticate with PKCE alone.
+    if (!id || id.includes('dummy')) return false;
+    return !sec || !sec.includes('dummy');
   }
   if (platform === 'instagram') return !!(getPlatformCred('instagram', 'app_id') && getPlatformCred('instagram', 'app_secret'));
   if (platform === 'linkedin')  return !!(getPlatformCred('linkedin',  'client_id') && getPlatformCred('linkedin',  'client_secret'));
@@ -161,10 +221,66 @@ function hasValidCreds(platform: string): boolean {
 }
 
 function getXClient(): TwitterApi {
-  return new TwitterApi({
-    clientId:     getPlatformCred('x', 'client_id'),
-    clientSecret: getPlatformCred('x', 'client_secret'),
-  });
+  const clientId = getPlatformCred('x', 'client_id');
+  const clientSecret = getPlatformCred('x', 'client_secret');
+  // Passing a clientSecret makes twitter-api-v2 send a Basic auth header. X rejects
+  // that outright for public clients (Native / SPA app types), which have no secret
+  // and authenticate with PKCE alone — so omit it entirely when none is configured.
+  return clientSecret ? new TwitterApi({ clientId, clientSecret }) : new TwitterApi({ clientId });
+}
+
+// X Premium allows long-form posts (25,000 chars); the free tier is capped at 280.
+// This is only a sanity bound — X itself is the real authority and will reject an
+// over-length post with a clear error. Set X_MAX_POST_CHARS=280 to enforce free-tier.
+const X_MAX_POST_CHARS = Number(process.env.X_MAX_POST_CHARS) || 25000;
+
+// Cite sources as a reply to the post rather than inside it. X reduces reach ~30-50% on
+// posts containing external links, so the body stays clean and the citation goes one level
+// down. Costs one extra API post per tweet (a link post is billed higher than a plain one),
+// which is why this is opt-in: set POST_SOURCE_AS_REPLY=true in .env to enable.
+const POST_SOURCE_AS_REPLY = process.env.POST_SOURCE_AS_REPLY === 'true';
+
+// ─── Publisher safety rails ────────────────────────────────────────────────────
+// This posts to a live public account on a timer and each post costs money, so the
+// scheduler needs bounds. All four are env-controlled and default to safe values.
+const POSTING_ENABLED = process.env.POSTING_ENABLED !== 'false';   // kill switch
+const POSTING_DRY_RUN = process.env.POSTING_DRY_RUN === 'true';    // log, never send
+const MAX_POSTS_PER_RUN = Number(process.env.MAX_POSTS_PER_RUN) || 5;
+const CLAIM_TIMEOUT_MIN = Number(process.env.POST_CLAIM_TIMEOUT_MIN) || 10;
+
+
+
+/**
+ * Token exchange against X, handling BOTH OAuth2 client types.
+ *
+ * twitter-api-v2 can't do the public-client flow: with no clientSecret it sends no
+ * Authorization header AND a `client_secret: undefined` field, which is just a
+ * malformed request. So we issue the request ourselves.
+ *
+ *  - Confidential client (Web App / Automated App / Bot): HTTP Basic clientId:clientSecret.
+ *  - Public client (Native App / Single page App): no Basic header, client_id in the
+ *    body, PKCE alone proves the caller. X issues no secret for these at all.
+ */
+async function xTokenRequest(params: Record<string, string>): Promise<any> {
+  const clientId = getPlatformCred('x', 'client_id');
+  const clientSecret = getPlatformCred('x', 'client_secret');
+
+  const headers: Record<string, string> = { 'Content-Type': 'application/x-www-form-urlencoded' };
+  const body = new URLSearchParams({ ...params, client_id: clientId });
+  if (clientSecret) {
+    headers.Authorization = 'Basic ' + Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
+  }
+
+  const resp = await fetch('https://api.x.com/2/oauth2/token', { method: 'POST', headers, body });
+  const text = await resp.text();
+  let json: any;
+  try { json = JSON.parse(text); } catch { json = { raw: text }; }
+
+  if (!resp.ok) {
+    const mode = clientSecret ? 'confidential' : 'public';
+    throw new Error(`X token request failed (${resp.status}, ${mode} client): ${json.error || ''} ${json.error_description || text.slice(0, 200)}`);
+  }
+  return json;
 }
 
 if (!hasValidCreds('x')) {
@@ -173,10 +289,18 @@ if (!hasValidCreds('x')) {
 
 // ─── Auth helpers ──────────────────────────────────────────────────────────────
 
+// Only ever trusted for loopback hosts — never let a spoofed Host header steer
+// the OAuth redirect on a real deployment.
+const LOOPBACK_HOST = /^(localhost|127\.0\.0\.1|\[::1\]|::1)(:\d+)?$/;
+
 const getAppOrigin = (req: express.Request): string => {
+  const host = req.headers.host || '';
+  // Local dev: use the host we were actually reached on, so the OAuth redirect
+  // follows whatever port/hostname you happen to be browsing. Each variant still
+  // has to be registered as a callback URL in the X developer portal.
+  if (LOOPBACK_HOST.test(host)) return `http://${host}`;
   if (process.env.APP_URL) return process.env.APP_URL;
   const protocol = req.headers['x-forwarded-proto'] || 'https';
-  const host = req.headers.host;
   return `${protocol}://${host}`;
 };
 
@@ -343,6 +467,13 @@ const PLATFORM_KEYS: Record<string, string[]> = {
   threads:   ['app_id', 'app_secret'],
 };
 
+// Keys that may legitimately be left blank. X public clients (Native / SPA app types)
+// have no client secret at all, so requiring one made those apps impossible to configure.
+// Submitting a blank value clears the stored override rather than saving an empty string.
+const OPTIONAL_CRED_KEYS: Record<string, string[]> = {
+  x: ['client_secret'],
+};
+
 // Returns which platforms are configured (never returns actual values)
 app.get("/api/platform-credentials", requireAuth, (req, res) => {
   const status: Record<string, { configured: boolean; keys: string[] }> = {};
@@ -360,16 +491,24 @@ app.post("/api/platform-credentials/:platform", requireAuth, (req, res) => {
   if (!credentials || typeof credentials !== 'object') return res.status(400).json({ error: "credentials object required" });
 
   const requiredKeys = PLATFORM_KEYS[platform];
+  const optionalKeys = OPTIONAL_CRED_KEYS[platform] || [];
   for (const key of requiredKeys) {
+    if (optionalKeys.includes(key)) continue;
     if (!credentials[key]?.trim()) return res.status(400).json({ error: `Missing required field: ${key}` });
   }
 
   for (const key of requiredKeys) {
+    const value = credentials[key]?.trim() || '';
+    if (!value) {
+      // Blank optional key — drop the override so lookups fall through to .env / public-client mode.
+      db.prepare("DELETE FROM platform_credentials WHERE platform = ? AND key_name = ?").run(platform, key);
+      continue;
+    }
     db.prepare(`
       INSERT INTO platform_credentials (platform, key_name, key_value, updated_at)
       VALUES (?, ?, ?, CURRENT_TIMESTAMP)
       ON CONFLICT(platform, key_name) DO UPDATE SET key_value = excluded.key_value, updated_at = CURRENT_TIMESTAMP
-    `).run(platform, key, credentials[key].trim());
+    `).run(platform, key, value);
   }
 
   res.json({ success: true, configured: hasValidCreds(platform) });
@@ -389,9 +528,16 @@ app.get("/api/platform-credentials/:platform/test", requireAuth, async (req, res
   if (!hasValidCreds(platform)) return res.json({ ok: false, error: "Credentials not saved" });
   try {
     if (platform === 'x') {
-      const redirectUri = getRedirectUri(req, 'x');
-      getXClient().generateOAuth2AuthLink(redirectUri, { scope: ['tweet.read', 'users.read'] });
-      return res.json({ ok: true });
+      // This used to call generateOAuth2AuthLink, which is pure local string building and
+      // makes no network request — it returned ok:true against completely dead credentials.
+      // Do a real round trip instead: refresh if near expiry, then hit the API.
+      const tokenRecord = getXTokenRecord((req.session as any).userId);
+      if (!tokenRecord?.access_token) {
+        return res.json({ ok: false, error: "Credentials saved, but no X account connected yet — click Connect." });
+      }
+      const accessToken = await refreshXToken(tokenRecord);
+      const me = await new TwitterApi(accessToken).v2.me();
+      return res.json({ ok: true, handle: `@${me.data.username}` });
     }
     if (platform === 'linkedin') {
       const clientId = getPlatformCred('linkedin', 'client_id');
@@ -597,16 +743,26 @@ app.get("/auth/x/connect/callback", async (req, res) => {
 
   const pending = db.prepare("SELECT code_verifier FROM pending_auth WHERE state = ? AND platform = 'x_connect'").get(state) as any;
   if (!pending || !code) return res.status(400).send("Invalid state or missing code. Please try again.");
+  // No session here means the callback landed on a different hostname than the one
+  // the flow started on (localhost vs 127.0.0.1 have separate cookie jars). Filing the
+  // token under 'anonymous' would look like success but leave posting broken, so stop.
+  if (!userId) return res.status(401).send("Session lost during the X handshake — start Connect from the same hostname you're signed in on, then try again.");
   db.prepare("DELETE FROM pending_auth WHERE state = ?").run(state);
 
   try {
     const redirectUri = getRedirectUri(req, 'x/connect');
-    const { client: loggedClient, accessToken, refreshToken, expiresIn } = await getXClient().loginWithOAuth2({
+    const tok = await xTokenRequest({
+      grant_type: 'authorization_code',
       code: code as string,
-      codeVerifier: pending.code_verifier,
-      redirectUri,
+      code_verifier: pending.code_verifier,
+      redirect_uri: redirectUri,
     });
+    const accessToken: string = tok.access_token;
+    const refreshToken: string | undefined = tok.refresh_token;
+    const expiresIn: number = tok.expires_in;
+    console.log(`[x-connect] token OK — scopes: ${tok.scope} | refresh_token: ${refreshToken ? 'yes' : 'NO'}`);
 
+    const loggedClient = new TwitterApi(accessToken);
     const { data: xUser } = await loggedClient.v2.me({ "user.fields": ["profile_image_url", "username", "name"] });
 
     const expiresAt = Date.now() + (expiresIn || 0) * 1000;
@@ -619,7 +775,7 @@ app.get("/auth/x/connect/callback", async (req, res) => {
         handle = excluded.handle,
         expires_at = excluded.expires_at,
         updated_at = CURRENT_TIMESTAMP
-    `).run(userId || 'anonymous', accessToken, refreshToken || '', `@${xUser.username}`, expiresAt);
+    `).run(userId, accessToken, refreshToken || '', `@${xUser.username}`, expiresAt);
 
     const xHandle = JSON.stringify('@' + xUser.username);
     const origin = JSON.stringify(getAppOrigin(req));
@@ -894,21 +1050,29 @@ app.post("/api/social/post", requireAuth, postLimiter, async (req, res) => {
     }
   }
 
-  // Post to X via OAuth 1.0a (free tier — uses app-level keys)
+  // Post to X via the OAuth 2.0 user connection — the same token the scheduler and
+  // /api/post-to-x use. This previously required a separate set of OAuth 1.0a app keys
+  // (X_API_KEY/X_API_SECRET/X_ACCESS_TOKEN/X_ACCESS_SECRET) that were never configured,
+  // so Compose always failed with "OAuth 1.0a credentials not configured" even with a
+  // perfectly healthy OAuth 2.0 connection.
   if (platforms.includes('x')) {
     try {
-      const apiKey    = process.env.X_API_KEY;
-      const apiSecret = process.env.X_API_SECRET;
-      const accToken  = process.env.X_ACCESS_TOKEN;
-      const accSecret = process.env.X_ACCESS_SECRET;
-      if (!apiKey || !apiSecret || !accToken || !accSecret) {
-        throw new Error("X OAuth 1.0a credentials not configured");
+      const tokenRecord = getXTokenRecord(userId);
+      if (!tokenRecord?.access_token) {
+        throw new Error("X account not connected — connect it on the Profile page.");
       }
-      const client = new TwitterApi({ appKey: apiKey, appSecret: apiSecret, accessToken: accToken, accessSecret: accSecret });
-      const result = await client.v1.tweet(text.substring(0, 280));
-      results.x = { success: true, id: result.id_str };
-    } catch (err) {
-      results.x = { success: false, error: err instanceof Error ? err.message : String(err) };
+      if (text.length > X_MAX_POST_CHARS) {
+        throw new Error(`Post too long: ${text.length}/${X_MAX_POST_CHARS} characters`);
+      }
+      const accessToken = await refreshXToken(tokenRecord);
+      const result = await new TwitterApi(accessToken).v2.tweet(text);
+      results.x = { success: true, id: result.data.id };
+    } catch (err: any) {
+      // Surface X's own response body. A bare "Request failed with code NNN" hides the
+      // reason (wrong tier, duplicate post, suspended app), which makes these unfixable.
+      const detail = err?.data ? JSON.stringify(err.data).slice(0, 500) : '';
+      console.error(`[x-post] failed code=${err?.code ?? '?'} len=${text.length} msg=${err?.message ?? err} detail=${detail}`);
+      results.x = { success: false, error: `${err instanceof Error ? err.message : String(err)}${detail ? ` — ${detail}` : ''}` };
     }
   }
 
@@ -1000,7 +1164,10 @@ app.get("/api/debug/models", requireAuth, async (_req, res) => {
   }
 });
 
-const REPORT_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes max per report
+// Report generation is now TWO sequential AI calls: the report itself, then the hashtag
+// reach pass. At 3 minutes the request timed out while the second call was still running —
+// the work completed and was then discarded, which looked like a silent failure.
+const REPORT_TIMEOUT_MS = Number(process.env.REPORT_TIMEOUT_MS) || 8 * 60 * 1000;
 
 app.post("/api/generate-report", requireAuth, reportGenLimiter, async (req, res) => {
   try {
@@ -1031,10 +1198,30 @@ app.post("/api/generate-report", requireAuth, reportGenLimiter, async (req, res)
     } else if (type === 'speculation') {
       resultPromise = generateSpeculationReport(logProgress);
     } else {
-      resultPromise = generateWeeklyReport(type, customTopic, logProgress);
+      resultPromise = generateWeeklyReport(type, customTopic, logProgress, getContentGuidance());
     }
 
-    const report = await Promise.race([resultPromise, timeoutPromise]);
+    // The client is what normally persists a report, so losing the race used to discard a
+    // finished generation along with everything it cost. Salvage it server-side instead.
+    let raceLost = false;
+    resultPromise
+      .then((r: any) => {
+        if (!raceLost) return;
+        const items = r?.headlines?.length ?? r?.events?.length ?? 0;
+        if (!items) return;
+        const id = `${type}-${Date.now()}`;
+        db.prepare(`INSERT INTO reports (id, type, content, custom_topic, updated_at)
+                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(id) DO UPDATE SET content = excluded.content, updated_at = CURRENT_TIMESTAMP`)
+          .run(id, type, JSON.stringify(r), customTopic || null);
+        log.warn('report_salvaged_after_timeout', { id, type, items });
+      })
+      .catch((e: unknown) => log.error('report_background_failure', errInfo(e)));
+
+    const report = await Promise.race([resultPromise, timeoutPromise]).catch((e) => {
+      if (e instanceof Error && e.message === 'REPORT_TIMEOUT') raceLost = true;
+      throw e;
+    });
 
     if (type === 'forecast') {
       if (!report?.events?.length) return res.status(500).json({ error: "Failed to generate forecast: no events returned" });
@@ -1055,7 +1242,7 @@ app.post("/api/generate-report", requireAuth, reportGenLimiter, async (req, res)
 
     if (message === "REPORT_TIMEOUT") {
       errorType = "TIMEOUT"; statusCode = 504;
-      userMessage = "Report generation timed out after 3 minutes. The AI provider may be slow — please try again.";
+      userMessage = `Report generation exceeded ${Math.round(REPORT_TIMEOUT_MS / 60000)} minutes. It may still finish in the background — check Reports shortly before retrying.`;
     } else if (message.includes("AbortError") || message.includes("aborted") || message.includes("cancelled") || message.includes("canceled")) {
       errorType = "CANCELLED"; statusCode = 499;
       userMessage = "Report generation was cancelled.";
@@ -1337,13 +1524,94 @@ app.delete("/api/scheduled-reports/:id", requireAuth, (req, res) => {
   res.json({ success: true });
 });
 
+
+/** Human-editable content guidance injected into every report generation.
+ *  Edited by hand via PUT /api/app-settings, or proposed by the weekly audience sample. */
+function getContentGuidance(): string | undefined {
+  try {
+    const row = db.prepare("SELECT value FROM app_settings WHERE key = 'content_guidance'").get() as any;
+    return row?.value?.trim() || undefined;
+  } catch { return undefined; }
+}
+
+
+// ─── Weights & Measures ────────────────────────────────────────────────────────
+
+// The audience sample table is created by the weekly sampler, but the UI must not 500
+// before the first run — create it here too so reads always succeed with an empty set.
+try {
+  db.exec(`CREATE TABLE IF NOT EXISTS audience_samples (
+    tweet_id TEXT PRIMARY KEY, sampled_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    theme TEXT, author_id TEXT, username TEXT, followers INTEGER,
+    created_at TEXT, text TEXT, chars INTEGER, hashtag_count INTEGER,
+    has_link INTEGER, likes INTEGER, reposts INTEGER, replies INTEGER,
+    quotes INTEGER, bookmarks INTEGER, impressions INTEGER
+  )`);
+} catch (err) {
+  console.error("audience_samples init error:", err);
+}
+
+function getScoringWeights() {
+  try {
+    const row = db.prepare("SELECT value FROM app_settings WHERE key = 'scoring_weights'").get() as any;
+    return normaliseWeights(row?.value ? JSON.parse(row.value) : {});
+  } catch { return { ...DEFAULT_WEIGHTS }; }
+}
+
+app.get("/api/scoring-weights", requireAuth, (_req, res) => {
+  res.json({ weights: getScoringWeights(), defaults: DEFAULT_WEIGHTS });
+});
+
+app.put("/api/scoring-weights", requireAuth, (req, res) => {
+  const weights = normaliseWeights(req.body?.weights);
+  db.prepare(`INSERT INTO app_settings (key, value, updated_at) VALUES ('scoring_weights', ?, CURRENT_TIMESTAMP)
+              ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP`)
+    .run(JSON.stringify(weights));
+  res.json({ success: true, weights });
+});
+
+app.post("/api/scoring-weights/reset", requireAuth, (_req, res) => {
+  db.prepare("DELETE FROM app_settings WHERE key = 'scoring_weights'").run();
+  res.json({ success: true, weights: DEFAULT_WEIGHTS });
+});
+
+// Sampled posts for the UI to re-rank locally. Capped so the client stays responsive.
+app.get("/api/audience-samples", requireAuth, (req, res) => {
+  const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 300));
+  try {
+    const rows = db.prepare(`SELECT tweet_id, theme, username, followers, created_at, text, chars,
+                                    hashtag_count, has_link, likes, reposts, replies, quotes,
+                                    bookmarks, impressions, sampled_at
+                             FROM audience_samples ORDER BY sampled_at DESC, impressions DESC LIMIT ?`).all(limit) as any[];
+    const themes = db.prepare("SELECT theme, COUNT(*) c FROM audience_samples GROUP BY theme").all() as any[];
+    const last = db.prepare("SELECT MAX(sampled_at) m FROM audience_samples").get() as any;
+    res.json({ samples: rows, total: rows.length, byTheme: themes, lastSampledAt: last?.m ?? null });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+// Server-side ranking using the saved weights — same function the UI previews with.
+app.get("/api/audience-samples/ranked", requireAuth, (req, res) => {
+  const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 20));
+  const w = getScoringWeights();
+  const rows = db.prepare("SELECT * FROM audience_samples").all() as any[];
+  const now = Date.now();
+  const ranked = rows
+    .map(r => ({ ...r, ...scoreSample(r, w, now) }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
+  res.json({ weights: w, count: rows.length, ranked });
+});
+
 // ─── X Posting ─────────────────────────────────────────────────────────────────
 
 async function refreshXToken(tokenRecord: any) {
   if (tokenRecord.expires_at && tokenRecord.expires_at > Date.now() + 60000) return tokenRecord.access_token;
-  const client = new TwitterApi({ clientId: getPlatformCred('x', 'client_id'), clientSecret: getPlatformCred('x', 'client_secret') });
-  const { accessToken, refreshToken, expiresIn } = await client.refreshOAuth2Token(tokenRecord.refresh_token);
-  const expiresAt = Date.now() + expiresIn * 1000;
+  const tok = await xTokenRequest({ grant_type: 'refresh_token', refresh_token: tokenRecord.refresh_token });
+  const accessToken: string = tok.access_token;
+  const refreshToken: string | undefined = tok.refresh_token;
+  const expiresAt = Date.now() + tok.expires_in * 1000;
   if (tokenRecord.x_id) {
     // X-login user — update users table
     db.prepare(`UPDATE users SET access_token = ?, refresh_token = ?, expires_at = ? WHERE x_id = ?`).run(accessToken, refreshToken || tokenRecord.refresh_token, expiresAt, tokenRecord.x_id);
@@ -1377,7 +1645,7 @@ app.post("/api/post-to-x", postLimiter, async (req, res) => {
   const tokenRecord = getXTokenRecord(userId);
   if (!tokenRecord) return res.status(401).json({ error: "X account not connected — go to Settings to connect your X account" });
   if (!text?.trim()) return res.status(400).json({ error: "Cannot post empty content" });
-  if (text.length > 280) return res.status(400).json({ error: `Post too long: ${text.length}/280 characters` });
+  if (text.length > X_MAX_POST_CHARS) return res.status(400).json({ error: `Post too long: ${text.length}/${X_MAX_POST_CHARS} characters` });
 
   try {
     const accessToken = await refreshXToken(tokenRecord);
@@ -1442,7 +1710,7 @@ app.post("/api/auto-schedule/preview", requireAuth, (req, res) => {
   if (content.headlines?.length) {
     const slots = calculateTweetSlots(nextDate, content.headlines);
     for (const s of slots) {
-      items.push({ type: 'tweet', time: s.time, content: s.content, title: s.title, trendScore: s.trendScore, enabled: true });
+      items.push({ type: 'tweet', time: s.time, content: s.content, title: s.title, trendScore: s.trendScore, sourceUrl: s.sourceUrl, enabled: true });
     }
   }
 
@@ -1473,8 +1741,8 @@ app.post("/api/auto-schedule/confirm", requireAuth, (req, res) => {
     const content = item.type === 'tweet' ? item.content :
                     item.type === 'instagram' ? `[INSTAGRAM] ${item.content}` :
                     `[SUBSTACK] ${item.content}`;
-    db.prepare("INSERT INTO scheduled_posts (user_id, content, scheduled_at, status) VALUES (?, ?, ?, 'pending')")
-      .run(userId, content, item.time);
+    db.prepare("INSERT INTO scheduled_posts (user_id, content, scheduled_at, status, source_url) VALUES (?, ?, ?, 'pending', ?)")
+      .run(userId, content, item.time, item.type === 'tweet' ? (item.sourceUrl || null) : null);
     count++;
   }
 
@@ -1590,7 +1858,7 @@ function getNextWeekday(targetDay: number): Date {
 }
 
 // Assign tweets to time slots from 7am–7pm EST, highest trendScore to highest engagement hour
-function calculateTweetSlots(baseDate: Date, tweets: any[]): Array<{ time: string; content: string; trendScore: number; title: string }> {
+function calculateTweetSlots(baseDate: Date, tweets: any[]): Array<{ time: string; content: string; trendScore: number; title: string; sourceUrl?: string }> {
   const count = tweets.length;
   if (count === 0) return [];
 
@@ -1619,13 +1887,17 @@ function calculateTweetSlots(baseDate: Date, tweets: any[]): Array<{ time: strin
   const slotsByEng = [...scored].sort((a, b) => b.score - a.score).map(s => s.i);
 
   // Assign tweet[i] (sorted by trendScore desc already) → slot with ith highest engagement
-  const assigned: Array<{ time: string; content: string; trendScore: number; title: string }> = new Array(count);
+  const assigned: Array<{ time: string; content: string; trendScore: number; title: string; sourceUrl?: string }> = new Array(count);
   for (let ti = 0; ti < count; ti++) {
     assigned[ti] = {
       time: slots[slotsByEng[ti]].toISOString(),
-      content: tweets[ti].socialPost,
+      // Prefer the tagged variant from the hashtag pass; fall back to the bare post
+      // for reports generated before that pass existed.
+      content: tweets[ti].socialPostWithTags || tweets[ti].socialPost,
       trendScore: tweets[ti].trendScore ?? (count - ti),
       title: tweets[ti].title,
+      // Carried so the poster can cite it in a reply rather than in the post body.
+      sourceUrl: tweets[ti].url,
     };
   }
 
@@ -1675,22 +1947,73 @@ setInterval(async () => {
 
   // Process scheduled social posts
   try {
-    const pending = db.prepare("SELECT * FROM scheduled_posts WHERE status = 'pending' AND scheduled_at <= ?").all(new Date().toISOString()) as any[];
-    for (const post of pending) {
-      const tokenRecord = getXTokenRecord(post.user_id);
-      if (!tokenRecord) continue;
-      try {
-        const accessToken = await refreshXToken(tokenRecord);
-        const client = new TwitterApi(accessToken);
-        await client.v2.tweet(post.content);
-        db.prepare("UPDATE scheduled_posts SET status = 'posted' WHERE id = ?").run(post.id);
-      } catch (error) {
-        console.error(`Background task failed for post ${post.id}:`, error);
-        db.prepare("UPDATE scheduled_posts SET status = 'failed' WHERE id = ?").run(post.id);
+    if (!POSTING_ENABLED) {
+      log.warn('posting_disabled_skip');
+    } else {
+      // Reclaim rows stranded by a crash. Deliberately marked failed, NOT retried: if the
+      // crash happened after the API call, retrying would post a duplicate. Losing a post
+      // is recoverable; double-posting to a public account is not.
+      const stale = db.prepare(
+        `UPDATE scheduled_posts SET status='failed', last_error='stranded in posting state — not retried to avoid duplicate'
+         WHERE status='posting' AND claimed_at < ?`
+      ).run(new Date(Date.now() - CLAIM_TIMEOUT_MIN * 60_000).toISOString());
+      if (stale.changes) log.warn('posts_stranded_reclaimed', { count: stale.changes });
+
+      const due = db.prepare(
+        "SELECT * FROM scheduled_posts WHERE status = 'pending' AND scheduled_at <= ? ORDER BY scheduled_at ASC LIMIT ?"
+      ).all(new Date().toISOString(), MAX_POSTS_PER_RUN) as any[];
+
+      const backlog = db.prepare(
+        "SELECT COUNT(*) c FROM scheduled_posts WHERE status='pending' AND scheduled_at <= ?"
+      ).get(new Date().toISOString()) as any;
+      if (backlog.c > due.length) {
+        // Never silently truncate — a growing backlog means something upstream is wrong.
+        log.warn('post_backlog_capped', { due: backlog.c, cap: MAX_POSTS_PER_RUN, deferred: backlog.c - due.length });
+      }
+
+      for (const post of due) {
+        const tokenRecord = getXTokenRecord(post.user_id);
+        if (!tokenRecord) { log.warn('post_skipped_no_token', { id: post.id, user: post.user_id }); continue; }
+
+        // Atomic claim: the WHERE guards against any second worker taking the same row.
+        const claimed = db.prepare(
+          "UPDATE scheduled_posts SET status='posting', claimed_at=?, attempts=COALESCE(attempts,0)+1 WHERE id=? AND status='pending'"
+        ).run(new Date().toISOString(), post.id);
+        if (!claimed.changes) continue;
+
+        if (POSTING_DRY_RUN) {
+          db.prepare("UPDATE scheduled_posts SET status='pending', claimed_at=NULL WHERE id=?").run(post.id);
+          log.info('post_dry_run', { id: post.id, chars: (post.content || '').length, preview: (post.content || '').slice(0, 80) });
+          continue;
+        }
+
+        try {
+          const accessToken = await refreshXToken(tokenRecord);
+          const client = new TwitterApi(accessToken);
+          const posted = await client.v2.tweet(post.content);
+          db.prepare("UPDATE scheduled_posts SET status='posted', posted_tweet_id=?, last_error=NULL WHERE id=?")
+            .run(posted.data.id, post.id);
+          log.info('post_published', { id: post.id, tweet_id: posted.data.id, chars: (post.content || '').length });
+
+          // Cite the source as a REPLY, never in the body — a link in the post costs 30-50%
+          // of reach. A failed reply must not mark the post failed; the post already went out.
+          if (POST_SOURCE_AS_REPLY && post.source_url) {
+            try {
+              await client.v2.tweet({ text: `Source: ${post.source_url}`, reply: { in_reply_to_tweet_id: posted.data.id } });
+              log.info('source_reply_published', { id: post.id });
+            } catch (replyErr) {
+              log.warn('source_reply_failed', { id: post.id, ...errInfo(replyErr) });
+            }
+          }
+        } catch (error) {
+          db.prepare("UPDATE scheduled_posts SET status='failed', last_error=? WHERE id=?")
+            .run(String(error instanceof Error ? error.message : error).slice(0, 500), post.id);
+          log.error('post_failed', { id: post.id, ...errInfo(error) });
+        }
       }
     }
   } catch (err) {
-    console.error("Scheduled posts task error:", err);
+    log.error('scheduled_posts_task_error', errInfo(err));
   }
 
   // Process scheduled report generation
@@ -1719,7 +2042,7 @@ setInterval(async () => {
           ? await generateForecastReport()
           : isSpec
             ? await generateSpeculationReport()
-            : await generateWeeklyReport(schedule.report_type, schedule.custom_topic || undefined);
+            : await generateWeeklyReport(schedule.report_type, schedule.custom_topic || undefined, undefined, getContentGuidance());
         const reportId = `${schedule.report_type}-${Date.now()}`;
         const reportJson = JSON.stringify(report);
         db.prepare(`
@@ -2738,9 +3061,234 @@ Use plain text, no markdown headers. Be concise but thorough.`;
   }
 });
 
+// ─── Connections / Live API Status ────────────────────────────────────────────
+
+// Ping a single service — returns { status, latencyMs, error?, rateLimits?, meta? }
+async function pingService(id: string): Promise<{ status: 'live' | 'error' | 'unconfigured'; latencyMs: number; error?: string; rateLimits?: any; meta?: any }> {
+  const start = Date.now();
+  try {
+    switch (id) {
+      case 'anthropic': {
+        if (!process.env.ANTHROPIC_API_KEY) return { status: 'unconfigured', latencyMs: 0 };
+        const Anthropic = (await import("@anthropic-ai/sdk")).default;
+        const client = new Anthropic();
+        const { data: resp, response: raw } = await client.messages.create({
+          model: "claude-sonnet-4-6", max_tokens: 5,
+          messages: [{ role: "user", content: "ping" }],
+        }).withResponse();
+        const rl = {
+          limitRequests: parseInt(raw.headers.get('x-ratelimit-limit-requests') || '') || undefined,
+          limitTokens: parseInt(raw.headers.get('x-ratelimit-limit-tokens') || '') || undefined,
+          remainingRequests: parseInt(raw.headers.get('x-ratelimit-remaining-requests') || '') || undefined,
+          remainingTokens: parseInt(raw.headers.get('x-ratelimit-remaining-tokens') || '') || undefined,
+          resetRequests: raw.headers.get('x-ratelimit-reset-requests') || undefined,
+          resetTokens: raw.headers.get('x-ratelimit-reset-tokens') || undefined,
+        };
+        aiRateLimits.anthropic = { ...rl, inputTokensUsed: resp.usage?.input_tokens, outputTokensUsed: resp.usage?.output_tokens, lastCallAt: new Date().toISOString(), lastModel: "claude-sonnet-4-6" };
+        return { status: 'live', latencyMs: Date.now() - start, rateLimits: rl, meta: { model: "claude-sonnet-4-6" } };
+      }
+      case 'openai': {
+        if (!process.env.OPENAI_API_KEY) return { status: 'unconfigured', latencyMs: 0 };
+        const OpenAI = (await import("openai")).default;
+        const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+        await client.chat.completions.create({ model: "gpt-4o", max_tokens: 5, messages: [{ role: "user", content: "ping" }] });
+        return { status: 'live', latencyMs: Date.now() - start, meta: { model: "gpt-4o" } };
+      }
+      case 'gemini': {
+        if (!process.env.GEMINI_API_KEY) return { status: 'unconfigured', latencyMs: 0 };
+        const { GoogleGenAI } = await import("@google/genai");
+        const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+        const geminiModels = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"];
+        let geminiOk = false;
+        let usedModel = "";
+        for (const gm of geminiModels) {
+          try {
+            const resp = await ai.models.generateContent({ model: gm, contents: [{ parts: [{ text: "ping" }], role: "user" }] });
+            aiRateLimits.gemini = { inputTokensUsed: (resp as any).usageMetadata?.promptTokenCount, outputTokensUsed: (resp as any).usageMetadata?.candidatesTokenCount, lastCallAt: new Date().toISOString(), lastModel: gm };
+            usedModel = gm;
+            geminiOk = true;
+            break;
+          } catch { continue; }
+        }
+        if (!geminiOk) throw new Error("All Gemini models unavailable");
+        return { status: 'live', latencyMs: Date.now() - start, meta: { model: usedModel } };
+      }
+      case 'x': {
+        if (!hasValidCreds('x')) return { status: 'unconfigured', latencyMs: 0 };
+        const tokenRow = db.prepare("SELECT access_token FROM platform_tokens WHERE platform = 'x'").get() as any;
+        if (!tokenRow?.access_token) return { status: 'error', latencyMs: 0, error: 'No OAuth token — sign in via Settings' };
+        const { TwitterApi } = await import("twitter-api-v2");
+        const client = new TwitterApi(tokenRow.access_token);
+        const me = await client.v2.me();
+        return { status: 'live', latencyMs: Date.now() - start, meta: { user: `@${me.data?.username}` } };
+      }
+      case 'linkedin': {
+        if (!hasValidCreds('linkedin')) return { status: 'unconfigured', latencyMs: 0 };
+        const tokenRow = db.prepare("SELECT access_token FROM platform_tokens WHERE platform = 'linkedin'").get() as any;
+        if (!tokenRow?.access_token) return { status: 'error', latencyMs: 0, error: 'No OAuth token — connect in Settings' };
+        const r = await fetch('https://api.linkedin.com/v2/userinfo', { headers: { Authorization: `Bearer ${tokenRow.access_token}` } });
+        if (!r.ok) return { status: 'error', latencyMs: Date.now() - start, error: `HTTP ${r.status}` };
+        const data = await r.json();
+        return { status: 'live', latencyMs: Date.now() - start, meta: { user: data.name || data.sub } };
+      }
+      case 'bluesky': {
+        const tokenRow = db.prepare("SELECT access_token, person_urn FROM platform_tokens WHERE platform = 'bluesky'").get() as any;
+        if (!tokenRow?.access_token) return { status: 'error', latencyMs: 0, error: 'No credentials — connect in Settings' };
+        // Bluesky tokens are short-lived, just check if we have one stored
+        return { status: 'live', latencyMs: Date.now() - start, meta: { handle: tokenRow.person_urn || 'connected' } };
+      }
+      case 'threads': {
+        if (!hasValidCreds('threads')) return { status: 'unconfigured', latencyMs: 0 };
+        const tokenRow = db.prepare("SELECT access_token FROM platform_tokens WHERE platform = 'threads'").get() as any;
+        if (!tokenRow?.access_token) return { status: 'error', latencyMs: 0, error: 'No OAuth token — connect in Settings' };
+        const r = await fetch(`https://graph.threads.net/v1.0/me?fields=id,username&access_token=${tokenRow.access_token}`);
+        if (!r.ok) return { status: 'error', latencyMs: Date.now() - start, error: `HTTP ${r.status}` };
+        const data = await r.json();
+        return { status: 'live', latencyMs: Date.now() - start, meta: { user: `@${data.username}` } };
+      }
+      case 'instagram': {
+        const tokenRow = db.prepare("SELECT access_token, person_urn FROM platform_tokens WHERE platform = 'instagram'").get() as any;
+        if (!tokenRow?.access_token) return { status: 'error', latencyMs: 0, error: 'No OAuth token — connect in Settings' };
+        const igId = tokenRow.person_urn;
+        const r = await fetch(`https://graph.facebook.com/v18.0/${igId}?fields=username&access_token=${tokenRow.access_token}`);
+        if (!r.ok) return { status: 'error', latencyMs: Date.now() - start, error: `HTTP ${r.status}` };
+        const data = await r.json();
+        return { status: 'live', latencyMs: Date.now() - start, meta: { user: `@${data.username}` } };
+      }
+      case 'substack': {
+        const substackRow = db.prepare("SELECT key_value FROM platform_credentials WHERE platform = 'substack' AND key_name = 'subdomain'").get() as any;
+        if (!substackRow?.key_value) return { status: 'error', latencyMs: 0, error: 'No subdomain configured — set in Settings' };
+        return { status: 'live', latencyMs: Date.now() - start, meta: { subdomain: substackRow.key_value } };
+      }
+      case 'vercel': {
+        const r = await fetch('https://api.vercel.com/v6/deployments?limit=1', {
+          headers: process.env.VERCEL_TOKEN ? { Authorization: `Bearer ${process.env.VERCEL_TOKEN}` } : {},
+        });
+        if (r.status === 403 || r.status === 401) return { status: process.env.VERCEL_TOKEN ? 'error' : 'unconfigured', latencyMs: Date.now() - start, error: !process.env.VERCEL_TOKEN ? 'Set VERCEL_TOKEN in .env' : 'Invalid token' };
+        return { status: 'live', latencyMs: Date.now() - start };
+      }
+      case 'sentry': {
+        if (!process.env.SENTRY_DSN) return { status: 'unconfigured', latencyMs: 0, error: 'Set SENTRY_DSN in .env' };
+        // Sentry DSN is a URL — just validate it parses and the host resolves
+        const dsnUrl = new URL(process.env.SENTRY_DSN);
+        const r = await fetch(`${dsnUrl.protocol}//${dsnUrl.host}/api/0/`, { method: 'GET' });
+        return { status: 'live', latencyMs: Date.now() - start, meta: { host: dsnUrl.host } };
+      }
+      case 'posthog': {
+        if (!process.env.NEXT_PUBLIC_POSTHOG_KEY) return { status: 'unconfigured', latencyMs: 0, error: 'Set NEXT_PUBLIC_POSTHOG_KEY in .env' };
+        const host = process.env.NEXT_PUBLIC_POSTHOG_HOST || 'https://us.i.posthog.com';
+        const r = await fetch(`${host}/decide?v=3`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ api_key: process.env.NEXT_PUBLIC_POSTHOG_KEY, distinct_id: 'ping' }) });
+        if (!r.ok) return { status: 'error', latencyMs: Date.now() - start, error: `HTTP ${r.status}` };
+        return { status: 'live', latencyMs: Date.now() - start };
+      }
+      case 'pinecone': {
+        if (!process.env.PINECONE_API_KEY) return { status: 'unconfigured', latencyMs: 0, error: 'Set PINECONE_API_KEY in .env' };
+        const r = await fetch('https://api.pinecone.io/indexes', { headers: { 'Api-Key': process.env.PINECONE_API_KEY } });
+        if (!r.ok) return { status: 'error', latencyMs: Date.now() - start, error: `HTTP ${r.status}` };
+        const data = await r.json();
+        const count = Array.isArray(data.indexes) ? data.indexes.length : 0;
+        return { status: 'live', latencyMs: Date.now() - start, meta: { indexes: `${count} indexes` } };
+      }
+      case 'upstash': {
+        if (!process.env.UPSTASH_REDIS_REST_URL || !process.env.UPSTASH_REDIS_REST_TOKEN) return { status: 'unconfigured', latencyMs: 0, error: 'Set UPSTASH_REDIS_REST_URL & TOKEN in .env' };
+        const r = await fetch(`${process.env.UPSTASH_REDIS_REST_URL}/ping`, { headers: { Authorization: `Bearer ${process.env.UPSTASH_REDIS_REST_TOKEN}` } });
+        if (!r.ok) return { status: 'error', latencyMs: Date.now() - start, error: `HTTP ${r.status}` };
+        return { status: 'live', latencyMs: Date.now() - start };
+      }
+      case 'supabase': {
+        if (!process.env.NEXT_PUBLIC_SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) return { status: 'unconfigured', latencyMs: 0, error: 'Set SUPABASE_URL & SERVICE_ROLE_KEY in .env' };
+        const r = await fetch(`${process.env.NEXT_PUBLIC_SUPABASE_URL}/rest/v1/`, { headers: { apikey: process.env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}` } });
+        if (!r.ok) return { status: 'error', latencyMs: Date.now() - start, error: `HTTP ${r.status}` };
+        return { status: 'live', latencyMs: Date.now() - start };
+      }
+      case 'clerk': {
+        if (!process.env.CLERK_SECRET_KEY) return { status: 'unconfigured', latencyMs: 0, error: 'Set CLERK_SECRET_KEY in .env' };
+        const r = await fetch('https://api.clerk.com/v1/users?limit=1', { headers: { Authorization: `Bearer ${process.env.CLERK_SECRET_KEY}` } });
+        if (!r.ok) return { status: 'error', latencyMs: Date.now() - start, error: `HTTP ${r.status}` };
+        return { status: 'live', latencyMs: Date.now() - start };
+      }
+      case 'resend': {
+        if (!process.env.RESEND_API_KEY) return { status: 'unconfigured', latencyMs: 0, error: 'Set RESEND_API_KEY in .env' };
+        const r = await fetch('https://api.resend.com/domains', { headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY}` } });
+        if (!r.ok) return { status: 'error', latencyMs: Date.now() - start, error: `HTTP ${r.status}` };
+        const data = await r.json();
+        const domains = Array.isArray(data.data) ? data.data.map((d: any) => d.name).join(', ') : '';
+        return { status: 'live', latencyMs: Date.now() - start, meta: domains ? { domains } : undefined };
+      }
+      case 'cloudflare': {
+        if (!process.env.CLOUDFLARE_API_TOKEN) return { status: 'unconfigured', latencyMs: 0, error: 'Set CLOUDFLARE_API_TOKEN in .env' };
+        const r = await fetch('https://api.cloudflare.com/client/v4/user/tokens/verify', { headers: { Authorization: `Bearer ${process.env.CLOUDFLARE_API_TOKEN}` } });
+        if (!r.ok) return { status: 'error', latencyMs: Date.now() - start, error: `HTTP ${r.status}` };
+        return { status: 'live', latencyMs: Date.now() - start };
+      }
+      default:
+        return { status: 'error', latencyMs: 0, error: 'Unknown service' };
+    }
+  } catch (err: any) {
+    return { status: 'error', latencyMs: Date.now() - start, error: err.message?.slice(0, 120) || String(err) };
+  }
+}
+
+// Connection definitions (static info)
+const CONNECTION_DEFS = [
+  { id: 'anthropic', name: 'Anthropic (Claude)', category: 'ai', tier: 'Max', knownLimits: { rpm: 4000, tpmInput: 400000, tpmOutput: 80000 } },
+  { id: 'openai',    name: 'OpenAI (GPT-4o)',    category: 'ai', tier: 'Fallback', knownLimits: { rpm: 500, tpmInput: 800000, tpmOutput: 100000 } },
+  { id: 'gemini',    name: 'Google Gemini',       category: 'ai', tier: 'Pay-as-you-go', knownLimits: { rpm: 1000, rpd: 1500, tpmInput: 4000000 } },
+  { id: 'x',         name: 'X (Twitter)',         category: 'social', tier: 'Premium', knownLimits: { postsPerDay: 100, postsPerMonth: 3000 } },
+  { id: 'linkedin',  name: 'LinkedIn',            category: 'social', tier: 'OAuth', knownLimits: { postsPerDay: 150 } },
+  { id: 'bluesky',   name: 'Bluesky',             category: 'social', tier: 'AT Proto', knownLimits: { postsPerDay: 1666 } },
+  { id: 'threads',   name: 'Threads',             category: 'social', tier: 'OAuth', knownLimits: { postsPerDay: 250 } },
+  { id: 'instagram', name: 'Instagram',           category: 'social', tier: 'Graph API', knownLimits: { postsPerDay: 50 } },
+  { id: 'substack',  name: 'Substack',            category: 'publishing', tier: 'API', knownLimits: {} },
+  { id: 'vercel',    name: 'Vercel',              category: 'infra', tier: 'Pro', knownLimits: {} },
+  { id: 'sentry',    name: 'Sentry',              category: 'infra', tier: 'Developer', knownLimits: {} },
+  { id: 'posthog',   name: 'PostHog',             category: 'infra', tier: 'Free', knownLimits: {} },
+  { id: 'pinecone',  name: 'Pinecone',            category: 'infra', tier: 'Starter', knownLimits: {} },
+  { id: 'upstash',   name: 'Upstash',             category: 'infra', tier: 'Free', knownLimits: {} },
+  { id: 'supabase',  name: 'Supabase',            category: 'infra', tier: 'Free', knownLimits: {} },
+  { id: 'clerk',     name: 'Clerk',               category: 'infra', tier: 'Free', knownLimits: {} },
+  { id: 'resend',    name: 'Resend',              category: 'infra', tier: 'Free', knownLimits: {} },
+  { id: 'cloudflare',name: 'Cloudflare',          category: 'infra', tier: 'Free', knownLimits: {} },
+];
+
+// GET — returns all 9 connections with live ping status
+app.get("/api/connections", async (_req, res) => {
+  try {
+    // Ping all 9 services in parallel
+    const results = await Promise.all(
+      CONNECTION_DEFS.map(async (def) => {
+        const ping = await pingService(def.id);
+        return {
+          ...def,
+          status: ping.status,
+          latencyMs: ping.latencyMs,
+          error: ping.error || null,
+          meta: ping.meta || null,
+          rateLimits: ping.rateLimits || aiRateLimits[def.id as keyof typeof aiRateLimits] || {},
+          checkedAt: new Date().toISOString(),
+        };
+      })
+    );
+    res.json({ connections: results });
+  } catch (err) {
+    console.error("[Connections]", err);
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// POST — ping a single service on demand
+app.post("/api/connections/ping/:provider", async (req, res) => {
+  const { provider } = req.params;
+  const def = CONNECTION_DEFS.find(d => d.id === provider);
+  if (!def) return res.status(400).json({ error: `Unknown: ${provider}` });
+  const ping = await pingService(provider);
+  res.json({ ...def, ...ping, rateLimits: ping.rateLimits || aiRateLimits[provider as keyof typeof aiRateLimits] || {}, checkedAt: new Date().toISOString() });
+});
+
 // ─── Vite / Static ─────────────────────────────────────────────────────────────
 
 async function startServer() {
+  installProcessHandlers();
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
     app.use(vite.middlewares);
@@ -2748,7 +3296,17 @@ async function startServer() {
     app.use(express.static(path.resolve("dist")));
     app.get("*", (req, res) => res.sendFile(path.resolve("dist/index.html")));
   }
-  app.listen(PORT, "0.0.0.0", () => console.log(`Server running on http://localhost:${PORT}`));
+  // Local mode has no auth, so refuse to listen on anything but loopback — otherwise
+  // anyone on the same network could post to X through this. LOCAL_MODE=false to open up.
+  if (LOCAL_MODE) {
+    // Bind BOTH loopback stacks: on macOS `localhost` resolves to ::1 first while
+    // `127.0.0.1` is IPv4, and binding only one makes the other host silently fail.
+    for (const host of ["127.0.0.1", "::1"]) {
+      app.listen(PORT, host, () => console.log(`Server running on http://${host === "::1" ? "localhost" : host}:${PORT} (loopback only, auth bypassed)`));
+    }
+  } else {
+    app.listen(PORT, "0.0.0.0", () => console.log(`Server running on http://localhost:${PORT}`));
+  }
 }
 
 startServer();

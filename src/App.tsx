@@ -13,6 +13,8 @@ import { Reports } from './components/Reports';
 import { AutomatedReports } from './components/AutomatedReports';
 import { Terminal } from './components/Terminal';
 import { TradeFlow } from './components/TradeFlow';
+import { Connections } from './components/Connections';
+import { WeightsAndMeasures } from './components/WeightsAndMeasures';
 import type { UserData } from './types';
 
 export default function App() {
@@ -21,10 +23,11 @@ export default function App() {
 
   const checkAuth = async () => {
     try {
-      const res = await apiFetch('/api/me');
+      const res = await apiFetch('/api/auth/me');
       if (res.ok) {
         const data = await res.json();
-        setUser(data.user || null);
+        // /api/auth/me returns the user at the top level, not wrapped in { user }.
+        setUser(data.user ?? (data.id ? data : null));
       } else {
         setUser(null);
       }
@@ -36,7 +39,7 @@ export default function App() {
   };
 
   const handleLogout = async () => {
-    await apiFetch('/api/logout', { method: 'POST' });
+    await apiFetch('/api/auth/logout', { method: 'POST' });
     window.localStorage.removeItem('debug_sid');
     setUser(null);
   };
@@ -79,6 +82,8 @@ export default function App() {
           <Route path="/automated" element={<AutomatedReports />} />
           <Route path="/terminal" element={<Terminal />} />
           <Route path="/trade-flow" element={<TradeFlow />} />
+          <Route path="/connections" element={<Connections />} />
+          <Route path="/weights" element={<WeightsAndMeasures />} />
         </Routes>
       </Layout>
     </BrowserRouter>

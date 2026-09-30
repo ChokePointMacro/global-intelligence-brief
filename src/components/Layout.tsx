@@ -15,11 +15,13 @@ const NAV_ITEMS = [
   { to: '/automated', label: 'Automated' },
   { to: '/terminal', label: 'Terminal' },
   { to: '/trade-flow', label: 'Trade Flow' },
+  { to: '/connections', label: 'Connections' },
 ];
 
 const AUTH_NAV_ITEMS = [
   { to: '/compose', label: 'Compose' },
   { to: '/schedule', label: 'Schedule' },
+  { to: '/weights', label: 'Weights' },
 ];
 
 function NavLink({ to, label, active, onClick }: { to: string; label: string; active: boolean; onClick?: () => void }) {

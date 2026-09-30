@@ -6,6 +6,11 @@ import { apiFetch } from '../lib/api';
 import { BackButton } from './BackButton';
 import type { UserData, SocialAccount } from '../types';
 
+// X Premium supports long-form posts up to 25,000 chars; 280 is the free-tier cap.
+// Kept in sync with X_MAX_POST_CHARS in server.ts.
+const X_MAX_POST_CHARS = 25000;
+const FREE_TIER_CHARS = 280;
+
 export const Compose = ({ user }: { user: UserData | null }) => {
   const location = useLocation();
   const [content, setContent] = useState(location.state?.content || '');
@@ -113,11 +118,13 @@ export const Compose = ({ user }: { user: UserData | null }) => {
           onChange={(e) => setContent(e.target.value)}
           placeholder="What's the market update?"
           className="w-full h-48 p-4 font-mono text-sm bg-black/40 border border-btc-orange/20 text-white focus:border-btc-orange outline-none resize-none transition-all"
-          maxLength={280}
+          maxLength={X_MAX_POST_CHARS}
         />
 
         <div className="flex justify-between items-center">
-          <span className="text-[10px] font-mono uppercase opacity-40 text-btc-orange/60">{content.length} / 280</span>
+          <span className={`text-[10px] font-mono uppercase opacity-40 ${content.length > FREE_TIER_CHARS ? 'text-sky-400/70' : 'text-btc-orange/60'}`}>
+            {content.length} / {X_MAX_POST_CHARS}{content.length > FREE_TIER_CHARS ? ' · long-form (Premium)' : ''}
+          </span>
           <div className="flex gap-4">
             <button
               onClick={() => {
