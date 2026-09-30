@@ -15,6 +15,7 @@ import { Terminal } from './components/Terminal';
 import { TradeFlow } from './components/TradeFlow';
 import { Connections } from './components/Connections';
 import { WeightsAndMeasures } from './components/WeightsAndMeasures';
+import { ApiSpend } from './components/ApiSpend';
 import type { UserData } from './types';
 
 export default function App() {
@@ -84,6 +85,7 @@ export default function App() {
           <Route path="/trade-flow" element={<TradeFlow />} />
           <Route path="/connections" element={<Connections />} />
           <Route path="/weights" element={<WeightsAndMeasures />} />
+          <Route path="/spend" element={<ApiSpend />} />
         </Routes>
       </Layout>
     </BrowserRouter>

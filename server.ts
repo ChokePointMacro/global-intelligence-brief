@@ -14,9 +14,10 @@ import db from "./db.ts";
 import dotenv from "dotenv";
 import path from "path";
 import { generateWeeklyReport, generateInstagramCaption, generateSubstackArticle, generateForecastReport, generateSpeculationReport, type WeeklyReport } from "./src/services/geminiService.ts";
-import { rateLimits as aiRateLimits } from "./src/services/aiService.ts";
+import { rateLimits as aiRateLimits, onAISpend } from "./src/services/aiService.ts";
 import { DEFAULT_WEIGHTS, normaliseWeights, scorePost as scoreSample } from "./src/services/scoring.ts";
 import { log, errInfo, installProcessHandlers } from "./src/services/log.ts";
+import { aiSpend, xSpend, X_RATES, MODEL_RATES, type SpendEntry } from "./src/services/spend.ts";
 
 import fs from "fs";
 
@@ -1066,6 +1067,7 @@ app.post("/api/social/post", requireAuth, postLimiter, async (req, res) => {
       }
       const accessToken = await refreshXToken(tokenRecord);
       const result = await new TwitterApi(accessToken).v2.tweet(text);
+      recordSpend(xSpend(/https?:\/\//.test(text) ? 'post_with_link' : 'post', 1, { source: 'compose', tweet_id: result.data.id }));
       results.x = { success: true, id: result.data.id };
     } catch (err: any) {
       // Surface X's own response body. A bare "Request failed with code NNN" hides the
@@ -1169,6 +1171,23 @@ app.get("/api/debug/models", requireAuth, async (_req, res) => {
 // the work completed and was then discarded, which looked like a silent failure.
 const REPORT_TIMEOUT_MS = Number(process.env.REPORT_TIMEOUT_MS) || 8 * 60 * 1000;
 
+// In-flight report generation progress, published for the client to poll.
+// Bounded by construction: one entry per (report type, user) and deleted on completion.
+const genProgress = new Map<string, { stage: string; percent: number; at: number; startedAt: number }>();
+
+app.get("/api/generate-report/progress", requireAuth, (req, res) => {
+  const type = String(req.query.type || '');
+  const p = genProgress.get(`${type}:${(req.session as any).userId ?? 'anon'}`);
+  if (!p) return res.json({ active: false });
+  res.json({
+    active: true,
+    stage: p.stage,
+    percent: p.percent,
+    elapsedMs: Date.now() - p.startedAt,
+    staleMs: Date.now() - p.at,
+  });
+});
+
 app.post("/api/generate-report", requireAuth, reportGenLimiter, async (req, res) => {
   try {
     const { type, customTopic } = req.body;
@@ -1186,10 +1205,22 @@ app.post("/api/generate-report", requireAuth, reportGenLimiter, async (req, res)
       setTimeout(() => reject(new Error("REPORT_TIMEOUT")), REPORT_TIMEOUT_MS)
     );
 
-    // Progress callback just logs server-side
+    // Publish real progress so the client can read it. The UI previously ran a fake
+    // timer-driven bar that froze at 92.2% and showed a stage label unrelated to what
+    // the server was actually doing.
+    const jobKey = `${type}:${(req.session as any).userId ?? 'anon'}`;
+    let lastLogged = -1;
     const logProgress = (stage: string, percent: number) => {
-      console.log(`[API] ${type} progress: ${percent}% — ${stage}`);
+      const pct = Math.round(percent * 10) / 10;
+      // Token-level ticks fire several times a second; only log on a whole-percent
+      // change so the console stays readable while the map stays current.
+      if (Math.floor(pct) !== lastLogged) {
+        lastLogged = Math.floor(pct);
+        console.log(`[API] ${type} progress: ${pct}% — ${stage}`);
+      }
+      genProgress.set(jobKey, { stage, percent: pct, at: Date.now(), startedAt: genProgress.get(jobKey)?.startedAt ?? Date.now() });
     };
+    genProgress.set(jobKey, { stage: 'Starting...', percent: 2, at: Date.now(), startedAt: Date.now() });
 
     let resultPromise: Promise<any>;
 
@@ -1231,8 +1262,10 @@ app.post("/api/generate-report", requireAuth, reportGenLimiter, async (req, res)
       console.log(`[API] Successfully generated ${type} report with ${report.headlines.length} headlines`);
     }
 
+    genProgress.delete(`${type}:${(req.session as any).userId ?? 'anon'}`);
     res.json(report);
   } catch (error) {
+    try { genProgress.delete(`${req.body?.type}:${(req.session as any).userId ?? 'anon'}`); } catch { /* ignore */ }
     console.error("[API] Report generation error:", error);
     const message = error instanceof Error ? error.message : String(error);
 
@@ -1604,6 +1637,78 @@ app.get("/api/audience-samples/ranked", requireAuth, (req, res) => {
   res.json({ weights: w, count: rows.length, ranked });
 });
 
+
+// ─── API spend tracking ────────────────────────────────────────────────────────
+// Every billable call records a row here. X is per-operation, AI providers are
+// per-token, so the table carries both shapes and the UI aggregates them.
+try {
+  db.exec(`CREATE TABLE IF NOT EXISTS api_spend (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts DATETIME DEFAULT CURRENT_TIMESTAMP,
+    provider TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    model TEXT,
+    units INTEGER DEFAULT 1,
+    input_tokens INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
+    cost_usd REAL NOT NULL,
+    verified INTEGER DEFAULT 1,
+    meta TEXT
+  )`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_api_spend_ts ON api_spend(ts)`);
+} catch (err) {
+  console.error("api_spend init error:", err);
+}
+
+// Route every AI call's token usage into the ledger.
+onAISpend(({ model, inputTokens, outputTokens, label }) => {
+  recordSpend(aiSpend(label, model, inputTokens, outputTokens));
+});
+
+/** Record spend. Never throws — a failed ledger write must not break the operation. */
+function recordSpend(entry: SpendEntry): void {
+  try {
+    db.prepare(`INSERT INTO api_spend (provider, operation, model, units, input_tokens, output_tokens, cost_usd, verified, meta)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(entry.provider, entry.operation, entry.model ?? null, entry.units ?? 1,
+           entry.inputTokens ?? 0, entry.outputTokens ?? 0, entry.costUsd,
+           entry.verified ? 1 : 0, entry.meta ? JSON.stringify(entry.meta) : null);
+  } catch (err) {
+    log.warn('spend_record_failed', errInfo(err));
+  }
+}
+
+app.get("/api/spend", requireAuth, (req, res) => {
+  const days = Math.min(365, Math.max(1, Number(req.query.days) || 30));
+  const since = new Date(Date.now() - days * 86_400_000).toISOString();
+  try {
+    const totals = db.prepare(
+      `SELECT provider, operation, model, COUNT(*) calls, SUM(units) units,
+              SUM(input_tokens) input_tokens, SUM(output_tokens) output_tokens,
+              SUM(cost_usd) cost, MIN(verified) verified
+       FROM api_spend WHERE ts >= ? GROUP BY provider, operation, model
+       ORDER BY cost DESC`).all(since) as any[];
+    const daily = db.prepare(
+      `SELECT date(ts) day, provider, SUM(cost_usd) cost
+       FROM api_spend WHERE ts >= ? GROUP BY day, provider ORDER BY day ASC`).all(since) as any[];
+    const total = totals.reduce((a, r) => a + (r.cost || 0), 0);
+    const first = db.prepare("SELECT MIN(ts) m FROM api_spend").get() as any;
+
+    // Projection from the observed daily average, not from a single day.
+    const daysObserved = Math.max(1, new Set(daily.map(d => d.day)).size);
+    res.json({
+      days, since, total,
+      projectedMonthly: (total / daysObserved) * 30,
+      daysObserved,
+      trackingSince: first?.m ?? null,
+      totals, daily,
+      rates: { x: X_RATES, models: MODEL_RATES },
+    });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 // ─── X Posting ─────────────────────────────────────────────────────────────────
 
 async function refreshXToken(tokenRecord: any) {
@@ -1653,6 +1758,7 @@ app.post("/api/post-to-x", postLimiter, async (req, res) => {
 
     const client = new TwitterApi(accessToken);
     const result = await client.v2.tweet(text);
+    recordSpend(xSpend(/https?:\/\//.test(text) ? 'post_with_link' : 'post', 1, { source: 'post-to-x', tweet_id: result.data.id }));
     res.json({ success: true, tweetId: result.data.id });
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
@@ -1993,6 +2099,7 @@ setInterval(async () => {
           const posted = await client.v2.tweet(post.content);
           db.prepare("UPDATE scheduled_posts SET status='posted', posted_tweet_id=?, last_error=NULL WHERE id=?")
             .run(posted.data.id, post.id);
+          recordSpend(xSpend('post', 1, { scheduled_post_id: post.id, tweet_id: posted.data.id }));
           log.info('post_published', { id: post.id, tweet_id: posted.data.id, chars: (post.content || '').length });
 
           // Cite the source as a REPLY, never in the body — a link in the post costs 30-50%
@@ -2000,6 +2107,8 @@ setInterval(async () => {
           if (POST_SOURCE_AS_REPLY && post.source_url) {
             try {
               await client.v2.tweet({ text: `Source: ${post.source_url}`, reply: { in_reply_to_tweet_id: posted.data.id } });
+              // Billed at the URL rate — this is the cost of citing sources.
+              recordSpend(xSpend('post_with_link', 1, { scheduled_post_id: post.id, kind: 'source_reply' }));
               log.info('source_reply_published', { id: post.id });
             } catch (replyErr) {
               log.warn('source_reply_failed', { id: post.id, ...errInfo(replyErr) });

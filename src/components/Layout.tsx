@@ -22,6 +22,7 @@ const AUTH_NAV_ITEMS = [
   { to: '/compose', label: 'Compose' },
   { to: '/schedule', label: 'Schedule' },
   { to: '/weights', label: 'Weights' },
+  { to: '/spend', label: 'Spend' },
 ];
 
 function NavLink({ to, label, active, onClick }: { to: string; label: string; active: boolean; onClick?: () => void }) {

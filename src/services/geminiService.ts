@@ -1,6 +1,4 @@
-import { generateReportWithFallback, parseJSONResponse } from "./aiService";
-import Anthropic from "@anthropic-ai/sdk";
-import OpenAI from "openai";
+import { generateReportWithFallback, generateTextWithFallback, parseJSONResponse } from "./aiService";
 
 // ── Interfaces ────────────────────────────────────────────────────────────────
 
@@ -775,12 +773,22 @@ ANALYSIS SECTION:
 OUTPUT RULES:
 1. Return ONLY valid JSON — no markdown, no code blocks, no text before or after.
 2. All 20 headlines must have a summary and a sentiment value.
-3. Sort headlines array by trendScore descending before returning.`;
+3. Sort headlines array by trendScore descending before returning.
+4. The response MUST be a single object with EXACTLY these two top-level keys:
+   {"headlines": [ ...20 headline objects... ], "analysis": { ...the analysis object... }}
+   The "analysis" key is REQUIRED and is a sibling of "headlines", not nested inside it.
+   A response containing only "headlines" is invalid and will be rejected.`;
 
   try {
     onProgress?.('Sending to AI provider...', 35, sourceStatuses);
     console.log(`[generateWeeklyReport] Generating ${type} report...`);
-    const aiResponse = await generateReportWithFallback(prompt, ["claude", "gpt"], cfg.maxTokens);
+    // Map token generation onto the 35→82 band so the bar moves continuously through
+    // the long AI call instead of freezing at 35% for minutes.
+    const aiResponse = await generateReportWithFallback(prompt, ["claude", "gpt"], cfg.maxTokens, `report_${type}`,
+      (tokensSoFar, maxTokens) => {
+        const frac = Math.min(1, tokensSoFar / Math.max(1, maxTokens * 0.9));
+        onProgress?.(`Writing report — ${Math.round(frac * 100)}% of expected length`, 35 + frac * 47, sourceStatuses);
+      });
     onProgress?.('Parsing AI response...', 85, sourceStatuses);
     console.log(`[generateWeeklyReport] Using provider: ${aiResponse.provider}`);
 
@@ -794,6 +802,35 @@ OUTPUT RULES:
     }
 
     if (!parsed.analysis) {
+      // The model omitted a required key — measured at roughly 1 in 4 otherwise-clean
+      // runs. Ask for just the analysis rather than shipping a canned template: it is a
+      // small, cheap call and produces real content instead of a placeholder.
+      console.warn(`[generateWeeklyReport] Analysis missing — attempting targeted repair call`);
+      try {
+        const repairPrompt = `You are a factual intelligence analyst. Below are ${parsed.headlines.length} headlines from a ${cfg.reportTitle} generated today.
+
+${parsed.headlines.map((h, i) => `${i + 1}. [${h.category}] ${h.title}\n${(h.summary || '').slice(0, 300)}`).join('\n\n')}
+
+Produce ONLY the analysis object for this report as valid JSON, no markdown:
+{"analysis":{"performanceRanking":"...","verificationScore":87,"integrityScore":91,"overallSummary":"...","globalSocialPost":"..."}}
+
+- performanceRanking: top 3 stories by strategic importance, one sentence each
+- verificationScore / integrityScore: integers 1-100
+- overallSummary: 100-150 word synthesis of dominant trends and forward outlook
+- globalSocialPost: standalone X post digesting the single theme tying these stories together. No target length — decide it from how much substance the digest carries. No hashtags, no URLs, no emoji.`;
+        const repair = await generateReportWithFallback(repairPrompt, ["claude", "gpt"], 2000, `analysis_repair_${type}`);
+        const repaired = parseJSONResponse<{ analysis: Analysis }>(repair);
+        if (repaired?.analysis?.overallSummary) {
+          parsed.analysis = repaired.analysis;
+          warnings.push('Analysis section was missing from the main response and was regenerated in a follow-up call.');
+          console.log(`[generateWeeklyReport] ✓ Analysis repaired via follow-up call`);
+        }
+      } catch (repairErr) {
+        console.warn(`[generateWeeklyReport] Analysis repair failed:`, repairErr instanceof Error ? repairErr.message : repairErr);
+      }
+    }
+
+    if (!parsed.analysis) {
       const topHeadline = parsed.headlines[0];
       const dominantSentiment = parsed.headlines.map(h => h.sentiment).find(Boolean) ?? 'escalating';
       parsed.analysis = {
@@ -801,7 +838,14 @@ OUTPUT RULES:
         verificationScore: 87,
         integrityScore: 91,
         overallSummary: `This brief covers ${parsed.headlines.length} major developments. The top story: ${topHeadline?.title}. ${topHeadline?.summary?.slice(0, 200) || ''}`,
-        globalSocialPost: `🔎 ${topHeadline?.title || 'Intelligence Brief'} — ${dominantSentiment} signal. Full analysis: globalpulse.io`,
+        // Fallback digest, used when the model omits the analysis section. Deliberately
+        // carries no emoji and no URL: a link costs 30-50% of reach and moves the post
+        // into the $0.20 billing tier. The previous template did both.
+        globalSocialPost: [
+          topHeadline?.title || 'Intelligence brief',
+          '',
+          `Lead signal across ${parsed.headlines.length} developments today: ${dominantSentiment}.`,
+        ].join('\n'),
       };
       warnings.push('Analysis section was missing — synthesized from headlines.');
       console.warn(`[generateWeeklyReport] ⚠ Missing analysis — synthesized fallback from headlines`);
@@ -813,7 +857,8 @@ OUTPUT RULES:
     // Second pass: analyse the finished posts and attach reach tags.
     onProgress?.('Analysing reach / hashtags...', 92, sourceStatuses);
     try {
-      await enrichWithHashtags(parsed);
+      await enrichWithHashtags(parsed, (frac) =>
+        onProgress?.(`Analysing reach / hashtags — ${Math.round(frac * 100)}%`, 92 + frac * 7, sourceStatuses));
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       warnings.push(`Hashtag analysis failed — posts are usable without tags. (${msg})`);
@@ -899,7 +944,7 @@ function applyFallbackTags(report: WeeklyReport): void {
  * Batched into one call for the whole report rather than one per headline — 20x cheaper
  * and lets the model spread tags across the set instead of stamping #Geopolitics on all 20.
  */
-export async function enrichWithHashtags(report: WeeklyReport): Promise<void> {
+export async function enrichWithHashtags(report: WeeklyReport, onTick?: (frac: number) => void): Promise<void> {
   const posts = report.headlines.map((h, i) =>
     `[${i}] category=${h.category} | sentiment=${h.sentiment ?? 'n/a'}\nTITLE: ${h.title}\nPOST: ${h.socialPost}`
   ).join('\n\n');
@@ -912,7 +957,7 @@ WHAT ACTUALLY DRIVES REACH ON X NOW — read this before choosing:
 X no longer distributes by hashtag. It ranks and categorises posts by reading the TEXT semantically. Hashtags are search/indexing labels, not reach levers. Measured effect: 1–2 hashtags ≈ +21% engagement versus none, 3+ ≈ −17%, 5+ ≈ −40%. More tags is not more reach — it is measurably less.
 
 TAG STRATEGY:
-1. Choose AT MOST ${MAX_HASHTAGS} hashtags. ONE genuinely well-targeted tag beats two mediocre ones. Zero is a legitimate answer if nothing fits well — return an empty array rather than padding.
+1. Choose AT MOST ${MAX_HASHTAGS} hashtags. ONE genuinely well-targeted tag beats two mediocre ones. Return zero ONLY if you genuinely cannot name a community that discusses this subject — that is rare. Advocacy, professional, regional and industry communities exist for almost every story (a femicide story has #GBV and #Femicide; a prison-corruption story has an anti-corruption community). Do not default to zero out of caution; find the community first, and return empty only if there truly isn't one.
 2. Prefer the NICHE COMMUNITY tag over the broad one. Broad tags (#Markets, #News, #Finance) are saturated and contribute almost nothing; the engaged audience lives in specific tags (#OOTT, #Chokepoints, #SupplyChain, #Semiconductors, #Sanctions, #Shipping, #CentralBanks, #DeDollarization). If you pick two, make them one community tag plus one adjacent-community tag that reaches a DIFFERENT group — never two synonyms.
 
 HARD RULES:
@@ -934,7 +979,8 @@ OUTPUT — return ONLY valid JSON, no markdown, no commentary:
 {"tags":[{"index":0,"hashtags":["#Tag1","#Tag2"],"audience":"...","rationale":"..."}]}
 Return one entry for every post index 0–${report.headlines.length - 1}.`;
 
-  const aiResponse = await generateReportWithFallback(prompt, ["claude", "gpt"], 4000);
+  const aiResponse = await generateReportWithFallback(prompt, ["claude", "gpt"], 4000, 'hashtag_pass',
+    onTick ? (tokensSoFar, maxTokens) => onTick(Math.min(1, tokensSoFar / Math.max(1, maxTokens * 0.8))) : undefined);
   const parsed = parseJSONResponse<{ tags: Array<{ index: number; hashtags?: string[]; audience?: string; rationale?: string }> }>(aiResponse);
 
   if (!parsed?.tags?.length) throw new Error('Hashtag pass returned no tags');
@@ -992,16 +1038,12 @@ ${report.analysis.overallSummary}`;
 
   try {
     console.log("[generateSubstackArticle] Generating article...");
-    const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY || "" });
-    const response = await claude.messages.create({
-      model: "claude-sonnet-4-6",
-      max_tokens: 4000,
-      system: "You are a senior financial and geopolitical intelligence analyst. Write in a professional, authoritative style.",
-      messages: [{ role: "user", content: prompt }],
-    });
-
-    const article = response.content[0]?.type === "text" ? response.content[0].text : "";
-    if (!article) throw new Error("Empty response from Claude");
+    // Routed through the fallback chain rather than the Anthropic SDK directly, so this
+    // survives a Claude outage and is metered like every other call.
+    const response = await generateTextWithFallback(prompt, ["claude", "gpt"], 4000, 'substack_article',
+      "You are a senior financial and geopolitical intelligence analyst. Write in a professional, authoritative style.");
+    const article = response.content;
+    if (!article) throw new Error("Empty response from AI providers");
     console.log("[generateSubstackArticle] ✓ Article generated");
     return article;
   } catch (error) {
@@ -1039,39 +1081,14 @@ STRICT REQUIREMENTS:
 
   console.log("[generateInstagramCaption] Starting caption generation...");
 
+  // Was ~35 lines of hand-rolled Claude-then-GPT fallback duplicating the shared chain,
+  // with its own spend reporting and its own divergent error handling.
   try {
-    const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY || "" });
-    const response = await claude.messages.create({
-      model: "claude-sonnet-4-6",
-      max_tokens: 2200,
-      messages: [{ role: "user", content: prompt }],
-    });
-    const caption = response.content[0]?.type === "text" ? response.content[0].text : "";
-    if (caption) {
-      console.log("[generateInstagramCaption] ✓ Claude succeeded");
-      return truncateToInstagram(caption);
-    }
-  } catch (claudeError) {
-    console.warn("[generateInstagramCaption] Claude failed, trying GPT...", claudeError instanceof Error ? claudeError.message : String(claudeError));
-  }
-
-  try {
-    const gpt = new OpenAI({ apiKey: process.env.OPENAI_API_KEY || "" });
-    const response = await gpt.chat.completions.create({
-      model: "gpt-4o",
-      messages: [
-        { role: "system", content: "You are an expert social media strategist. Create viral Instagram captions." },
-        { role: "user", content: prompt },
-      ],
-      max_tokens: 2200,
-    });
-    const caption = response.choices[0]?.message.content || "";
-    if (caption) {
-      console.log("[generateInstagramCaption] ✓ GPT succeeded");
-      return truncateToInstagram(caption);
-    }
-  } catch (gptError) {
-    console.error("[generateInstagramCaption] GPT failed:", gptError instanceof Error ? gptError.message : String(gptError));
+    const response = await generateTextWithFallback(prompt, ["claude", "gpt"], 2200, 'instagram_caption',
+      "You are an expert social media strategist. Create engaging Instagram captions.");
+    if (response.content) return truncateToInstagram(response.content);
+  } catch (err) {
+    console.error("[generateInstagramCaption] all providers failed:", err instanceof Error ? err.message : String(err));
   }
 
   return "Failed to generate Instagram caption. Please try again.";
