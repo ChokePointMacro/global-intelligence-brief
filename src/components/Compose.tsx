@@ -4,6 +4,7 @@ import { Twitter, Linkedin, AtSign, MessageSquare, Loader2, Send, Clock, Check, 
 import { cn } from '../lib/utils';
 import { apiFetch } from '../lib/api';
 import { BackButton } from './BackButton';
+import { etInputValue, etZoneAbbrev } from '../services/time';
 import type { UserData, SocialAccount } from '../types';
 
 // X Premium supports long-form posts up to 25,000 chars; 280 is the free-tier cap.
@@ -61,7 +62,13 @@ export const Compose = ({ user }: { user: UserData | null }) => {
 
   const handleSchedule = async () => {
     if (!isConnected('x')) return alert("Connect your X account in Settings first.");
-    const dateStr = prompt("Enter scheduled date/time (YYYY-MM-DD HH:mm):", new Date(Date.now() + 3600000).toISOString().substring(0, 16).replace('T', ' '));
+    // Eastern, to match how every slot time in the app is defined. The default was
+    // previously derived from toISOString(), i.e. a UTC wall clock, which the server
+    // then interpreted as Eastern — scheduling the post 4-5 hours off without warning.
+    const dateStr = prompt(
+      `Enter scheduled date/time in Eastern time (${etZoneAbbrev()}) — YYYY-MM-DD HH:mm:`,
+      etInputValue(new Date(Date.now() + 3600000)),
+    );
     if (!dateStr) return;
     setLoading(true);
     try {

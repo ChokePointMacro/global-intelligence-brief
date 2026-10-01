@@ -9,8 +9,20 @@ export interface UserData {
 export interface ScheduledPost {
   id: number;
   content: string;
+  /** Always ISO-8601 UTC. Canonicalised on write so SQLite's text comparison is chronological. */
   scheduled_at: string;
-  status: 'pending' | 'posted' | 'failed';
+  /**
+   * 'posting' is the in-flight claim that keeps publishing idempotent across a crash.
+   * 'skipped' means the slot passed its lateness window and was deliberately not
+   * published — distinct from 'failed', which is an error returned by the X API.
+   */
+  status: 'pending' | 'posting' | 'posted' | 'failed' | 'skipped';
+  /** Discriminates real tweets from the Instagram/Substack reminders sharing this table. */
+  kind?: 'tweet' | 'instagram' | 'substack';
+  last_error?: string | null;
+  posted_tweet_id?: string | null;
+  source_url?: string | null;
+  attempts?: number;
 }
 
 export interface ReportSchedule {

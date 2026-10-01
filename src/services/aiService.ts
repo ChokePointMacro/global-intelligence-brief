@@ -71,6 +71,50 @@ export function reportAISpend(info: { provider: string; model: string; inputToke
   try { spendListener?.(info); } catch { /* accounting must never break generation */ }
 }
 
+/**
+ * Pre-flight budget gate — the enforcement half of the spend story.
+ *
+ * The ledger above *measures* spend; nothing stopped it. A runaway generation loop or a
+ * stuck retry would bill without limit and the only evidence would be a larger number in
+ * the spend UI afterwards. This lets the server veto a call before it is made.
+ *
+ * Same injection pattern as the spend listener: aiService has no database access, so the
+ * server registers the policy and this module only enforces whatever it returns.
+ */
+export type SpendGuard = () => { allowed: boolean; reason?: string };
+let spendGuard: SpendGuard | null = null;
+export function setSpendGuard(fn: SpendGuard | null): void { spendGuard = fn; }
+
+/** Thrown when a call is refused by the budget gate. Distinguishable from a provider error. */
+export class SpendCapExceededError extends Error {
+  constructor(reason: string) {
+    super(reason);
+    this.name = 'SpendCapExceededError';
+  }
+}
+
+/**
+ * Throws if the configured spend cap is already exceeded.
+ *
+ * Call this before any billable AI request, including direct SDK use that bypasses the
+ * fallback chain. A guard that throws is treated as refusing: if the policy itself is
+ * broken we stop spending rather than assume consent.
+ */
+export function assertSpendAllowed(label = 'ai_call'): void {
+  if (!spendGuard) return; // no policy registered → unmetered, as before
+  let verdict: { allowed: boolean; reason?: string };
+  try {
+    verdict = spendGuard();
+  } catch (err) {
+    throw new SpendCapExceededError(
+      `spend guard failed, refusing to spend (${label}): ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  if (!verdict.allowed) {
+    throw new SpendCapExceededError(verdict.reason || `spend cap reached, refusing ${label}`);
+  }
+}
+
 
 /**
  * Fallback chain for PROSE output (articles, captions).
@@ -86,6 +130,10 @@ export async function generateTextWithFallback(
   label = 'text_call',
   system?: string
 ): Promise<AIResponse> {
+  // Checked once, before the chain: a refusal is a budget decision, not a provider
+  // failure, so it must not fall through to the next provider and spend there instead.
+  assertSpendAllowed(label);
+
   const errors: Array<{ provider: string; error: string }> = [];
   for (const provider of providers) {
     try {
@@ -118,6 +166,9 @@ export async function generateReportWithFallback(
   label = 'ai_call',
   onTick?: TokenTickFn
 ): Promise<AIResponse> {
+  // See generateTextWithFallback: a budget refusal must short-circuit the whole chain.
+  assertSpendAllowed(label);
+
   const errors: Array<{ provider: string; error: string }> = [];
   const rateLimitErrors: string[] = [];
 

@@ -14,9 +14,14 @@ import db from "./db.ts";
 import dotenv from "dotenv";
 import path from "path";
 import { generateWeeklyReport, generateInstagramCaption, generateSubstackArticle, generateForecastReport, generateSpeculationReport, type WeeklyReport } from "./src/services/geminiService.ts";
-import { rateLimits as aiRateLimits, onAISpend } from "./src/services/aiService.ts";
+import { rateLimits as aiRateLimits, onAISpend, setSpendGuard } from "./src/services/aiService.ts";
 import { log, errInfo, installProcessHandlers } from "./src/services/log.ts";
 import { aiSpend, xSpend } from "./src/services/spend.ts";
+import {
+  etParts, etToUtc, etMinutesOfDay, etDateString, parseHhMm,
+  nextEtWeekdayMidnight, normaliseScheduledAt,
+} from "./src/services/time.ts";
+import { backupDatabase } from "./src/services/backup.ts";
 import { createAnalytics } from "./src/server/analytics.ts";
 import { createMarketsRouter } from "./src/server/markets.ts";
 
@@ -25,7 +30,10 @@ import fs from "fs";
 dotenv.config();
 
 const app = express();
-const PORT = 3000;
+// 3000 by default. Overridable so a throwaway instance can be booted against a copy of
+// the database (with posting disabled) to exercise the publisher without touching the
+// real one — the OAuth redirect already follows whatever loopback port you browse.
+const PORT = Number(process.env.PORT) || 3000;
 
 // ─── Connection Rate Limit Tracker ────────────────────────────────────────────
 
@@ -244,11 +252,87 @@ const POST_SOURCE_AS_REPLY = process.env.POST_SOURCE_AS_REPLY === 'true';
 
 // ─── Publisher safety rails ────────────────────────────────────────────────────
 // This posts to a live public account on a timer and each post costs money, so the
-// scheduler needs bounds. All four are env-controlled and default to safe values.
-const POSTING_ENABLED = process.env.POSTING_ENABLED !== 'false';   // kill switch
+// scheduler needs bounds.
 const POSTING_DRY_RUN = process.env.POSTING_DRY_RUN === 'true';    // log, never send
 const MAX_POSTS_PER_RUN = Number(process.env.MAX_POSTS_PER_RUN) || 5;
 const CLAIM_TIMEOUT_MIN = Number(process.env.POST_CLAIM_TIMEOUT_MIN) || 10;
+
+// How late a slot may fire. Past this, the post is skipped rather than published.
+//
+// Without this bound the due-query is an open-ended backward window: every pending
+// row whose scheduled_at is in the past qualifies, oldest first. Sleep the laptop over
+// a weekend and the whole backlog publishes at MAX_POSTS_PER_RUN/minute on wake —
+// stalest market commentary first, which is both wrong and a good way to get flagged.
+// Losing a slot is recoverable; publishing Friday's "what matters today" on Monday is not.
+const MAX_SLOT_LATENESS_MIN = Number(process.env.POST_MAX_LATE_MIN) || 30;
+
+// A report generation may still catch up later in the day — a brief is not as
+// perishable as a market post, and regenerating uses live data anyway.
+const MAX_REPORT_LATENESS_MIN = Number(process.env.REPORT_MAX_LATE_MIN) || 360;
+
+/**
+ * Posting kill switch — DB-backed so it can be flipped without a restart.
+ *
+ * Deliberately FAIL-CLOSED: with nothing configured, posting is OFF. The previous
+ * default was fail-open (`!== 'false'`), meaning a fresh checkout, a lost .env, or a
+ * typo in the variable name all resulted in a live account posting on a timer. For an
+ * irreversible, public, billable action the safe default is silence.
+ *
+ * Resolution order: app_settings.posting_enabled (UI toggle) → POSTING_ENABLED env → off.
+ */
+function isPostingEnabled(): boolean {
+  try {
+    const row = db.prepare("SELECT value FROM app_settings WHERE key = 'posting_enabled'").get() as any;
+    if (row?.value != null) return row.value === 'true' || row.value === '1';
+  } catch (err) {
+    // A DB read failure must not be interpreted as consent to post.
+    log.warn('posting_toggle_read_failed', errInfo(err));
+    return false;
+  }
+  return process.env.POSTING_ENABLED === 'true';
+}
+
+/**
+ * Out-of-band notification for things the operator must know about but would never
+ * see in a terminal: a skipped slot, a tripped spend cap, a failed publish.
+ *
+ * Email because that is the only channel this app already has configured. The build
+ * plan's Tailscale/Telegram approval path lands in a later phase; until then this is
+ * the honest ceiling — if SMTP isn't configured it logs loudly and nothing more.
+ */
+async function notifyOps(subject: string, body: string): Promise<void> {
+  log.warn('ops_notify', { subject, body: body.slice(0, 500) });
+
+  const to = (() => {
+    try {
+      const row = db.prepare("SELECT value FROM app_settings WHERE key = 'digest_email'").get() as any;
+      return row?.value || null;
+    } catch { return null; }
+  })();
+
+  if (!to || !process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
+    log.warn('ops_notify_undeliverable', { reason: 'no digest_email or SMTP not configured', subject });
+    return;
+  }
+
+  try {
+    const transporter = nodemailer.createTransport({
+      host: process.env.SMTP_HOST,
+      port: parseInt(process.env.SMTP_PORT || '587'),
+      secure: process.env.SMTP_PORT === '465',
+      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+    });
+    await transporter.sendMail({
+      from: process.env.SMTP_FROM || process.env.SMTP_USER,
+      to,
+      subject: `[ChokePoint Macro] ${subject}`,
+      text: body,
+    });
+  } catch (err) {
+    // Never let a failed notification break the task that raised it.
+    log.error('ops_notify_failed', { subject, ...errInfo(err) });
+  }
+}
 
 
 
@@ -1505,9 +1589,45 @@ app.get("/api/reports/automated", (req, res) => {
 
 // ─── App Settings ──────────────────────────────────────────────────────────────
 
-app.get("/api/app-settings/:key", (req, res) => {
+// requireAuth added: app_settings holds operator configuration (digest_email, the
+// content_guidance prompt block, the posting kill switch). Readable without a session it
+// was the one un-gated settings route. In LOCAL_MODE this is a no-op, as intended.
+app.get("/api/app-settings/:key", requireAuth, (req, res) => {
   const row = db.prepare("SELECT value FROM app_settings WHERE key = ?").get(req.params.key) as any;
   res.json({ value: row?.value ?? null });
+});
+
+// ─── Posting kill switch ───────────────────────────────────────────────────────
+//
+// Separate from the generic settings route so it has its own explicit shape and an
+// audit log line. Takes effect on the next cron tick (<= 60s) with no restart.
+
+app.get("/api/posting/status", requireAuth, (_req, res) => {
+  const row = db.prepare("SELECT value, updated_at FROM app_settings WHERE key = 'posting_enabled'").get() as any;
+  res.json({
+    enabled: isPostingEnabled(),
+    // Distinguishes "explicitly turned on/off" from "never configured, defaulting to off".
+    source: row?.value != null ? 'app_settings' : (process.env.POSTING_ENABLED === 'true' ? 'env' : 'default'),
+    updatedAt: row?.updated_at ?? null,
+    dryRun: POSTING_DRY_RUN,
+    maxPostsPerRun: MAX_POSTS_PER_RUN,
+    maxSlotLatenessMin: MAX_SLOT_LATENESS_MIN,
+  });
+});
+
+app.put("/api/posting/status", requireAuth, (req, res) => {
+  const { enabled } = req.body ?? {};
+  if (typeof enabled !== 'boolean') {
+    return res.status(400).json({ error: "enabled must be true or false" });
+  }
+  db.prepare(`
+    INSERT INTO app_settings (key, value, updated_at) VALUES ('posting_enabled', ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+  `).run(enabled ? 'true' : 'false');
+
+  // Worth a log line either way: this flag decides whether a public account posts.
+  log.warn('posting_toggle_changed', { enabled, by: (req.session as any)?.userId ?? 'unknown' });
+  res.json({ success: true, enabled });
 });
 
 app.put("/api/app-settings", requireAuth, (req, res) => {
@@ -1585,6 +1705,59 @@ onAISpend(({ model, inputTokens, outputTokens, label }) => {
   recordSpend(aiSpend(label, model, inputTokens, outputTokens));
 });
 
+// ─── AI spend cap ──────────────────────────────────────────────────────────────
+//
+// The ledger measures; this enforces. Without it a stuck retry loop bills without
+// limit and the only symptom is a bigger number in the spend UI tomorrow.
+//
+// Calendar-month window, matching how the providers bill. 0 disables the cap.
+const AI_MONTHLY_CAP_USD = Number(process.env.AI_MONTHLY_CAP_USD ?? 80);
+
+/** Month-to-date AI spend in USD. X posting costs are billed separately and excluded. */
+function aiSpendThisMonthUsd(): number {
+  const since = etDateString().slice(0, 7) + '-01T00:00:00.000Z';
+  const row = db.prepare(
+    "SELECT COALESCE(SUM(cost_usd), 0) total FROM api_spend WHERE provider != 'x' AND ts >= ?"
+  ).get(since) as any;
+  return Number(row?.total ?? 0);
+}
+
+// Warn once per server run as the cap approaches, so the first signal isn't a hard stop.
+let capWarningSent = false;
+
+setSpendGuard(() => {
+  if (!AI_MONTHLY_CAP_USD || AI_MONTHLY_CAP_USD <= 0) return { allowed: true };
+
+  let spent: number;
+  try {
+    spent = aiSpendThisMonthUsd();
+  } catch (err) {
+    // Deliberately fail OPEN here, unlike the posting switch. A broken ledger read
+    // should not take content generation offline — generation is reversible and
+    // bounded by max_tokens, whereas a published post is neither.
+    log.warn('spend_cap_check_failed', errInfo(err));
+    return { allowed: true };
+  }
+
+  if (spent >= AI_MONTHLY_CAP_USD) {
+    const reason = `AI spend cap reached: $${spent.toFixed(2)} of $${AI_MONTHLY_CAP_USD.toFixed(2)} month-to-date. Raise AI_MONTHLY_CAP_USD or wait for the next calendar month.`;
+    log.error('spend_cap_exceeded', { spent, cap: AI_MONTHLY_CAP_USD });
+    void notifyOps('AI spend cap reached — generation paused', reason);
+    return { allowed: false, reason };
+  }
+
+  if (!capWarningSent && spent >= AI_MONTHLY_CAP_USD * 0.8) {
+    capWarningSent = true;
+    log.warn('spend_cap_approaching', { spent, cap: AI_MONTHLY_CAP_USD });
+    void notifyOps(
+      'AI spend at 80% of monthly cap',
+      `Month-to-date AI spend is $${spent.toFixed(2)} against a $${AI_MONTHLY_CAP_USD.toFixed(2)} cap. Generation will stop when the cap is reached.`,
+    );
+  }
+
+  return { allowed: true };
+});
+
 
 // ─── X Posting ─────────────────────────────────────────────────────────────────
 
@@ -1653,8 +1826,24 @@ app.post("/api/schedule-post", requireAuth, (req, res) => {
   const { content, scheduledAt } = req.body;
   if (!content?.trim()) return res.status(400).json({ error: "content required" });
   if (!scheduledAt) return res.status(400).json({ error: "scheduledAt required" });
-  db.prepare(`INSERT INTO scheduled_posts (user_id, content, scheduled_at) VALUES (?, ?, ?)`).run(userId, content, scheduledAt);
-  res.json({ success: true });
+
+  // Reject over-length here rather than letting it fail at X an hour later, where it
+  // lands as a 'failed' row with a truncated API error and no way to retry.
+  if (content.length > X_MAX_POST_CHARS) {
+    return res.status(400).json({ error: `content exceeds ${X_MAX_POST_CHARS} characters`, chars: content.length });
+  }
+
+  // Canonicalise to ISO UTC. A zone-less value is read as Eastern wall clock, matching
+  // how every other slot time in the app is defined. Storing the raw client string is
+  // what let '2026-10-01 23:59' compare as due at UTC midnight and publish early.
+  const iso = normaliseScheduledAt(scheduledAt);
+  if (!iso) {
+    return res.status(400).json({ error: "scheduledAt not understood — use 'YYYY-MM-DD HH:MM' (Eastern) or a full ISO-8601 timestamp" });
+  }
+
+  db.prepare(`INSERT INTO scheduled_posts (user_id, content, scheduled_at, kind) VALUES (?, ?, ?, 'tweet')`)
+    .run(userId, content, iso);
+  res.json({ success: true, scheduledAt: iso });
 });
 
 app.get("/api/scheduled-posts", requireAuth, (req, res) => {
@@ -1697,14 +1886,18 @@ app.post("/api/auto-schedule/preview", requireAuth, (req, res) => {
     }
   }
 
-  // Instagram reminder (9am EST = 14:00 UTC)
-  const instaTime = new Date(nextDate.getTime() + 4 * 60 * 60 * 1000); // +4h from midnight EST = 9am EST
-  items.push({ type: 'instagram', time: instaTime.toISOString(), content: 'Post your 21-slide Instagram carousel for today\'s report.', enabled: true });
+  // Reminders at 9am ET. These were previously `midnight + 4h`, which the comment
+  // called 9am but which actually produced 4am ET — midnight ET to 9am ET is nine
+  // hours, not four. Stating the wall clock directly removes the arithmetic entirely.
+  const at9amEt = (day: Date) => {
+    const p = etParts(day);
+    return etToUtc(p.year, p.month, p.day, 9, 0).toISOString();
+  };
 
-  // Substack reminder (next Monday 9am EST)
-  const nextMonday = getNextWeekday(1);
-  const substackTime = new Date(nextMonday.getTime() + 4 * 60 * 60 * 1000);
-  items.push({ type: 'substack', time: substackTime.toISOString(), content: 'Publish your Substack article for this week\'s intelligence brief.', enabled: true });
+  items.push({ type: 'instagram', time: at9amEt(nextDate), content: 'Post your 21-slide Instagram carousel for today\'s report.', enabled: true });
+
+  // Substack reminder (next Monday 9am ET)
+  items.push({ type: 'substack', time: at9amEt(getNextWeekday(1)), content: 'Publish your Substack article for this week\'s intelligence brief.', enabled: true });
 
   // Sort chronologically
   items.sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime());
@@ -1719,17 +1912,38 @@ app.post("/api/auto-schedule/confirm", requireAuth, (req, res) => {
   if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "No items provided" });
 
   let count = 0;
+  const rejected: Array<{ time: unknown; reason: string }> = [];
+
+  const insert = db.prepare(
+    "INSERT INTO scheduled_posts (user_id, content, scheduled_at, status, source_url, kind) VALUES (?, ?, ?, 'pending', ?, ?)"
+  );
+
   for (const item of items) {
     if (!item.enabled) continue;
-    const content = item.type === 'tweet' ? item.content :
-                    item.type === 'instagram' ? `[INSTAGRAM] ${item.content}` :
-                    `[SUBSTACK] ${item.content}`;
-    db.prepare("INSERT INTO scheduled_posts (user_id, content, scheduled_at, status, source_url) VALUES (?, ?, ?, 'pending', ?)")
-      .run(userId, content, item.time, item.type === 'tweet' ? (item.sourceUrl || null) : null);
+
+    const kind = item.type === 'tweet' ? 'tweet'
+               : item.type === 'instagram' ? 'instagram'
+               : 'substack';
+
+    // The '[INSTAGRAM] '/'[SUBSTACK] ' prefix stays for display compatibility with
+    // Schedule.tsx, but `kind` is now what the publisher filters on — a prefix on a
+    // text column was never a safe way to keep a reminder out of the X API.
+    const content = kind === 'tweet' ? item.content
+                  : kind === 'instagram' ? `[INSTAGRAM] ${item.content}`
+                  : `[SUBSTACK] ${item.content}`;
+
+    const iso = normaliseScheduledAt(item.time);
+    if (!iso) { rejected.push({ time: item.time, reason: 'unparseable time' }); continue; }
+
+    insert.run(userId, content, iso, kind === 'tweet' ? (item.sourceUrl || null) : null, kind);
     count++;
   }
 
-  res.json({ success: true, scheduled: count });
+  // Surface partial failure rather than reporting a success count that silently
+  // under-counts what the operator confirmed.
+  if (rejected.length) log.warn('auto_schedule_items_rejected', { count: rejected.length, rejected });
+
+  res.json({ success: true, scheduled: count, rejected: rejected.length });
 });
 
 // ─── Debug ─────────────────────────────────────────────────────────────────────
@@ -1825,47 +2039,47 @@ app.get("/api/debug/session", (req, res) => {
 
 // ─── Auto-Schedule Helpers ─────────────────────────────────────────────────────
 
-// Returns the next Date (midnight EST) for the given day-of-week (0=Sun…6=Sat)
-// If today IS that day, schedules for next week.
+// Returns the next instant corresponding to midnight Eastern on the given day-of-week
+// (0=Sun…6=Sat). If today IS that day in ET, schedules for next week.
+//
+// Was: `now - 5h`, hardcoding EST. Eastern has no fixed offset — it is UTC-5 in winter
+// and UTC-4 under DST — so for ~8 months a year that put every derived slot an hour off.
+// nextEtWeekdayMidnight asks the timezone database instead. See src/services/time.ts.
 function getNextWeekday(targetDay: number): Date {
-  const now = new Date();
-  // EST = UTC-5; get current EST day-of-week
-  const estNow = new Date(now.getTime() - 5 * 60 * 60 * 1000);
-  let daysUntil = (targetDay - estNow.getDay() + 7) % 7;
-  if (daysUntil === 0) daysUntil = 7;
-  // Midnight EST = 05:00 UTC
-  const result = new Date(estNow);
-  result.setDate(result.getDate() + daysUntil);
-  result.setUTCHours(5, 0, 0, 0); // midnight EST
-  return result;
+  return nextEtWeekdayMidnight(targetDay);
 }
 
-// Assign tweets to time slots from 7am–7pm EST, highest trendScore to highest engagement hour
+// Assign tweets to time slots from 7am–7pm ET, highest trendScore to highest engagement hour
 function calculateTweetSlots(baseDate: Date, tweets: any[]): Array<{ time: string; content: string; trendScore: number; title: string; sourceUrl?: string }> {
   const count = tweets.length;
   if (count === 0) return [];
 
-  const startMinEST = 7 * 60;  // 420
-  const endMinEST  = 19 * 60;  // 1140
-  const totalMins  = endMinEST - startMinEST; // 720
+  const startMinET = 7 * 60;  // 420
+  const endMinET   = 19 * 60; // 1140
+  const totalMins  = endMinET - startMinET; // 720
   const interval   = totalMins / count;
 
-  // Finance/politics Twitter engagement score per EST hour
+  // Finance/politics X engagement score per ET hour
   const engHour: Record<number, number> = {
     7:8, 8:10, 9:9, 10:6, 11:5, 12:8, 13:7, 14:5, 15:6, 16:10, 17:9, 18:7,
   };
 
-  // Build evenly-spaced slots (stored as UTC)
+  // Build evenly-spaced slots as ET wall-clock times, each resolved to a real instant.
+  // Adding milliseconds to a midnight timestamp (the old approach) breaks across a DST
+  // boundary, because the day is 23 or 25 hours long — so the wall clock is computed
+  // first and converted second.
+  const base = etParts(baseDate);
   const slots: Date[] = Array.from({ length: count }, (_, i) => {
-    const minFromMidnightEST = startMinEST + Math.round(i * interval);
-    const d = new Date(baseDate);
-    // baseDate is midnight EST = 05:00 UTC; add EST minutes
-    d.setTime(baseDate.getTime() + minFromMidnightEST * 60000);
-    return d;
+    const minFromMidnightET = startMinET + Math.round(i * interval);
+    return etToUtc(
+      base.year, base.month, base.day,
+      Math.floor(minFromMidnightET / 60),
+      minFromMidnightET % 60,
+    );
   });
 
-  // Score each slot (EST hour = UTC hour - 5)
-  const scored = slots.map((d, i) => ({ i, slot: d, score: engHour[d.getUTCHours() - 5] ?? 5 }));
+  // Score each slot by its actual ET hour.
+  const scored = slots.map((d, i) => ({ i, slot: d, score: engHour[etParts(d).hour] ?? 5 }));
   // Sort slot indices by engagement descending
   const slotsByEng = [...scored].sort((a, b) => b.score - a.score).map(s => s.i);
 
@@ -1916,6 +2130,45 @@ try {
 
 let isCronRunning = false; // Lock to prevent overlapping cron executions
 
+/**
+ * Parse a SQLite CURRENT_TIMESTAMP value ("YYYY-MM-DD HH:MM:SS", always UTC).
+ *
+ * `new Date("2026-10-01 06:00:00")` is interpreted as *local* time by JS, which on this
+ * machine is 7 hours off — enough to put a once-per-day guard on the wrong side of the
+ * boundary. The zone has to be stated explicitly.
+ */
+function parseSqliteUtc(value: string): Date {
+  const s = String(value).trim();
+  if (/[Zz]$|[+-]\d{2}:?\d{2}$/.test(s)) return new Date(s);
+  return new Date(s.replace(' ', 'T') + 'Z');
+}
+
+// Remembers which (schedule, ET day) pairs have already logged a miss, so a report that
+// blew past its catch-up window warns once rather than every 60 seconds until midnight.
+const reportSkipLogged = new Set<string>();
+
+// ─── Nightly database backup ───────────────────────────────────────────────────
+//
+// Logic lives in src/services/backup.ts so `npm run backup` can use the same code path.
+function runBackup(): void {
+  try {
+    const { target, bytes, pruned } = backupDatabase(db);
+    log.info('db_backup_written', { target, bytes, pruned });
+  } catch (err) {
+    log.error('db_backup_failed', errInfo(err));
+    void notifyOps(
+      'Nightly database backup failed',
+      `The SQLite backup did not complete. The database holds your X tokens, reports and spend ledger, and is not stored anywhere else.\n\nError: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+// On boot, then daily. Backing up at startup matters because this app runs on a laptop
+// that sleeps: an app up for only part of each day would otherwise keep resetting a 24h
+// timer it never reaches. Same "the machine isn't always on" problem as the publisher.
+runBackup();
+setInterval(runBackup, 24 * 60 * 60 * 1000);
+
 // Clean up stale pending_auth records older than 1 hour (abandoned OAuth flows)
 setInterval(() => {
   try {
@@ -1930,7 +2183,48 @@ setInterval(async () => {
 
   // Process scheduled social posts
   try {
-    if (!POSTING_ENABLED) {
+    const nowIso = new Date().toISOString();
+
+    // Expire slots that are too late to be worth publishing.
+    //
+    // This runs BEFORE the kill-switch check on purpose: if posting is paused, stale
+    // rows must still age out, otherwise re-enabling the switch would dump an entire
+    // paused period's backlog onto the live account at once.
+    //
+    // Only `kind='tweet'` rows are time-sensitive — the Instagram/Substack reminders
+    // are notes to self and are excluded from the publisher entirely (below).
+    const latenessCutoff = new Date(Date.now() - MAX_SLOT_LATENESS_MIN * 60_000).toISOString();
+    const overdue = db.prepare(
+      "SELECT id, scheduled_at, substr(content, 1, 80) preview FROM scheduled_posts WHERE status='pending' AND kind='tweet' AND scheduled_at < ?"
+    ).all(latenessCutoff) as any[];
+
+    if (overdue.length) {
+      db.prepare(
+        `UPDATE scheduled_posts SET status='skipped',
+           last_error='missed slot — more than ${MAX_SLOT_LATENESS_MIN} min late, skipped rather than publishing stale content'
+         WHERE status='pending' AND kind='tweet' AND scheduled_at < ?`
+      ).run(latenessCutoff);
+
+      log.warn('posts_skipped_stale', {
+        count: overdue.length,
+        lateness_limit_min: MAX_SLOT_LATENESS_MIN,
+        ids: overdue.map(o => o.id),
+      });
+
+      // The operator needs to know a slot was dropped — silence here reads as "it posted".
+      void notifyOps(
+        `${overdue.length} scheduled post${overdue.length === 1 ? '' : 's'} skipped`,
+        [
+          `${overdue.length} post(s) were more than ${MAX_SLOT_LATENESS_MIN} minutes past their slot and were skipped rather than published stale.`,
+          '',
+          'This usually means the machine was asleep or the app was not running.',
+          '',
+          ...overdue.map(o => `  · #${o.id}  due ${o.scheduled_at}  "${o.preview}…"`),
+        ].join('\n'),
+      );
+    }
+
+    if (!isPostingEnabled()) {
       log.warn('posting_disabled_skip');
     } else {
       // Reclaim rows stranded by a crash. Deliberately marked failed, NOT retried: if the
@@ -1942,13 +2236,16 @@ setInterval(async () => {
       ).run(new Date(Date.now() - CLAIM_TIMEOUT_MIN * 60_000).toISOString());
       if (stale.changes) log.warn('posts_stranded_reclaimed', { count: stale.changes });
 
+      // `kind='tweet'` is the fix for reminder rows reaching the X API: the
+      // '[INSTAGRAM] …' text was only ever stripped by the frontend, so without this
+      // filter the publisher would tweet the reminder verbatim.
       const due = db.prepare(
-        "SELECT * FROM scheduled_posts WHERE status = 'pending' AND scheduled_at <= ? ORDER BY scheduled_at ASC LIMIT ?"
-      ).all(new Date().toISOString(), MAX_POSTS_PER_RUN) as any[];
+        "SELECT * FROM scheduled_posts WHERE status = 'pending' AND kind = 'tweet' AND scheduled_at <= ? ORDER BY scheduled_at ASC LIMIT ?"
+      ).all(nowIso, MAX_POSTS_PER_RUN) as any[];
 
       const backlog = db.prepare(
-        "SELECT COUNT(*) c FROM scheduled_posts WHERE status='pending' AND scheduled_at <= ?"
-      ).get(new Date().toISOString()) as any;
+        "SELECT COUNT(*) c FROM scheduled_posts WHERE status='pending' AND kind='tweet' AND scheduled_at <= ?"
+      ).get(nowIso) as any;
       if (backlog.c > due.length) {
         // Never silently truncate — a growing backlog means something upstream is wrong.
         log.warn('post_backlog_capped', { due: backlog.c, cap: MAX_POSTS_PER_RUN, deferred: backlog.c - due.length });
@@ -1992,9 +2289,16 @@ setInterval(async () => {
             }
           }
         } catch (error) {
+          const msg = String(error instanceof Error ? error.message : error).slice(0, 500);
           db.prepare("UPDATE scheduled_posts SET status='failed', last_error=? WHERE id=?")
-            .run(String(error instanceof Error ? error.message : error).slice(0, 500), post.id);
+            .run(msg, post.id);
           log.error('post_failed', { id: post.id, ...errInfo(error) });
+          // A 'failed' row is terminal — nothing re-queues it and the UI offers no retry,
+          // so an unnoticed failure is a silently missing post.
+          void notifyOps(
+            `Scheduled post #${post.id} failed to publish`,
+            `Post #${post.id} (due ${post.scheduled_at}) could not be published and has been marked failed. It will NOT be retried automatically.\n\nError: ${msg}\n\nPreview: "${String(post.content || '').slice(0, 200)}…"`,
+          );
         }
       }
     }
@@ -2005,20 +2309,55 @@ setInterval(async () => {
   // Process scheduled report generation
   try {
     const now = new Date();
-    const currentTime = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
-    const currentDay = now.getDay().toString();
-    const todayStr = now.toISOString().split('T')[0];
+    const nowEt = etParts(now);
+    const todayEt = etDateString(now);
+    const nowMinEt = etMinutesOfDay(now);
 
-    const schedules = db.prepare(`
-      SELECT * FROM scheduled_reports
-      WHERE enabled = 1
-        AND schedule_time = ?
-        AND (last_run IS NULL OR date(last_run) != ?)
-    `).all(currentTime, todayStr) as any[];
+    // All comparisons are in Eastern. `schedule_time` was previously matched against
+    // server-LOCAL time, which on this machine (America/Los_Angeles) meant a schedule
+    // labelled "06:00 EST" in the UI actually fired at 6am Pacific.
+    const schedules = db.prepare("SELECT * FROM scheduled_reports WHERE enabled = 1").all() as any[];
 
     for (const schedule of schedules) {
-      const scheduleDays = schedule.days.split(',').map((d: string) => d.trim());
-      if (!scheduleDays.includes(currentDay)) continue;
+      const scheduleDays = String(schedule.days || '').split(',').map((d: string) => d.trim()).filter(Boolean);
+      if (!scheduleDays.includes(String(nowEt.weekday))) continue;
+
+      // Already generated today (Eastern calendar day)?
+      if (schedule.last_run && etDateString(parseSqliteUtc(schedule.last_run)) === todayEt) continue;
+
+      const schedMinEt = parseHhMm(schedule.schedule_time);
+      if (schedMinEt === null) {
+        log.warn('report_schedule_time_unparseable', { id: schedule.id, type: schedule.report_type, value: schedule.schedule_time });
+        continue;
+      }
+
+      // Window, not an exact minute match. The old `schedule_time = ?` required the tick
+      // to land on precisely the right HH:MM — one skewed or missed tick (asleep, busy,
+      // restarting) and the report silently never generated that day.
+      const lateByMin = nowMinEt - schedMinEt;
+      if (lateByMin < 0) continue; // not due yet today
+
+      if (lateByMin > MAX_REPORT_LATENESS_MIN) {
+        // Too late to be worth catching up. Log once per ET day rather than every
+        // 60 seconds until midnight.
+        const key = `${schedule.id}:${todayEt}`;
+        if (!reportSkipLogged.has(key)) {
+          reportSkipLogged.add(key);
+          log.warn('report_schedule_missed', {
+            id: schedule.id, type: schedule.report_type,
+            due: schedule.schedule_time, late_by_min: lateByMin, limit_min: MAX_REPORT_LATENESS_MIN,
+          });
+          void notifyOps(
+            `Scheduled report "${schedule.report_type}" missed`,
+            `The ${schedule.report_type} report was due at ${schedule.schedule_time} ET and is now ${Math.round(lateByMin / 60)}h late, past the ${Math.round(MAX_REPORT_LATENESS_MIN / 60)}h catch-up window. It was not generated today.\n\nThis usually means the machine was asleep or the app was not running.`,
+          );
+        }
+        continue;
+      }
+
+      if (lateByMin > 2) {
+        log.info('report_schedule_catchup', { id: schedule.id, type: schedule.report_type, late_by_min: lateByMin });
+      }
 
       try {
         console.log(`[Cron] Generating scheduled ${schedule.report_type} report...`);

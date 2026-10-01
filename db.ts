@@ -1,7 +1,11 @@
 import Database from 'better-sqlite3';
 import path from 'path';
+import { normaliseScheduledAt } from './src/services/time.ts';
 
-const db = new Database(path.resolve('database.sqlite'));
+// Overridable so a throwaway instance can be pointed at a COPY of the database —
+// migrations and the publisher can then be exercised without risking the real one,
+// which holds the live X tokens.
+const db = new Database(path.resolve(process.env.DB_PATH || 'database.sqlite'));
 
 // Initialize tables
 db.exec(`
@@ -151,6 +155,63 @@ try {
   add('claimed_at', 'claimed_at DATETIME');
 } catch (err) {
   console.error("scheduled_posts safety migration error:", err);
+}
+
+// Migration: distinguish real tweets from the Instagram/Substack *reminders* that share
+// this table.
+//
+// The reminders were previously identified only by a '[INSTAGRAM] '/'[SUBSTACK] ' prefix
+// on the content, which the frontend stripped for display. The publisher's due-query had
+// no such filter, so it would have tweeted "[INSTAGRAM] Post your 21-slide carousel..."
+// verbatim to the live account. A prefix on a text column is a display convention; it is
+// not a type. This makes the type explicit so the publisher can filter on it.
+try {
+  const cols = db.prepare("PRAGMA table_info(scheduled_posts)").all() as any[];
+  if (!cols.some(c => c.name === 'kind')) {
+    db.exec("ALTER TABLE scheduled_posts ADD COLUMN kind TEXT NOT NULL DEFAULT 'tweet'");
+    // Backfill from the legacy prefixes so existing rows are classified correctly.
+    const insta = db.prepare("UPDATE scheduled_posts SET kind='instagram' WHERE content LIKE '[INSTAGRAM]%'").run();
+    const sub = db.prepare("UPDATE scheduled_posts SET kind='substack' WHERE content LIKE '[SUBSTACK]%'").run();
+    console.log(`Migrated scheduled_posts table: added kind column (reclassified ${insta.changes} instagram, ${sub.changes} substack)`);
+  }
+} catch (err) {
+  console.error("scheduled_posts kind migration error:", err);
+}
+
+// Migration: canonicalise scheduled_at to ISO-8601 UTC.
+//
+// SQLite compares DATETIME columns as TEXT. A value like '2026-10-01 23:59' (space
+// separator, no zone) sorts BELOW '2026-10-01T00:00:00.000Z' because ' ' (0x20) < 'T'
+// (0x54) — so the publisher's `scheduled_at <= now` test treated a post scheduled for
+// late tonight as already due and published it ~18 hours early. Writes now go through
+// normaliseScheduledAt(); this fixes any rows already stored in a mixed format.
+try {
+  const rows = db.prepare(
+    "SELECT id, scheduled_at FROM scheduled_posts WHERE scheduled_at IS NOT NULL AND scheduled_at NOT LIKE '%Z'"
+  ).all() as any[];
+  if (rows.length) {
+    const upd = db.prepare("UPDATE scheduled_posts SET scheduled_at = ? WHERE id = ?");
+    let fixed = 0;
+    let unparseable = 0;
+    for (const r of rows) {
+      const iso = normaliseScheduledAt(r.scheduled_at);
+      if (iso) { upd.run(iso, r.id); fixed++; } else { unparseable++; }
+    }
+    console.log(`Migrated scheduled_posts table: normalised ${fixed} scheduled_at value(s) to ISO UTC`);
+    if (unparseable) {
+      // Never silently leave a row that will compare unpredictably against `now`.
+      console.warn(`⚠️  ${unparseable} scheduled_at value(s) could not be parsed and were left as-is — inspect them before enabling posting`);
+    }
+  }
+} catch (err) {
+  console.error("scheduled_posts scheduled_at migration error:", err);
+}
+
+// The publisher polls `WHERE status=? AND kind=? AND scheduled_at <= ?` every 60s.
+try {
+  db.exec("CREATE INDEX IF NOT EXISTS idx_scheduled_posts_due ON scheduled_posts(status, kind, scheduled_at)");
+} catch (err) {
+  console.error("scheduled_posts index migration error:", err);
 }
 
 // Migration: add platform column to pending_auth if missing

@@ -5,11 +5,18 @@
   "type": "module",
   "scripts": {
     "dev": "tsx --no-cache server.ts",
+    "start": "tsx server.ts",
     "build": "vite build",
     "preview": "vite preview",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
-    "test": "node --import tsx --test tests/*.test.ts"
+    "test": "node --import tsx --test tests/*.test.ts",
+    "pm2:start": "pm2 start ecosystem.config.cjs && pm2 save",
+    "pm2:restart": "pm2 restart gib",
+    "pm2:stop": "pm2 stop gib",
+    "pm2:logs": "pm2 logs gib",
+    "pm2:status": "pm2 status",
+    "backup": "tsx scripts/backup-db.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.78.0",

@@ -6,8 +6,15 @@
  * block was entirely self-contained — no database access, no shared helpers, no auth
  * middleware — so the move is a pure relocation with no behavioural change. Its only
  * external dependency is the Public.com credentials in the environment.
+ *
+ * The two AI endpoints here instantiate the Anthropic SDK directly rather than going
+ * through aiService's fallback chain. That is deliberate (they want prose, not validated
+ * JSON), but it previously meant their spend was invisible to the ledger and immune to
+ * the budget cap. They now gate and report through aiService's injected hooks, which
+ * keeps this module database-free.
  */
 import express from 'express';
+import { assertSpendAllowed, reportAISpend, SpendCapExceededError } from '../services/aiService.ts';
 
 export function createMarketsRouter(): express.Router {
   const router = express.Router();
@@ -402,17 +409,31 @@ export function createMarketsRouter(): express.Router {
 
   Be direct. No filler. Use the actual numbers from the data. Format in markdown.`;
 
+      assertSpendAllowed('markets_insights');
+
+      const model = "claude-sonnet-4-6";
       const anthropic = new (await import("@anthropic-ai/sdk")).default();
       const msg = await anthropic.messages.create({
-        model: "claude-sonnet-4-6",
+        model,
         max_tokens: 600,
         messages: [{ role: "user", content: prompt }],
+      });
+
+      reportAISpend({
+        provider: 'anthropic', model, label: 'markets_insights',
+        inputTokens: msg.usage?.input_tokens ?? 0,
+        outputTokens: msg.usage?.output_tokens ?? 0,
       });
 
       const text = (msg.content[0] as any).text as string;
       insightsCache = { text, ts: Date.now() };
       res.json({ text, cached: false, generatedAt: new Date().toISOString() });
     } catch (err) {
+      // 402 Payment Required, so the UI can distinguish "over budget" from "broken".
+      if (err instanceof SpendCapExceededError) {
+        console.warn("[Insights] refused by spend cap:", err.message);
+        return res.status(402).json({ error: err.message, spendCapExceeded: true });
+      }
       console.error("[Insights]", err);
       res.status(500).json({ error: String(err) });
     }
@@ -918,17 +939,30 @@ export function createMarketsRouter(): express.Router {
 
   Use plain text, no markdown headers. Be concise but thorough.`;
 
+      assertSpendAllowed('markets_terminal_analysis');
+
+      const model = "claude-sonnet-4-6";
       const anthropic = new (await import("@anthropic-ai/sdk")).default();
       const msg = await anthropic.messages.create({
-        model: "claude-sonnet-4-6",
+        model,
         max_tokens: 800,
         messages: [{ role: "user", content: prompt }],
+      });
+
+      reportAISpend({
+        provider: 'anthropic', model, label: 'markets_terminal_analysis',
+        inputTokens: msg.usage?.input_tokens ?? 0,
+        outputTokens: msg.usage?.output_tokens ?? 0,
       });
 
       const text = (msg.content[0] as any).text as string;
       terminalAnalysisCache = { text, ts: Date.now() };
       res.json({ text, cached: false, generatedAt: new Date().toISOString() });
     } catch (err) {
+      if (err instanceof SpendCapExceededError) {
+        console.warn("[Terminal Analysis] refused by spend cap:", err.message);
+        return res.status(402).json({ error: err.message, spendCapExceeded: true });
+      }
       console.error("[Terminal Analysis]", err);
       res.status(500).json({ error: String(err) });
     }

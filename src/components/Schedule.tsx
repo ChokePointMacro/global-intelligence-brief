@@ -3,6 +3,7 @@ import { Calendar, Loader2, Trash2, Send, Instagram, FileText } from 'lucide-rea
 import { cn } from '../lib/utils';
 import { apiFetch } from '../lib/api';
 import { BackButton } from './BackButton';
+import { etDisplayTime, etZoneAbbrev } from '../services/time';
 import type { ScheduledPost } from '../types';
 
 const WEEKLY_CALENDAR = [
@@ -142,23 +143,35 @@ export const Schedule = () => {
                   return (
                     <div key={post.id} className="flex items-start gap-3 p-4 bg-[#0a0a0a] border border-btc-orange/15 hover:border-btc-orange/30 transition-colors">
                       <div className="shrink-0 w-16 text-center pt-0.5">
-                        <p className="text-[11px] font-mono font-bold text-white">{new Date(post.scheduled_at).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}</p>
-                        <p className="text-[9px] font-mono text-gray-600">EST</p>
+                        {/* Rendered in Eastern explicitly. This used to use the browser's
+                            own timezone while printing the label "EST" underneath it. */}
+                        <p className="text-[11px] font-mono font-bold text-white">{etDisplayTime(new Date(post.scheduled_at))}</p>
+                        <p className="text-[9px] font-mono text-gray-600">{etZoneAbbrev(new Date(post.scheduled_at))}</p>
                       </div>
                       <div className="flex-1 min-w-0 space-y-1.5">
                         <div className="flex items-center gap-2 flex-wrap">
                           <span className={cn('flex items-center gap-1 px-1.5 py-0.5 text-[9px] font-mono uppercase border rounded-sm', ts.color)}>
                             {ts.icon} {ts.label}
                           </span>
+                          {/* 'skipped' is distinct from 'failed': the slot passed its
+                              lateness window and was deliberately not published, which
+                              is the system working, not an error. */}
                           <span className={cn('text-[8px] font-mono uppercase px-1.5 py-0.5 border rounded-sm',
                             post.status === 'pending' ? 'text-amber-400 border-amber-400/30 bg-amber-400/5' :
                             post.status === 'posted'  ? 'text-green-400 border-green-400/30 bg-green-400/5' :
+                            post.status === 'posting' ? 'text-sky-400 border-sky-400/30 bg-sky-400/5' :
+                            post.status === 'skipped' ? 'text-gray-400 border-gray-400/30 bg-gray-400/5' :
                             'text-red-400 border-red-400/30 bg-red-400/5'
                           )}>{post.status}</span>
+                          {post.status === 'skipped' && post.last_error && (
+                            <span className="text-[8px] font-mono text-gray-600">missed slot</span>
+                          )}
                         </div>
                         <p className="text-xs text-gray-400 leading-relaxed line-clamp-2">{displayContent}</p>
                       </div>
-                      {post.status === 'pending' && (
+                      {/* Also deletable once terminal — a skipped or failed row is never
+                          retried, so without this they accumulate with no way to clear them. */}
+                      {(post.status === 'pending' || post.status === 'skipped' || post.status === 'failed') && (
                         <button onClick={() => handleDelete(post.id)} className="shrink-0 p-2 text-red-500/40 hover:text-red-500 hover:bg-red-500/10 transition-colors rounded-sm">
                           <Trash2 size={14} />
                         </button>

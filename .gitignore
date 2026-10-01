@@ -9,6 +9,11 @@ coverage/
 *.sqlite
 sessions/
 
+# nightly VACUUM INTO snapshots (see backupDatabase() in server.ts).
+# Already covered by *.sqlite above, but listed explicitly because these must never be
+# committed: the database contains live X OAuth access and refresh tokens.
+backups/
+
 # runtime logs (structured JSONL from src/services/log.ts)
 logs/
 *.jsonl
