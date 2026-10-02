@@ -8,6 +8,7 @@ import {
   etDateString,
   parseHhMm,
   nextEtWeekdayMidnight,
+  etZoneAbbrev,
   normaliseScheduledAt,
 } from '../src/services/time.ts';
 
@@ -85,6 +86,33 @@ test('etDateString reports the ET calendar day, not the UTC one', () => {
   // 03:30 UTC on Oct 2 is still 23:30 ET on Oct 1 — the UTC date is a day ahead.
   const d = new Date('2026-10-02T03:30:00.000Z');
   assert.equal(etDateString(d), '2026-10-01');
+});
+
+test('REGRESSION: etZoneAbbrev is not fooled by sub-second precision', () => {
+  // etParts has second resolution. Differencing it against a millisecond timestamp left
+  // a remainder, so the offset never equalled exactly -4h and this returned "EST" all
+  // year — including in October, which the Post Queue header displayed verbatim.
+  const summerOdd = new Date(Date.UTC(2026, 6, 1, 12, 45, 30, 777)); // July, EDT, .777ms
+  assert.equal(etZoneAbbrev(summerOdd), 'EDT');
+
+  const winterOdd = new Date(Date.UTC(2026, 0, 15, 13, 45, 30, 123)); // January, EST
+  assert.equal(etZoneAbbrev(winterOdd), 'EST');
+});
+
+test('etZoneAbbrev flips at the Nov 1 2026 transition', () => {
+  assert.equal(etZoneAbbrev(new Date('2026-10-31T12:00:00.000Z')), 'EDT');
+  assert.equal(etZoneAbbrev(new Date('2026-11-02T12:00:00.000Z')), 'EST');
+});
+
+test('etZoneAbbrev agrees with the offset etToUtc actually applies', () => {
+  // The label must never contradict the arithmetic: if we call it EDT, 08:45 ET has to
+  // resolve at UTC-4.
+  for (const [y, m, d] of [[2026, 7, 1], [2026, 1, 15], [2026, 10, 1], [2026, 12, 25]] as const) {
+    const utc = etToUtc(y, m, d, 8, 45);
+    const expectedOffset = etZoneAbbrev(utc) === 'EDT' ? 4 : 5;
+    const hourUtc = utc.getUTCHours();
+    assert.equal(hourUtc, 8 + expectedOffset, `${y}-${m}-${d}: label and offset disagree`);
+  }
 });
 
 test('parseHhMm accepts valid times and rejects junk', () => {

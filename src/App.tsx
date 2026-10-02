@@ -17,6 +17,7 @@ import { Connections } from './components/Connections';
 import { WeightsAndMeasures } from './components/WeightsAndMeasures';
 import { ApiSpend } from './components/ApiSpend';
 import { PostTypes } from './components/PostTypes';
+import { PostQueue } from './components/PostQueue';
 import type { UserData } from './types';
 
 export default function App() {
@@ -88,6 +89,7 @@ export default function App() {
           <Route path="/weights" element={<WeightsAndMeasures />} />
           <Route path="/spend" element={<ApiSpend />} />
           <Route path="/post-types" element={<PostTypes />} />
+          <Route path="/queue" element={<PostQueue />} />
         </Routes>
       </Layout>
     </BrowserRouter>

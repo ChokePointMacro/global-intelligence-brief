@@ -175,11 +175,38 @@ export function etDisplayTime(instant: Date): string {
   return displayTimeFormatter.format(instant);
 }
 
-/** Whether Eastern is currently observing DST, for labelling output "EDT" vs "EST". */
+/**
+ * Mike's own timezone. Phoenix does NOT observe daylight saving, so its offset to
+ * Eastern changes twice a year: 3 hours behind under EDT, 2 under EST. The timeline
+ * shows both, because "4:20 PM ET" means two different local times depending on the
+ * month and getting that wrong is how you miss your own post.
+ */
+export const LOCAL_ZONE = 'America/Phoenix';
+
+const localTimeFormatter = new Intl.DateTimeFormat('en-US', {
+  timeZone: LOCAL_ZONE,
+  hour: 'numeric',
+  minute: '2-digit',
+});
+
+/** An instant rendered as a Phoenix clock time, e.g. "1:20 PM". */
+export function localDisplayTime(instant: Date): string {
+  return localTimeFormatter.format(instant);
+}
+
+/**
+ * Whether Eastern is observing DST at an instant, for labelling output "EDT" vs "EST".
+ *
+ * The instant is truncated to whole seconds before comparing. etParts() has only
+ * second resolution, so differencing it against a millisecond-precision timestamp
+ * leaves a sub-second remainder and the offset never equals exactly -4h — which made
+ * this return "EST" all year round, including in October.
+ */
 export function etZoneAbbrev(instant: Date = new Date()): 'EDT' | 'EST' {
   const p = etParts(instant);
   const asIfUtc = Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second);
-  return asIfUtc - instant.getTime() === -4 * 3_600_000 ? 'EDT' : 'EST';
+  const wholeSeconds = Math.floor(instant.getTime() / 1000) * 1000;
+  return asIfUtc - wholeSeconds === -4 * 3_600_000 ? 'EDT' : 'EST';
 }
 
 /** ET calendar date as "YYYY-MM-DD" — for once-per-ET-day guards. */

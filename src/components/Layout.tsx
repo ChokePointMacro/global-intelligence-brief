@@ -20,6 +20,7 @@ const NAV_ITEMS = [
 
 const AUTH_NAV_ITEMS = [
   { to: '/compose', label: 'Compose' },
+  { to: '/queue', label: 'Queue' },
   { to: '/schedule', label: 'Schedule' },
   { to: '/post-types', label: 'Post Types' },
   { to: '/weights', label: 'Weights' },
