@@ -86,17 +86,45 @@ export function createPostQueueRouter({ db, requireAuth }: PostQueueDeps): expre
       ORDER BY sort_order ASC, id ASC
     `).all() as PostType[];
 
-    // Queued counts for the next 7 days — the left-rail numbers in the plan's wireframe.
+    // Queued counts for the next 7 days.
+    //
+    // Bounds are ISO strings built in JS, NOT SQLite's datetime(), which returns
+    // "YYYY-MM-DD HH:MM:SS" with a space. scheduled_at is ISO with a 'T', and SQLite
+    // compares DATETIME as text — ' ' (0x20) sorts below 'T' (0x54), so a post on the
+    // boundary DAY was dropped even when it fell hours inside the window. Same class of
+    // bug as the early-publishing one in Phase 0; it must not come back through a
+    // convenience helper.
+    //
+    // The lower bound matters too: without it a draft from any time in the past counted
+    // toward "next 7 days", so the number on screen was inflated by stale rows.
+    const nowIso2 = new Date().toISOString();
+    const in7Iso = new Date(Date.now() + 7 * 24 * 3_600_000).toISOString();
     const counts = db.prepare(`
       SELECT type_id, COUNT(*) c FROM posts
       WHERE status NOT IN ('posted', 'archived', 'skipped')
         AND scheduled_at IS NOT NULL
-        AND scheduled_at <= datetime('now', '+7 days')
+        AND scheduled_at >= ? AND scheduled_at <= ?
       GROUP BY type_id
-    `).all() as Array<{ type_id: number; c: number }>;
+    `).all(nowIso2, in7Iso) as Array<{ type_id: number; c: number }>;
     const byType = new Map(counts.map(r => [r.type_id, r.c]));
 
-    res.json({ types: rows.map(t => ({ ...t, queued_next_7d: byType.get(t.id) ?? 0 })) });
+    // Anything overdue and still unresolved is surfaced separately rather than folded
+    // into the forward count, where it would read as upcoming work.
+    const overdue = db.prepare(`
+      SELECT type_id, COUNT(*) c FROM posts
+      WHERE status NOT IN ('posted', 'archived', 'skipped')
+        AND scheduled_at IS NOT NULL AND scheduled_at < ?
+      GROUP BY type_id
+    `).all(nowIso2) as Array<{ type_id: number; c: number }>;
+    const overdueByType = new Map(overdue.map(r => [r.type_id, r.c]));
+
+    res.json({
+      types: rows.map(t => ({
+        ...t,
+        queued_next_7d: byType.get(t.id) ?? 0,
+        overdue: overdueByType.get(t.id) ?? 0,
+      })),
+    });
   });
 
   router.get('/api/post-types/:id', requireAuth, (req, res) => {
@@ -488,6 +516,72 @@ export function createPostQueueRouter({ db, requireAuth }: PostQueueDeps): expre
       conflicts: findSpacingConflicts(windowPosts, minSpacing),
       settings: { min_spacing_minutes: minSpacing, lock_window_minutes: settingNum('lock_window_minutes') },
       types,
+    });
+  });
+
+  /**
+   * GET /api/posts/sections — the whole tweet page in one call.
+   *
+   * The page is four sections over one table: Generation, Drafts, Planned, Archive.
+   * They are derived from status rather than stored separately, so a post moves
+   * between sections by being approved or published, not by being copied.
+   */
+  router.get('/api/posts/sections', requireAuth, (req, res) => {
+    const days = Math.min(60, Math.max(1, Number(req.query.days) || 14));
+    const now = new Date();
+    const nowIso = now.toISOString();
+    const horizonIso = new Date(now.getTime() + days * 24 * 3_600_000).toISOString();
+    // Archive looks backwards; everything else looks forward.
+    const pastIso = new Date(now.getTime() - 30 * 24 * 3_600_000).toISOString();
+
+    const decorate = (rows: any[]) => rows.map(r => ({
+      ...r,
+      et_date: r.scheduled_at ? etDateString(new Date(r.scheduled_at)) : null,
+      locked: isLocked(r) ? 1 : 0,
+      rule: summariseCheck(ruleCheckFor(r)),
+    }));
+
+    const select = `
+      SELECT p.*, t.code AS type_code, t.name AS type_name, t.color AS type_color,
+             t.length_mode, t.cashtag_max, t.hashtag_max, t.staleness_hours
+      FROM posts p LEFT JOIN post_types t ON t.id = p.type_id
+    `;
+
+    // Drafts: written but not committed to a slot yet. Includes unscheduled.
+    const drafts = db.prepare(`${select}
+      WHERE p.status IN ('draft', 'needs_review')
+      ORDER BY p.scheduled_at IS NULL, p.scheduled_at ASC, p.id DESC
+    `).all() as any[];
+
+    // Planned: approved with a confirmed time — exactly what the publisher will send.
+    const planned = db.prepare(`${select}
+      WHERE p.status IN ('approved', 'posting')
+      ORDER BY p.scheduled_at ASC
+    `).all() as any[];
+
+    // Archive: finished, one way or another.
+    const archive = db.prepare(`${select}
+      WHERE p.status IN ('posted', 'skipped', 'failed', 'archived')
+        AND (p.scheduled_at IS NULL OR p.scheduled_at >= ?)
+      ORDER BY COALESCE(p.posted_at, p.scheduled_at) DESC
+      LIMIT 100
+    `).all(pastIso) as any[];
+
+    const types = allTypes();
+    const windowPosts = postsInWindow(nowIso, horizonIso);
+
+    res.json({
+      drafts: decorate(drafts),
+      planned: decorate(planned),
+      archive: decorate(archive),
+      emptySlots: findEmptySlots(types, windowPosts, now, days),
+      conflicts: findSpacingConflicts(windowPosts, settingNum('min_spacing_minutes')),
+      settings: {
+        min_spacing_minutes: settingNum('min_spacing_minutes'),
+        lock_window_minutes: settingNum('lock_window_minutes'),
+      },
+      types,
+      counts: { drafts: drafts.length, planned: planned.length, archive: archive.length },
     });
   });
 

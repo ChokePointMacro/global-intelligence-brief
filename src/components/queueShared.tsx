@@ -21,6 +21,7 @@ export interface QueuePost {
   locked?: number;
   error?: string | null;
   x_post_id?: string | null;
+  posted_at?: string | null;
   created_at?: string | null;
   type_code?: string | null;
   type_name?: string | null;

@@ -1,12 +1,11 @@
 import { useState, useEffect } from 'react';
-import { BrowserRouter, Routes, Route } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { Loader2 } from 'lucide-react';
 import { apiFetch } from './lib/api';
 import { Layout } from './components/Layout';
 import { Dashboard } from './components/Dashboard';
 import { Profile } from './components/Profile';
 import { Compose } from './components/Compose';
-import { Schedule } from './components/Schedule';
 import { Settings } from './components/Settings';
 import { Markets } from './components/Markets';
 import { Reports } from './components/Reports';
@@ -16,8 +15,7 @@ import { TradeFlow } from './components/TradeFlow';
 import { Connections } from './components/Connections';
 import { WeightsAndMeasures } from './components/WeightsAndMeasures';
 import { ApiSpend } from './components/ApiSpend';
-import { PostTypes } from './components/PostTypes';
-import { PostQueue } from './components/PostQueue';
+import { Tweets } from './components/Tweets';
 import type { UserData } from './types';
 
 export default function App() {
@@ -78,7 +76,6 @@ export default function App() {
           <Route path="/" element={<Dashboard />} />
           <Route path="/profile" element={<Profile user={user} onLogout={handleLogout} />} />
           <Route path="/compose" element={<Compose user={user} />} />
-          <Route path="/schedule" element={<Schedule />} />
           <Route path="/settings" element={<Settings user={user} onLogout={handleLogout} />} />
           <Route path="/markets" element={<Markets user={user} />} />
           <Route path="/reports" element={<Reports />} />
@@ -88,8 +85,12 @@ export default function App() {
           <Route path="/connections" element={<Connections />} />
           <Route path="/weights" element={<WeightsAndMeasures />} />
           <Route path="/spend" element={<ApiSpend />} />
-          <Route path="/post-types" element={<PostTypes />} />
-          <Route path="/queue" element={<PostQueue />} />
+          <Route path="/tweets" element={<Tweets />} />
+          {/* The tweet workflow used to be split across four screens. They now redirect
+              to the one page so old links and muscle memory keep working. */}
+          <Route path="/queue" element={<Navigate to="/tweets" replace />} />
+          <Route path="/post-types" element={<Navigate to="/tweets" replace />} />
+          <Route path="/schedule" element={<Navigate to="/tweets" replace />} />
         </Routes>
       </Layout>
     </BrowserRouter>
