@@ -19,7 +19,7 @@ import { log, errInfo, installProcessHandlers } from "./src/services/log.ts";
 import { aiSpend, xSpend } from "./src/services/spend.ts";
 import {
   etParts, etToUtc, etMinutesOfDay, etDateString, parseHhMm,
-  nextEtWeekdayMidnight, normaliseScheduledAt,
+  nextEtWeekdayMidnight, normaliseScheduledAt, parseSqliteUtc,
 } from "./src/services/time.ts";
 import { backupDatabase } from "./src/services/backup.ts";
 import { createAnalytics } from "./src/server/analytics.ts";
@@ -2160,19 +2160,6 @@ try {
 }
 
 let isCronRunning = false; // Lock to prevent overlapping cron executions
-
-/**
- * Parse a SQLite CURRENT_TIMESTAMP value ("YYYY-MM-DD HH:MM:SS", always UTC).
- *
- * `new Date("2026-10-01 06:00:00")` is interpreted as *local* time by JS, which on this
- * machine is 7 hours off — enough to put a once-per-day guard on the wrong side of the
- * boundary. The zone has to be stated explicitly.
- */
-function parseSqliteUtc(value: string): Date {
-  const s = String(value).trim();
-  if (/[Zz]$|[+-]\d{2}:?\d{2}$/.test(s)) return new Date(s);
-  return new Date(s.replace(' ', 'T') + 'Z');
-}
 
 // Remembers which (schedule, ET day) pairs have already logged a miss, so a report that
 // blew past its catch-up window warns once rather than every 60 seconds until midnight.

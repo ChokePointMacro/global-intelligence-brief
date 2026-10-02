@@ -209,6 +209,19 @@ export function etZoneAbbrev(instant: Date = new Date()): 'EDT' | 'EST' {
   return asIfUtc - wholeSeconds === -4 * 3_600_000 ? 'EDT' : 'EST';
 }
 
+/**
+ * Parse a SQLite CURRENT_TIMESTAMP value ("YYYY-MM-DD HH:MM:SS", always UTC).
+ *
+ * `new Date("2026-10-01 06:00:00")` is interpreted as *local* time by JS — 7 hours off
+ * on this machine, enough to put a once-per-day guard or a staleness age on the wrong
+ * side of a boundary. The zone has to be stated explicitly.
+ */
+export function parseSqliteUtc(value: string): Date {
+  const s = String(value).trim();
+  if (/[Zz]$|[+-]\d{2}:?\d{2}$/.test(s)) return new Date(s);
+  return new Date(s.replace(' ', 'T') + 'Z');
+}
+
 /** ET calendar date as "YYYY-MM-DD" — for once-per-ET-day guards. */
 export function etDateString(instant: Date = new Date()): string {
   const p = etParts(instant);

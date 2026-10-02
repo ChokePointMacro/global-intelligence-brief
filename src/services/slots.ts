@@ -10,7 +10,7 @@
  * across day boundaries: a day is 23 or 25 hours long twice a year, and "midnight plus
  * 16h20m" is the bug that produces.
  */
-import { etParts, etToUtc, etDateString, parseHhMm } from './time.ts';
+import { etParts, etToUtc, etDateString, parseHhMm, parseSqliteUtc } from './time.ts';
 import type { PostType } from './postTypes.ts';
 
 /** The subset of a post the placement logic needs. */
@@ -214,6 +214,41 @@ export function findEmptySlots(
   }
 
   return out.sort((a, b) => a.at.localeCompare(b.at));
+}
+
+/**
+ * How old a post's content is, in hours.
+ *
+ * NOTE: the build plan defines staleness against the *source event*. Events and
+ * post_sources are not populated yet, so this uses created_at as a stand-in. That
+ * answers the question that matters day to day — "was this drafted off news that has
+ * since moved on?" — but understates staleness for a post drafted long after its event.
+ * Switch to the event timestamp once sources land.
+ */
+export function ageHours(
+  post: { created_at?: string | null },
+  now: Date = new Date(),
+): number | null {
+  if (!post.created_at) return null;
+  const t = parseSqliteUtc(post.created_at).getTime();
+  if (!Number.isFinite(t)) return null;
+  return (now.getTime() - t) / 3_600_000;
+}
+
+/**
+ * Whether a post has outlived its type's staleness limit.
+ *
+ * Terminal states are never stale: a posted post cannot be refreshed, and a skipped or
+ * archived one is not going out. Flagging those would be noise on rows nobody can act on.
+ */
+export function isStale(
+  post: { created_at?: string | null; status: string; staleness_hours?: number | null },
+  now: Date = new Date(),
+): boolean {
+  if (!post.staleness_hours || post.staleness_hours <= 0) return false;
+  if (['posted', 'posting', 'archived', 'skipped'].includes(post.status)) return false;
+  const age = ageHours(post, now);
+  return age !== null && age > post.staleness_hours;
 }
 
 /**

@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   nextSlotForType, nextOpenTime, findSpacingConflicts, findEmptySlots,
-  parseDays, occupiesSlot, countForTypeOnDay, type SlotPost,
+  parseDays, occupiesSlot, countForTypeOnDay, ageHours, isStale, type SlotPost,
 } from '../src/services/slots.ts';
 import { etToUtc, etParts, etDateString } from '../src/services/time.ts';
 import type { PostType } from '../src/services/postTypes.ts';
@@ -242,6 +242,57 @@ test('empty slots come back in chronological order across types', () => {
   const iso = empty.map(e => e.at);
   assert.deepEqual([...iso].sort(), iso, 'must already be sorted');
   assert.equal(empty[0].code, 'S1', '08:45 comes before 20:00');
+});
+
+// ─── staleness ─────────────────────────────────────────────────────────────────
+
+const NOW = new Date('2026-10-01T20:00:00.000Z');
+/** SQLite CURRENT_TIMESTAMP format: "YYYY-MM-DD HH:MM:SS", always UTC. */
+const agoHours = (h: number) =>
+  new Date(NOW.getTime() - h * 3_600_000).toISOString().replace('T', ' ').slice(0, 19);
+
+test('ageHours reads SQLite timestamps as UTC, not local', () => {
+  // `new Date("2026-10-01 14:00:00")` would be parsed as LOCAL time — 7h off here,
+  // which would report a 6-hour-old post as 13 hours old and falsely flag it stale.
+  assert.equal(Math.round(ageHours({ created_at: agoHours(6) }, NOW)!), 6);
+  assert.equal(Math.round(ageHours({ created_at: agoHours(0.5) }, NOW)!), 1);
+});
+
+test('ageHours handles a missing or unparseable timestamp', () => {
+  assert.equal(ageHours({ created_at: null }, NOW), null);
+  assert.equal(ageHours({}, NOW), null);
+  assert.equal(ageHours({ created_at: 'not a date' }, NOW), null);
+});
+
+test('a post past its type limit is stale; one inside it is not', () => {
+  const base = { status: 'needs_review', staleness_hours: 6 };
+  assert.equal(isStale({ ...base, created_at: agoHours(7) }, NOW), true);
+  assert.equal(isStale({ ...base, created_at: agoHours(5) }, NOW), false);
+});
+
+test('a type with no staleness limit never goes stale', () => {
+  assert.equal(isStale({ status: 'needs_review', staleness_hours: null, created_at: agoHours(500) }, NOW), false);
+  assert.equal(isStale({ status: 'needs_review', created_at: agoHours(500) }, NOW), false);
+  assert.equal(isStale({ status: 'needs_review', staleness_hours: 0, created_at: agoHours(500) }, NOW), false);
+});
+
+test('terminal states are never flagged stale', () => {
+  // Nobody can act on these, so a warning on them is pure noise.
+  for (const status of ['posted', 'posting', 'archived', 'skipped']) {
+    assert.equal(
+      isStale({ status, staleness_hours: 1, created_at: agoHours(99) }, NOW), false,
+      `${status} should not be flagged stale`,
+    );
+  }
+});
+
+test('actionable states ARE flagged stale', () => {
+  for (const status of ['draft', 'needs_review', 'approved', 'failed']) {
+    assert.equal(
+      isStale({ status, staleness_hours: 1, created_at: agoHours(99) }, NOW), true,
+      `${status} should be flagged stale`,
+    );
+  }
 });
 
 // ─── countForTypeOnDay ─────────────────────────────────────────────────────────
