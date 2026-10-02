@@ -9,6 +9,8 @@
  * `posts` table created in Phase A.
  */
 import express from 'express';
+import fs from 'fs';
+import path from 'path';
 import type Database from 'better-sqlite3';
 import { validatePostType, type PostType } from '../services/postTypes.ts';
 import {
@@ -243,9 +245,11 @@ export function createPostQueueRouter({ db, requireAuth }: PostQueueDeps): expre
     const media = db.prepare('SELECT COUNT(*) c FROM post_media WHERE post_id = ?').get(post.id) as any;
     return checkPost(post.body ?? '', {
       type: type ?? null,
-      // Left undefined deliberately while there is no UI to attach sources — that keeps
-      // the unsourced-number rule a warning rather than an unclearable blocker.
-      sourceCount: sources.c > 0 ? sources.c : undefined,
+      // Now passed as a real count, including zero. Through Phase C this was left
+      // undefined so the unsourced-number rule could only warn — there was no way to
+      // attach a source, so enforcing it would have been an unclearable blocker. The
+      // Sources tab exists now, so for a type with source_required it becomes an error.
+      sourceCount: sources.c,
       hasMedia: media.c > 0,
     });
   };
@@ -539,6 +543,10 @@ export function createPostQueueRouter({ db, requireAuth }: PostQueueDeps): expre
       (req.session as any)?.userId ?? null,
     );
 
+    if (String(body).trim()) {
+      recordVersion(Number(info.lastInsertRowid), String(body), (req.session as any)?.userId ?? null, 'created');
+    }
+
     res.status(201).json(getPost.get(info.lastInsertRowid));
   });
 
@@ -613,6 +621,12 @@ export function createPostQueueRouter({ db, requireAuth }: PostQueueDeps): expre
       WHERE id = @id
     `).run({ ...patch, id: post.id });
 
+    // History: snapshot the text after every content change, so the History tab can
+    // show what changed and restore any earlier state.
+    if (contentChanged) {
+      recordVersion(post.id, String(patch.body ?? ''), (req.session as any)?.userId ?? null, 'edited');
+    }
+
     res.json({ ...(getPost.get(post.id) as any), returnedToReview: patch.status === 'needs_review' });
   });
 
@@ -653,6 +667,17 @@ export function createPostQueueRouter({ db, requireAuth }: PostQueueDeps): expre
 
     db.prepare('UPDATE posts SET scheduled_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
       .run(target.toISOString(), post.id);
+
+    // Thread children trail the parent by a fixed offset. If the parent moves and they
+    // don't, a "+60 min" reply lands before the post it is replying to.
+    const children = db.prepare(
+      "SELECT id, offset_minutes FROM posts WHERE parent_post_id = ? AND status NOT IN ('posted','posting')"
+    ).all(post.id) as any[];
+    for (const child of children) {
+      const childAt = new Date(target.getTime() + (child.offset_minutes ?? 0) * 60_000);
+      db.prepare('UPDATE posts SET scheduled_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+        .run(childAt.toISOString(), child.id);
+    }
 
     // A moved post keeps its approval — only content edits revoke it.
     res.json({
@@ -744,12 +769,254 @@ export function createPostQueueRouter({ db, requireAuth }: PostQueueDeps): expre
     res.json({ success: true, changed, skipped, lockedOrSent: untouched });
   });
 
+  // ─── Versions (History tab) ──────────────────────────────────────────────────
+  //
+  // Phase D's bar is "every change can be undone". A version is recorded on every body
+  // change, including the change a restore makes — so restoring is itself undoable and
+  // you can never walk into a corner.
+
+  const recordVersion = (postId: number, body: string, who: string | null, reason: string) => {
+    try {
+      db.prepare(`INSERT INTO post_versions (post_id, body, changed_by, reason) VALUES (?, ?, ?, ?)`)
+        .run(postId, body, who, reason);
+    } catch (err) {
+      // History is valuable but must never block the edit it is recording.
+      console.error('[postQueue] version write failed:', err);
+    }
+  };
+
+  router.get('/api/posts/:id/versions', requireAuth, (req, res) => {
+    const rows = db.prepare(
+      'SELECT id, body, changed_by, changed_at, reason FROM post_versions WHERE post_id = ? ORDER BY changed_at DESC, id DESC'
+    ).all(req.params.id);
+    res.json({ versions: rows });
+  });
+
+  router.post('/api/posts/:id/versions/:versionId/restore', requireAuth, (req, res) => {
+    const post = db.prepare('SELECT * FROM posts WHERE id = ?').get(req.params.id) as any;
+    if (!post) return res.status(404).json({ error: 'Post not found' });
+    if (['posting', 'posted'].includes(post.status)) {
+      return res.status(409).json({ error: `Cannot restore a ${post.status} post.` });
+    }
+
+    const version = db.prepare('SELECT * FROM post_versions WHERE id = ? AND post_id = ?')
+      .get(req.params.versionId, post.id) as any;
+    if (!version) return res.status(404).json({ error: 'Version not found for this post' });
+
+    // Snapshot where we are before overwriting it, so the restore can be undone.
+    if (post.body !== version.body) {
+      recordVersion(post.id, post.body ?? '', (req.session as any)?.userId ?? null, 'before restore');
+    }
+
+    // A restore is a content change, so an approved post goes back for review — same
+    // rule as a manual edit. Restoring text nobody re-read must not stay approved.
+    const status = post.status === 'approved' ? 'needs_review' : post.status;
+    db.prepare('UPDATE posts SET body = ?, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+      .run(version.body, status, post.id);
+    recordVersion(post.id, version.body ?? '', (req.session as any)?.userId ?? null, `restored v${version.id}`);
+
+    res.json({ ...(db.prepare('SELECT * FROM posts WHERE id = ?').get(post.id) as any), returnedToReview: status === 'needs_review' });
+  });
+
+  // ─── Sources ─────────────────────────────────────────────────────────────────
+
+  router.get('/api/posts/:id/sources', requireAuth, (req, res) => {
+    res.json({
+      sources: db.prepare('SELECT * FROM post_sources WHERE post_id = ? ORDER BY id').all(req.params.id),
+    });
+  });
+
+  router.post('/api/posts/:id/sources', requireAuth, (req, res) => {
+    const post = db.prepare('SELECT id FROM posts WHERE id = ?').get(req.params.id) as any;
+    if (!post) return res.status(404).json({ error: 'Post not found' });
+
+    const name = String(req.body?.name ?? '').trim();
+    const url = String(req.body?.url ?? '').trim();
+    if (!name && !url) return res.status(400).json({ error: 'A source needs a name or a link.' });
+    if (url && !/^https?:\/\//i.test(url)) {
+      return res.status(400).json({ error: 'Source links must start with http:// or https://' });
+    }
+
+    const info = db.prepare(
+      `INSERT INTO post_sources (post_id, name, url, pulled_at, confirmed) VALUES (?, ?, ?, ?, ?)`
+    ).run(post.id, name || url, url || null, new Date().toISOString(), req.body?.confirmed ? 1 : 0);
+
+    res.status(201).json(db.prepare('SELECT * FROM post_sources WHERE id = ?').get(info.lastInsertRowid));
+  });
+
+  router.put('/api/posts/:id/sources/:sourceId', requireAuth, (req, res) => {
+    const row = db.prepare('SELECT * FROM post_sources WHERE id = ? AND post_id = ?')
+      .get(req.params.sourceId, req.params.id) as any;
+    if (!row) return res.status(404).json({ error: 'Source not found' });
+    db.prepare('UPDATE post_sources SET confirmed = ? WHERE id = ?')
+      .run(req.body?.confirmed ? 1 : 0, row.id);
+    res.json(db.prepare('SELECT * FROM post_sources WHERE id = ?').get(row.id));
+  });
+
+  router.delete('/api/posts/:id/sources/:sourceId', requireAuth, (req, res) => {
+    db.prepare('DELETE FROM post_sources WHERE id = ? AND post_id = ?').run(req.params.sourceId, req.params.id);
+    res.json({ success: true });
+  });
+
+  // ─── Thread ──────────────────────────────────────────────────────────────────
+  //
+  // A follow-up sits at parent time + offset. The Substack link reply is the main case:
+  // the link stays out of the parent post (where it would cost 30-50% of reach) and
+  // goes one level down.
+
+  router.get('/api/posts/:id/thread', requireAuth, (req, res) => {
+    res.json({
+      children: db.prepare(`
+        SELECT p.*, t.code AS type_code, t.color AS type_color
+        FROM posts p LEFT JOIN post_types t ON t.id = p.type_id
+        WHERE p.parent_post_id = ? ORDER BY COALESCE(p.offset_minutes, 0), p.id
+      `).all(req.params.id),
+    });
+  });
+
+  router.post('/api/posts/:id/thread', requireAuth, (req, res) => {
+    const parent = db.prepare('SELECT * FROM posts WHERE id = ?').get(req.params.id) as any;
+    if (!parent) return res.status(404).json({ error: 'Parent post not found' });
+    if (parent.parent_post_id) {
+      // One level only. A reply to a reply would need the publisher to resolve a chain
+      // of X ids in order, which it does not do.
+      return res.status(400).json({ error: 'This post is already a reply. Threads are one level deep.' });
+    }
+
+    const offset = Number(req.body?.offsetMinutes);
+    if (!Number.isFinite(offset) || offset < 0) {
+      return res.status(400).json({ error: 'offsetMinutes must be 0 or more.' });
+    }
+
+    const typeId = req.body?.typeId != null
+      ? ((db.prepare('SELECT id FROM post_types WHERE id = ?').get(req.body.typeId) as any)?.id ?? null)
+      : ((db.prepare("SELECT id FROM post_types WHERE code = 'LINK'").get() as any)?.id ?? null);
+
+    // The child's time trails the parent's. It is recomputed whenever the parent moves
+    // (see the reschedule handler), so the offset stays true.
+    const at = parent.scheduled_at
+      ? new Date(new Date(parent.scheduled_at).getTime() + offset * 60_000).toISOString()
+      : null;
+
+    const info = db.prepare(`
+      INSERT INTO posts (type_id, status, body, proposed_at, scheduled_at, time_confirmed,
+                         parent_post_id, offset_minutes, user_id)
+      VALUES (?, 'draft', ?, ?, ?, 0, ?, ?, ?)
+    `).run(typeId, String(req.body?.body ?? ''), at, at, parent.id, offset, (req.session as any)?.userId ?? null);
+
+    res.status(201).json(db.prepare('SELECT * FROM posts WHERE id = ?').get(info.lastInsertRowid));
+  });
+
+  // ─── Media ───────────────────────────────────────────────────────────────────
+  //
+  // Images arrive base64-encoded in JSON rather than multipart, which avoids adding a
+  // parser dependency. The body limit is raised on THIS route only — lifting the global
+  // 100kb would widen the surface on every endpoint.
+
+  const MEDIA_DIR = path.resolve(process.env.MEDIA_DIR || 'media');
+  const MAX_IMAGE_BYTES = 5 * 1024 * 1024;   // X's own still-image ceiling
+  const ALLOWED_MIME: Record<string, string> = {
+    'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif',
+  };
+
+  const bigJson = express.json({ limit: '8mb' });
+
+  router.get('/api/posts/:id/media', requireAuth, (req, res) => {
+    res.json({ media: db.prepare('SELECT * FROM post_media WHERE post_id = ? ORDER BY id').all(req.params.id) });
+  });
+
+  router.post('/api/posts/:id/media', requireAuth, bigJson, (req, res) => {
+    const post = db.prepare('SELECT id FROM posts WHERE id = ?').get(req.params.id) as any;
+    if (!post) return res.status(404).json({ error: 'Post not found' });
+
+    const { dataUrl, altText = '', cardType = null } = req.body ?? {};
+    const m = /^data:([\w/+.-]+);base64,(.+)$/s.exec(String(dataUrl ?? ''));
+    if (!m) return res.status(400).json({ error: 'Expected an image as a base64 data URL.' });
+
+    const mime = m[1].toLowerCase();
+    const ext = ALLOWED_MIME[mime];
+    if (!ext) {
+      return res.status(400).json({ error: `Unsupported image type ${mime}. Use PNG, JPEG, WebP or GIF.` });
+    }
+
+    const buf = Buffer.from(m[2], 'base64');
+    if (!buf.length) return res.status(400).json({ error: 'The image decoded to nothing.' });
+    if (buf.length > MAX_IMAGE_BYTES) {
+      return res.status(413).json({ error: `Image is ${(buf.length / 1024 / 1024).toFixed(1)}MB; X's limit is 5MB.` });
+    }
+
+    // Alt text is required: X surfaces it to screen readers, and a chart with no
+    // description is unreadable to anyone using one.
+    const alt = String(altText).trim();
+    if (!alt) return res.status(400).json({ error: 'Alt text is required.' });
+
+    fs.mkdirSync(MEDIA_DIR, { recursive: true });
+    // Filename is derived, never taken from the client — no path traversal surface.
+    const filename = `post-${post.id}-${Date.now()}.${ext}`;
+    fs.writeFileSync(path.join(MEDIA_DIR, filename), buf);
+
+    // One image per post for now; replacing removes the previous file.
+    const existing = db.prepare('SELECT * FROM post_media WHERE post_id = ?').all(post.id) as any[];
+    for (const old of existing) {
+      try { if (old.file_path) fs.unlinkSync(path.join(MEDIA_DIR, path.basename(old.file_path))); } catch { /* already gone */ }
+      db.prepare('DELETE FROM post_media WHERE id = ?').run(old.id);
+    }
+
+    const info = db.prepare(
+      `INSERT INTO post_media (post_id, card_type, file_path, alt_text) VALUES (?, ?, ?, ?)`
+    ).run(post.id, cardType, filename, alt);
+
+    res.status(201).json(db.prepare('SELECT * FROM post_media WHERE id = ?').get(info.lastInsertRowid));
+  });
+
+  router.put('/api/posts/:id/media/:mediaId', requireAuth, (req, res) => {
+    const row = db.prepare('SELECT * FROM post_media WHERE id = ? AND post_id = ?')
+      .get(req.params.mediaId, req.params.id) as any;
+    if (!row) return res.status(404).json({ error: 'Image not found' });
+    const alt = String(req.body?.altText ?? '').trim();
+    if (!alt) return res.status(400).json({ error: 'Alt text is required.' });
+    db.prepare('UPDATE post_media SET alt_text = ? WHERE id = ?').run(alt, row.id);
+    res.json(db.prepare('SELECT * FROM post_media WHERE id = ?').get(row.id));
+  });
+
+  router.delete('/api/posts/:id/media/:mediaId', requireAuth, (req, res) => {
+    const row = db.prepare('SELECT * FROM post_media WHERE id = ? AND post_id = ?')
+      .get(req.params.mediaId, req.params.id) as any;
+    if (!row) return res.status(404).json({ error: 'Image not found' });
+    try { if (row.file_path) fs.unlinkSync(path.join(MEDIA_DIR, path.basename(row.file_path))); } catch { /* already gone */ }
+    db.prepare('DELETE FROM post_media WHERE id = ?').run(row.id);
+    res.json({ success: true });
+  });
+
+  /** Serve a stored image for the preview. basename() keeps this inside MEDIA_DIR. */
+  router.get('/api/media/:mediaId/file', requireAuth, (req, res) => {
+    const row = db.prepare('SELECT * FROM post_media WHERE id = ?').get(req.params.mediaId) as any;
+    if (!row?.file_path) return res.status(404).json({ error: 'Not found' });
+    const full = path.join(MEDIA_DIR, path.basename(row.file_path));
+    if (!fs.existsSync(full)) return res.status(404).json({ error: 'File missing from disk' });
+    res.sendFile(full);
+  });
+
   router.delete('/api/posts/:id', requireAuth, (req, res) => {
     const post = getPost.get(req.params.id) as any;
     if (!post) return res.status(404).json({ error: 'Post not found' });
     if (post.status === 'posting') return res.status(409).json({ error: 'That post is being sent right now.' });
+
+    // Unlink the image files BEFORE the row goes. post_media cascades on delete, so
+    // once the post is gone there is no record of which file belonged to it and the
+    // upload sits orphaned on disk forever.
+    const media = db.prepare('SELECT file_path FROM post_media WHERE post_id = ?').all(post.id) as any[];
+    for (const m of media) {
+      if (!m.file_path) continue;
+      try { fs.unlinkSync(path.join(MEDIA_DIR, path.basename(m.file_path))); } catch { /* already gone */ }
+    }
+
+    // Detach thread children rather than letting them dangle against a missing parent.
+    // Deleting them too would silently remove a second post the operator did not pick.
+    db.prepare('UPDATE posts SET parent_post_id = NULL, offset_minutes = NULL WHERE parent_post_id = ?').run(post.id);
+
     db.prepare('DELETE FROM posts WHERE id = ?').run(post.id);
-    res.json({ success: true });
+    res.json({ success: true, mediaRemoved: media.length });
   });
 
   return router;

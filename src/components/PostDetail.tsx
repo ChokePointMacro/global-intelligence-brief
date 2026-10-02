@@ -1,13 +1,12 @@
 /**
- * Detail panel — Phase C.
+ * Detail panel — Phases C and D.
  *
- * Opens on the right when a post is clicked. Three tabs are in scope for this phase:
- * Content, Schedule and Attributes. Media, Sources, Thread and History are Phase D and
- * appear as disabled tabs rather than being hidden, so the shape of the thing is
- * visible and nobody wonders where they went.
+ * Opens on the right when a post is clicked. Content, Schedule and Attributes live
+ * here; Media, Sources, Thread and History are in PostDetailTabs.tsx, split out to keep
+ * each file readable.
  *
- * The goal is the phase's own bar: edit and approve a post in under a minute without
- * leaving the screen.
+ * The bar it has to clear: edit and approve a post in under a minute without leaving
+ * the screen, and undo any change afterwards.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
@@ -21,17 +20,18 @@ import { FOLD } from '../services/ruleCheck';
 import type { RuleCheckResult, RuleFinding } from '../services/ruleCheck';
 import type { PostType } from '../services/postTypes';
 import { STATUS_STYLE, STATUS_LABEL, labelCls, btn, type QueuePost } from './queueShared';
+import { MediaTab, SourcesTab, ThreadTab, HistoryTab } from './PostDetailTabs';
 
 type Tab = 'content' | 'schedule' | 'attributes' | 'media' | 'sources' | 'thread' | 'history';
 
-const TABS: Array<{ id: Tab; label: string; phase?: string }> = [
+const TABS: Array<{ id: Tab; label: string }> = [
   { id: 'content',    label: 'Content' },
   { id: 'schedule',   label: 'Schedule' },
   { id: 'attributes', label: 'Attributes' },
-  { id: 'media',      label: 'Media',   phase: 'D' },
-  { id: 'sources',    label: 'Sources', phase: 'D' },
-  { id: 'thread',     label: 'Thread',  phase: 'D' },
-  { id: 'history',    label: 'History', phase: 'D' },
+  { id: 'media',      label: 'Media' },
+  { id: 'sources',    label: 'Sources' },
+  { id: 'thread',     label: 'Thread' },
+  { id: 'history',    label: 'History' },
 ];
 
 export function PostDetail({
@@ -133,11 +133,9 @@ export function PostDetail({
       {/* Tabs */}
       <div className="flex border-b border-btc-orange/15 overflow-x-auto">
         {TABS.map(t => (
-          <button key={t.id} disabled={!!t.phase} onClick={() => setTab(t.id)}
-                  title={t.phase ? `Phase ${t.phase}` : undefined}
+          <button key={t.id} onClick={() => setTab(t.id)}
                   className={cn('px-2.5 py-1.5 text-[10px] font-mono uppercase tracking-wider whitespace-nowrap transition-colors',
-                    tab === t.id ? 'text-btc-orange border-b border-btc-orange'
-                                 : t.phase ? 'text-gray-700 cursor-not-allowed' : 'text-gray-500 hover:text-btc-orange')}>
+                    tab === t.id ? 'text-btc-orange border-b border-btc-orange' : 'text-gray-500 hover:text-btc-orange')}>
             {t.label}
           </button>
         ))}
@@ -263,10 +261,23 @@ export function PostDetail({
             </div>
 
             <p className="text-[10px] text-gray-600 border border-btc-orange/10 px-2 py-1.5">
-              Event scoring and the 48-hour traded-ticker check need the event and
-              positions data that lands with Sources in Phase D.
+              Event scoring and the 48-hour traded-ticker check still need event and
+              positions data, which nothing populates yet.
             </p>
           </div>
+        )}
+
+        {tab === 'media' && (
+          <MediaTab postId={post.id} disabled={locked || terminal} onChanged={onChanged} />
+        )}
+        {tab === 'sources' && (
+          <SourcesTab postId={post.id} disabled={terminal} onChanged={onChanged} />
+        )}
+        {tab === 'thread' && (
+          <ThreadTab postId={post.id} isReply={!!post.parent_post_id} disabled={terminal} onChanged={onChanged} />
+        )}
+        {tab === 'history' && (
+          <HistoryTab postId={post.id} currentBody={post.body ?? ''} disabled={terminal} onChanged={onChanged} />
         )}
       </div>
 

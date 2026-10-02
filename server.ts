@@ -2300,10 +2300,53 @@ setInterval(async () => {
           continue;
         }
 
+        // A thread reply must not go out before the post it replies to. If the parent
+        // has not published yet, release the claim and try again next tick — the
+        // lateness guard eventually skips it if the parent never lands.
+        if (post.parent_post_id) {
+          const parent = db.prepare('SELECT status, x_post_id FROM posts WHERE id = ?').get(post.parent_post_id) as any;
+          if (!parent?.x_post_id) {
+            db.prepare("UPDATE posts SET status='approved', claimed_at=NULL WHERE id=?").run(post.id);
+            log.warn('reply_waiting_for_parent', { id: post.id, parent: post.parent_post_id, parentStatus: parent?.status ?? 'missing' });
+            continue;
+          }
+        }
+
         try {
           const accessToken = await refreshXToken(tokenRecord);
           const client = new TwitterApi(accessToken);
-          const posted = await client.v2.tweet(post.body);
+
+          // Attach the image if one is stored. Upload goes through v1.1 — v2 has no
+          // upload endpoint of its own and simply takes the resulting media id.
+          const mediaIds: string[] = [];
+          const mediaRows = db.prepare('SELECT * FROM post_media WHERE post_id = ? ORDER BY id LIMIT 4').all(post.id) as any[];
+          for (const m of mediaRows) {
+            if (!m.file_path) continue;
+            const full = path.join(path.resolve(process.env.MEDIA_DIR || 'media'), path.basename(m.file_path));
+            if (!fs.existsSync(full)) { log.warn('media_file_missing', { id: post.id, file: m.file_path }); continue; }
+            try {
+              const mediaId = await client.v1.uploadMedia(full);
+              // Alt text is a separate call. A chart with no description is unreadable
+              // to anyone on a screen reader.
+              if (m.alt_text) {
+                await client.v1.createMediaMetadata(mediaId, { alt_text: { text: String(m.alt_text).slice(0, 1000) } });
+              }
+              mediaIds.push(mediaId);
+            } catch (mediaErr) {
+              // Publishing text-only beats not publishing, but it must not be silent.
+              log.error('media_upload_failed', { id: post.id, ...errInfo(mediaErr) });
+            }
+          }
+
+          const parentXId = post.parent_post_id
+            ? (db.prepare('SELECT x_post_id FROM posts WHERE id = ?').get(post.parent_post_id) as any)?.x_post_id
+            : null;
+
+          const payload: any = { text: post.body };
+          if (mediaIds.length) payload.media = { media_ids: mediaIds.slice(0, 4) };
+          if (parentXId) payload.reply = { in_reply_to_tweet_id: parentXId };
+
+          const posted = await client.v2.tweet(payload);
           db.prepare(
             "UPDATE posts SET status='posted', x_post_id=?, posted_at=CURRENT_TIMESTAMP, error=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?"
           ).run(posted.data.id, post.id);

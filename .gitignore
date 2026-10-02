@@ -14,6 +14,9 @@ sessions/
 # committed: the database contains live X OAuth access and refresh tokens.
 backups/
 
+# uploaded post images (post_media.file_path)
+media/
+
 # runtime logs (structured JSONL from src/services/log.ts)
 logs/
 *.jsonl

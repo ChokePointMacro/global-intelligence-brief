@@ -28,6 +28,8 @@ export interface QueuePost {
   length_mode?: string | null;
   staleness_hours?: number | null;
   notes?: string | null;
+  parent_post_id?: number | null;
+  offset_minutes?: number | null;
   et_date?: string;
   /** Rule-check summary computed server-side, so the card and the gate never disagree. */
   rule?: { ok: boolean; errors: number; warnings: number; weightedLength: number; first: string | null };
