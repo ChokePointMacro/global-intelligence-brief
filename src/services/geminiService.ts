@@ -1101,6 +1101,8 @@ export interface SlotContext {
   typeName: string;
   typeCode: string;
   lengthMode: 'short' | 'long';
+  /** reuse an existing headline post, synthesise across stories, or neither. */
+  generationMode: 'reuse' | 'synthesise' | 'manual';
   /** 0 means the type forbids cashtags, which is the shipped default. */
   cashtagMax: number;
   hashtagMax: number;
@@ -1152,19 +1154,44 @@ export async function generateSlotPost(
   // The report already sorted by trendScore, but do not rely on upstream ordering.
   const ranked = [...available].sort((a, b) => (b.trendScore ?? 0) - (a.trendScore ?? 0));
 
+  const limit = ctx.lengthMode === 'long' ? 2500 : 280;
+
   // ── Path 1: reuse ──
-  // A short, single-story slot is exactly what socialPost already is.
-  const isSingleStory = ctx.lengthMode === 'short';
-  if (isSingleStory) {
+  // One story, already written by the report generator.
+  if (ctx.generationMode === 'reuse') {
     const pick = ranked.find(h => (h.socialPost || '').trim());
-    if (pick) {
-      // socialPostWithTags carries the hashtag pass; fall back to the bare post.
-      const text = (pick.socialPostWithTags || pick.socialPost).trim();
-      return { text, sourceUrl: pick.url, eventId: headlineId(pick), reused: true };
+    if (!pick) throw new Error('No headline in the latest report has usable post text.');
+
+    // Start from the BARE socialPost, not socialPostWithTags. The hashtag pass applied
+    // the report's own tag budget, which is not this type's — S1 allows one tag and the
+    // pass routinely adds two, so the tagged variant arrives already failing the rules.
+    let text = (pick.socialPost || '').trim();
+
+    // The engine deliberately writes to the fold, not to a cap: this report's posts run
+    // 623–903 characters. A type set to 280 cannot take that verbatim, so condense it.
+    // Condensing the engine's own prose keeps its judgement and voice; re-reporting the
+    // story from scratch would throw that away.
+    if (text.length > limit) {
+      const condensePrompt = `Condense this X post to ${limit} characters or fewer.
+
+Keep the hardest number, the named entities and the causal point. Cut setup, restatement
+and anything that is not load-bearing. Do not add new facts. Do not add hashtags, cashtags,
+URLs or emoji. Return ONLY the shortened post.
+
+POST:
+${text}`;
+      const condensed = await generateTextWithFallback(condensePrompt, ['claude', 'gpt'], 1000, `slot_condense_${ctx.typeCode}`);
+      const out = condensed.content.trim().replace(/^["'`]|["'`]$/g, '');
+      if (out && out.length <= limit) text = out;
+      else text = text.slice(0, limit).replace(/\s+\S*$/, '');   // last resort: clean cut
     }
+
+    return { text, sourceUrl: pick.url, eventId: headlineId(pick), reused: true };
   }
 
   // ── Path 2: synthesise ──
+  // Several stories digested under this type's own instruction. No equivalent exists in
+  // the report, so this is the path that costs an AI call.
   const top = ranked.slice(0, 8);
   const context = top.map((h, i) =>
     `[${i + 1}] ${h.title}\n    score=${h.trendScore ?? 'n/a'} category=${h.category ?? 'n/a'}\n    ${(h.summary || '').slice(0, 400)}`
@@ -1175,8 +1202,8 @@ export async function generateSlotPost(
     : `At most ${ctx.cashtagMax} $ticker cashtags.`;
 
   const lengthRule = ctx.lengthMode === 'long'
-    ? 'This is a long-form segment. Going past the fold is expected, but only for substance that earns it.'
-    : 'Keep the whole post inside ~280 characters. This segment does not run long.';
+    ? `This is a long-form segment. Going past the fold is expected, but only for substance that earns it. HARD LIMIT: ${limit} characters.`
+    : `HARD LIMIT: ${limit} characters for the entire post. This segment does not run long — the whole thing sits above the fold.`;
 
   const prompt = `You are writing ONE X post for a recurring segment on the ChokePoint Macro account.
 
@@ -1200,7 +1227,12 @@ STORIES
 Return ONLY the post text. No JSON, no preamble, no quotes around it.`;
 
   const res = await generateTextWithFallback(prompt, ['claude', 'gpt'], 2000, `slot_${ctx.typeCode}`);
-  const text = res.content.trim().replace(/^["'`]|["'`]$/g, '');
+  let text = res.content.trim().replace(/^["'`]|["'`]$/g, '');
+
+  // Models overshoot a stated limit often enough that it cannot be left to the prompt.
+  // Trim on a word boundary rather than mid-word; the rule checker is the backstop.
+  if (text.length > limit) text = text.slice(0, limit).replace(/\s+\S*$/, '');
+
   const primary = top[0];
   return { text, sourceUrl: primary?.url, eventId: primary ? headlineId(primary) : undefined, reused: false };
 }

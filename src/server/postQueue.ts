@@ -30,7 +30,7 @@ export interface PostQueueDeps {
 const WRITABLE = [
   'name', 'code', 'color', 'default_time_et', 'days_of_week', 'max_per_day',
   'prompt_template', 'card_type', 'cashtag_min', 'cashtag_max', 'hashtag_max',
-  'length_mode', 'source_required', 'staleness_hours', 'active', 'sort_order',
+  'length_mode', 'generation_mode', 'source_required', 'staleness_hours', 'active', 'sort_order',
 ] as const;
 
 /**
@@ -49,6 +49,7 @@ function coerce(body: any): Partial<PostType> {
   if (body.prompt_template != null) out.prompt_template = String(body.prompt_template);
   if (body.card_type != null) out.card_type = String(body.card_type);
   if (body.length_mode != null) out.length_mode = String(body.length_mode);
+  if (body.generation_mode != null) out.generation_mode = String(body.generation_mode) as any;
   if (body.days_of_week != null) out.days_of_week = String(body.days_of_week).trim();
 
   if (body.default_time_et !== undefined) {
@@ -169,6 +170,7 @@ export function createPostQueueRouter({ db, requireAuth }: PostQueueDeps): expre
       cashtag_max: input.cashtag_max ?? 0,
       hashtag_max: input.hashtag_max ?? 1,
       length_mode: input.length_mode ?? 'short',
+      generation_mode: input.generation_mode ?? 'reuse',
       source_required: input.source_required ?? 1,
       staleness_hours: input.staleness_hours ?? null,
       active: input.active ?? 1,
@@ -700,6 +702,7 @@ export function createPostQueueRouter({ db, requireAuth }: PostQueueDeps): expre
           typeName: type.name,
           typeCode: type.code,
           lengthMode: type.length_mode === 'long' ? 'long' : 'short',
+          generationMode: (type as any).generation_mode ?? 'reuse',
           cashtagMax: type.cashtag_max,
           hashtagMax: type.hashtag_max,
           headlines,

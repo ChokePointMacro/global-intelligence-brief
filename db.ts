@@ -240,6 +240,8 @@ db.exec(`
     cashtag_max     INTEGER DEFAULT 0,
     hashtag_max     INTEGER DEFAULT 1,
     length_mode     TEXT DEFAULT 'short',      -- 'short' (280) | 'long' (Premium long-form)
+    -- reuse an existing headline post | synthesise across stories | manual
+    generation_mode TEXT DEFAULT 'reuse',
     source_required INTEGER DEFAULT 1,
     staleness_hours INTEGER,                   -- NULL = never goes stale
     active          INTEGER DEFAULT 1,
@@ -350,10 +352,10 @@ try {
   const insert = db.prepare(`
     INSERT INTO post_types (name, code, color, default_time_et, days_of_week, max_per_day,
                             prompt_template, card_type, cashtag_min, cashtag_max, hashtag_max,
-                            length_mode, source_required, staleness_hours, active, sort_order)
+                            length_mode, generation_mode, source_required, staleness_hours, active, sort_order)
     VALUES (@name, @code, @color, @default_time_et, @days_of_week, @max_per_day,
             @prompt_template, @card_type, @cashtag_min, @cashtag_max, @hashtag_max,
-            @length_mode, @source_required, @staleness_hours, @active, @sort_order)
+            @length_mode, @generation_mode, @source_required, @staleness_hours, @active, @sort_order)
   `);
 
   // Only seed into a table that has never been populated. Once there is any row, the
@@ -419,6 +421,23 @@ try {
   }
 } catch (err) {
   console.error("posts migration error:", err);
+}
+
+// Migration: generation_mode on post_types.
+//
+// Path selection used to be inferred from length_mode, which was wrong — the Morning
+// Brief is SHORT and a SYNTHESIS, so it grabbed a raw headline and ignored its prompt
+// template entirely. How a slot gets its text is its own property.
+try {
+  const cols = db.prepare("PRAGMA table_info(post_types)").all() as any[];
+  if (!cols.some(c => c.name === 'generation_mode')) {
+    db.exec("ALTER TABLE post_types ADD COLUMN generation_mode TEXT DEFAULT 'reuse'");
+    const set = db.prepare("UPDATE post_types SET generation_mode = ? WHERE code = ?");
+    for (const t of SEED_POST_TYPES) set.run(t.generation_mode, t.code);
+    console.log("Migrated post_types: added generation_mode and backfilled from the seed");
+  }
+} catch (err) {
+  console.error("post_types generation_mode migration error:", err);
 }
 
 // Migration: add platform column to pending_auth if missing

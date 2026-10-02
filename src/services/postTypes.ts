@@ -14,6 +14,20 @@ import { parseHhMm } from './time.ts';
 /** 280-char post vs. an X Premium long-form post. */
 export type LengthMode = 'short' | 'long';
 
+/**
+ * How a slot gets its text.
+ *
+ *   reuse      — a single story. The report generator already wrote a post for every
+ *                headline, so take the best unused one. No AI call.
+ *   synthesise — digests several stories under this type's own instruction. There is
+ *                no equivalent in the report, so it costs one AI call.
+ *   manual     — no generation; Mike writes it.
+ *
+ * This was previously inferred from length_mode, which was wrong: the Morning Brief is
+ * SHORT and a SYNTHESIS, so it silently grabbed a raw headline and ignored its prompt.
+ */
+export type GenerationMode = 'reuse' | 'synthesise' | 'manual';
+
 export type CardType =
   | 'market_chart'
   | 'chokepoint_map'
@@ -53,6 +67,7 @@ export interface PostType {
   cashtag_max: number;
   hashtag_max: number;
   length_mode: LengthMode;
+  generation_mode: GenerationMode;
   /** 1 = the rule checker fails any post of this type with no source. */
   source_required: number;
   /** Warn when the underlying event is older than this. null = never stale. */
@@ -79,7 +94,7 @@ export const SEED_POST_TYPES: PostTypeSeed[] = [
     name: 'Morning Market Brief', code: 'S1', color: '#f7931a',
     default_time_et: '08:45', days_of_week: '1,2,3,4,5', max_per_day: 1,
     card_type: 'market_chart', ...NO_CASHTAGS, hashtag_max: 1,
-    length_mode: 'short', source_required: 1, staleness_hours: 12,
+    length_mode: 'short', generation_mode: 'synthesise', source_required: 1, staleness_hours: 12,
     active: 1, sort_order: 10,
     prompt_template:
       'Overnight moves, then three "what matters today" lines, then the catalysts to watch. ' +
@@ -91,7 +106,7 @@ export const SEED_POST_TYPES: PostTypeSeed[] = [
     // lower bound is the default; "next open time" placement lands it inside the window.
     default_time_et: '09:30', days_of_week: '1,2,3,4,5', max_per_day: 2,
     card_type: 'chokepoint_map', ...NO_CASHTAGS, hashtag_max: 1,
-    length_mode: 'short', source_required: 1, staleness_hours: 3,
+    length_mode: 'short', generation_mode: 'reuse', source_required: 1, staleness_hours: 3,
     active: 1, sort_order: 20,
     prompt_template:
       'Event-driven. Only fires for events scoring 10+. What happened, which chokepoint it ' +
@@ -101,7 +116,7 @@ export const SEED_POST_TYPES: PostTypeSeed[] = [
     name: 'Close Analysis', code: 'S3', color: '#8b5cf6',
     default_time_et: '16:20', days_of_week: '1,2,3,4,5', max_per_day: 1,
     card_type: 'market_chart', ...NO_CASHTAGS, hashtag_max: 1,
-    length_mode: 'long', source_required: 1, staleness_hours: 24,
+    length_mode: 'long', generation_mode: 'synthesise', source_required: 1, staleness_hours: 24,
     active: 1, sort_order: 30,
     prompt_template:
       'Premium long post, 1,200–2,500 characters: thesis, mechanism, winners and losers, ' +
@@ -111,7 +126,7 @@ export const SEED_POST_TYPES: PostTypeSeed[] = [
     name: 'Headline A', code: 'S4', color: '#0ea5e9',
     default_time_et: '17:30', days_of_week: '0,1,2,3,4,5,6', max_per_day: 1,
     card_type: 'headline', ...NO_CASHTAGS, hashtag_max: 1,
-    length_mode: 'short', source_required: 1, staleness_hours: 6,
+    length_mode: 'short', generation_mode: 'reuse', source_required: 1, staleness_hours: 6,
     active: 1, sort_order: 40,
     prompt_template: 'What happened, why it matters, the market angle. Tightest framing of the day\'s best unposted event.',
   },
@@ -119,7 +134,7 @@ export const SEED_POST_TYPES: PostTypeSeed[] = [
     name: 'Headline B (Asia open)', code: 'S5', color: '#14b8a6',
     default_time_et: '20:00', days_of_week: '0,1,2,3,4,5,6', max_per_day: 1,
     card_type: 'headline', ...NO_CASHTAGS, hashtag_max: 1,
-    length_mode: 'short', source_required: 1, staleness_hours: 6,
+    length_mode: 'short', generation_mode: 'reuse', source_required: 1, staleness_hours: 6,
     active: 1, sort_order: 50,
     prompt_template: 'The day\'s second-best unposted event, framed for the Asia open. What Asian desks will react to.',
   },
@@ -127,7 +142,7 @@ export const SEED_POST_TYPES: PostTypeSeed[] = [
     name: 'Friday Cat + Companion', code: 'FRI', color: '#eab308',
     default_time_et: '18:00', days_of_week: '5', max_per_day: 1,
     card_type: 'photo', ...NO_CASHTAGS, hashtag_max: 0,
-    length_mode: 'short', source_required: 0, staleness_hours: null,
+    length_mode: 'short', generation_mode: 'manual', source_required: 0, staleness_hours: null,
     active: 1, sort_order: 60,
     prompt_template: 'Friday cat post plus its companion piece. Two linked posts; light register, still on-brand.',
   },
@@ -135,7 +150,7 @@ export const SEED_POST_TYPES: PostTypeSeed[] = [
     name: 'Sunday Week Ahead', code: 'SUN', color: '#a855f7',
     default_time_et: '18:00', days_of_week: '0', max_per_day: 1,
     card_type: 'longform_cover', ...NO_CASHTAGS, hashtag_max: 1,
-    length_mode: 'long', source_required: 1, staleness_hours: null,
+    length_mode: 'long', generation_mode: 'synthesise', source_required: 1, staleness_hours: null,
     active: 1, sort_order: 70,
     prompt_template: 'Week Ahead long post: the calendar, the two or three things that actually matter, and why. Pin after posting.',
   },
@@ -144,7 +159,7 @@ export const SEED_POST_TYPES: PostTypeSeed[] = [
     // No slot of its own: it is a reply, placed at parent time + offset_minutes.
     default_time_et: null, days_of_week: '', max_per_day: 1,
     card_type: 'none', ...NO_CASHTAGS, hashtag_max: 0,
-    length_mode: 'short', source_required: 0, staleness_hours: null,
+    length_mode: 'short', generation_mode: 'manual', source_required: 0, staleness_hours: null,
     active: 1, sort_order: 80,
     prompt_template: 'Substack link as a reply to the parent post. Mike sends this one himself.',
   },
@@ -152,7 +167,7 @@ export const SEED_POST_TYPES: PostTypeSeed[] = [
     name: 'Manual / ad hoc', code: 'MAN', color: '#6b7280',
     default_time_et: null, days_of_week: '', max_per_day: null,
     card_type: 'none', ...NO_CASHTAGS, hashtag_max: 1,
-    length_mode: 'short', source_required: 0, staleness_hours: null,
+    length_mode: 'short', generation_mode: 'manual', source_required: 0, staleness_hours: null,
     active: 1, sort_order: 90,
     prompt_template: '',
   },

@@ -11,7 +11,7 @@ const type = (over: Partial<PostType> = {}): PostType => ({
   id: 1, name: 'Close Analysis', code: 'S3', color: '#8b5cf6',
   default_time_et: '16:20', days_of_week: '1,2,3,4,5', max_per_day: 1,
   prompt_template: '', card_type: 'market_chart', cashtag_min: 0, cashtag_max: 0,
-  hashtag_max: 1, length_mode: 'short', source_required: 1, staleness_hours: null,
+  hashtag_max: 1, length_mode: 'short', generation_mode: 'reuse', source_required: 1, staleness_hours: null,
   active: 1, sort_order: 10, ...over,
 });
 

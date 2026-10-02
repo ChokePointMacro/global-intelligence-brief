@@ -7,7 +7,7 @@ const type = (over: Partial<PostType> = {}): PostType => ({
   id: 1, name: 'Headline A', code: 'S4', color: '#0ea5e9',
   default_time_et: '17:30', days_of_week: '0,1,2,3,4,5,6', max_per_day: 1,
   prompt_template: '', card_type: 'headline', cashtag_min: 0, cashtag_max: 0,
-  hashtag_max: 1, length_mode: 'short', source_required: 1, staleness_hours: 6,
+  hashtag_max: 1, length_mode: 'short', generation_mode: 'reuse', source_required: 1, staleness_hours: 6,
   active: 1, sort_order: 10, ...over,
 });
 
