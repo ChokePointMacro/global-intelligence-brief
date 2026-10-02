@@ -16,6 +16,7 @@ import {
   countForTypeOnDay, occupiesSlot, type SlotPost,
 } from '../services/slots.ts';
 import { etDateString, normaliseScheduledAt } from '../services/time.ts';
+import { checkPost, type RuleCheckResult } from '../services/ruleCheck.ts';
 
 export interface PostQueueDeps {
   db: Database.Database;
@@ -229,6 +230,51 @@ export function createPostQueueRouter({ db, requireAuth }: PostQueueDeps): expre
   // never send anything at all. These are the minimum to make the gate operable (and
   // to run the [VERIFY] test post).
 
+  /**
+   * Run the rule checker against a stored post, pulling its type and attached sources.
+   * Used by both the approve gate and the read endpoints, so the UI can never show a
+   * verdict that differs from the one approval will actually apply.
+   */
+  const ruleCheckFor = (post: any): RuleCheckResult => {
+    const type = post.type_id
+      ? (db.prepare('SELECT * FROM post_types WHERE id = ?').get(post.type_id) as PostType | undefined)
+      : null;
+    const sources = db.prepare('SELECT COUNT(*) c FROM post_sources WHERE post_id = ?').get(post.id) as any;
+    const media = db.prepare('SELECT COUNT(*) c FROM post_media WHERE post_id = ?').get(post.id) as any;
+    return checkPost(post.body ?? '', {
+      type: type ?? null,
+      // Left undefined deliberately while there is no UI to attach sources — that keeps
+      // the unsourced-number rule a warning rather than an unclearable blocker.
+      sourceCount: sources.c > 0 ? sources.c : undefined,
+      hasMedia: media.c > 0,
+    });
+  };
+
+  /** Trimmed shape for list rendering — the card only needs the verdict and counts. */
+  const summariseCheck = (c: RuleCheckResult) => ({
+    ok: c.ok,
+    errors: c.errors.length,
+    warnings: c.warnings.length,
+    weightedLength: c.weightedLength,
+    // First error is what the card shows on hover; the panel lists them all.
+    first: c.errors[0]?.message ?? c.warnings[0]?.message ?? null,
+  });
+
+  router.get('/api/posts/:id/rule-check', requireAuth, (req, res) => {
+    const post = db.prepare('SELECT * FROM posts WHERE id = ?').get(req.params.id) as any;
+    if (!post) return res.status(404).json({ error: 'Post not found' });
+    res.json(ruleCheckFor(post));
+  });
+
+  /** Check arbitrary text against a type — for the live check while editing. */
+  router.post('/api/rule-check', requireAuth, (req, res) => {
+    const { body = '', typeId } = req.body ?? {};
+    const type = typeId != null
+      ? (db.prepare('SELECT * FROM post_types WHERE id = ?').get(typeId) as PostType | undefined)
+      : null;
+    res.json(checkPost(String(body), { type: type ?? null }));
+  });
+
   router.post('/api/posts/:id/approve', requireAuth, (req, res) => {
     const post = db.prepare('SELECT * FROM posts WHERE id = ?').get(req.params.id) as any;
     if (!post) return res.status(404).json({ error: 'Post not found' });
@@ -238,6 +284,17 @@ export function createPostQueueRouter({ db, requireAuth }: PostQueueDeps): expre
     }
     if (!post.body?.trim()) {
       return res.status(400).json({ error: 'Cannot approve an empty post.' });
+    }
+
+    // The rule checker is enforced HERE, not only in the UI. A check that runs only in
+    // the browser is advice; approval is the last gate before a public, billable,
+    // irreversible action, so it has to hold server-side too.
+    const check = ruleCheckFor(post);
+    if (!check.ok) {
+      return res.status(422).json({
+        error: `Rule check failed: ${check.errors.map(e => e.message).join(' ')}`,
+        ruleCheck: check,
+      });
     }
     // Approving without a settled time would hand the publisher a slot Mike never
     // agreed to. Allow the caller to confirm the time in the same call.
@@ -411,11 +468,18 @@ export function createPostQueueRouter({ db, requireAuth }: PostQueueDeps): expre
     const windowPosts = postsInWindow(fromIso, toIso);
 
     res.json({
-      // Scheduled posts carry an ET day so the client groups without re-deriving it.
+      // Scheduled posts carry an ET day so the client groups without re-deriving it,
+      // and a rule-check summary so each card can show pass/warn/fail without a
+      // round trip per post.
       scheduled: filtered
         .filter(r => r.scheduled_at)
-        .map(r => ({ ...r, et_date: etDateString(new Date(r.scheduled_at)), locked: isLocked(r) ? 1 : 0 })),
-      unscheduled: filtered.filter(r => !r.scheduled_at),
+        .map(r => ({
+          ...r,
+          et_date: etDateString(new Date(r.scheduled_at)),
+          locked: isLocked(r) ? 1 : 0,
+          rule: summariseCheck(ruleCheckFor(r)),
+        })),
+      unscheduled: filtered.filter(r => !r.scheduled_at).map(r => ({ ...r, rule: summariseCheck(ruleCheckFor(r)) })),
       emptySlots: findEmptySlots(types, windowPosts, from, days),
       conflicts: findSpacingConflicts(windowPosts, minSpacing),
       settings: { min_spacing_minutes: minSpacing, lock_window_minutes: settingNum('lock_window_minutes') },
@@ -647,6 +711,10 @@ export function createPostQueueRouter({ db, requireAuth }: PostQueueDeps): expre
         if (action === 'approve') {
           if (!post.body?.trim()) { skipped.push({ id: post.id, reason: 'empty body' }); continue; }
           if (!post.scheduled_at) { skipped.push({ id: post.id, reason: 'no scheduled time' }); continue; }
+          // Bulk approve goes through the same gate as the single one. A multi-select
+          // must not be a way to wave posts past the rule checker.
+          const check = ruleCheckFor(post);
+          if (!check.ok) { skipped.push({ id: post.id, reason: check.errors[0].code }); continue; }
           db.prepare("UPDATE posts SET status='approved', time_confirmed=1, error=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?").run(post.id);
         } else if (action === 'skip') {
           db.prepare("UPDATE posts SET status='skipped', error='skipped by hand', updated_at=CURRENT_TIMESTAMP WHERE id=?").run(post.id);

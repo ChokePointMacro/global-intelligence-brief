@@ -21,6 +21,7 @@ import { etZoneAbbrev, etDateString, etInputValue, etToUtc, etParts, etDisplayTi
 import type { PostType } from '../services/postTypes';
 import { PostQueueWeek } from './PostQueueWeek';
 import { PostQueueBoard } from './PostQueueBoard';
+import { PostDetail } from './PostDetail';
 import {
   PostCard, dayHeading, labelCls, btn, STATUS_LABEL,
   type QueuePost, type EmptySlot, type Conflict,
@@ -29,8 +30,8 @@ import {
 type View = 'timeline' | 'week' | 'board';
 
 const SHORTCUTS: Array<[string, string]> = [
-  ['J / ↓', 'next post'], ['K / ↑', 'previous post'], ['Enter', 'edit'],
-  ['A', 'approve'], ['E', 'edit'], ['S', 'reschedule'], ['X', 'select'],
+  ['J / ↓', 'next post'], ['K / ↑', 'previous post'], ['Enter', 'open panel'],
+  ['A', 'approve'], ['E', 'open panel'], ['S', 'reschedule'], ['X', 'select'],
   ['Esc', 'clear focus'],
 ];
 
@@ -51,6 +52,7 @@ export const PostQueue = () => {
   const [query, setQuery] = useState('');
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [focusIdx, setFocusIdx] = useState(-1);
+  const [openId, setOpenId] = useState<number | null>(null);
   const [showHelp, setShowHelp] = useState(false);
 
   const [loading, setLoading] = useState(true);
@@ -116,6 +118,12 @@ export const PostQueue = () => {
   }, [conflicts]);
 
   const filtersOn = Boolean(typeFilter || statusFilter || query.trim());
+
+  // The panel reads from the same list the timeline renders, so it refreshes with it.
+  const openPost = useMemo(
+    () => [...posts, ...unscheduled].find(p => p.id === openId) ?? null,
+    [posts, unscheduled, openId],
+  );
 
   /** Posts in display order — the sequence J/K walks. */
   const ordered = useMemo(
@@ -225,17 +233,12 @@ export const PostQueue = () => {
         case 'x':
           if (focused) { e.preventDefault(); toggleSelect(focused.id); }
           break;
-        case 'e': case 'Enter': {
-          if (!focused) break;
-          e.preventDefault();
-          // The detail panel is Phase C; until then Enter/E opens the inline editor.
-          const node = document.querySelector<HTMLElement>(`[data-post-id="${focused.id}"] button`);
-          const editBtn = Array.from(document.querySelectorAll<HTMLButtonElement>(`[data-post-id="${focused.id}"] button`))
-            .find(b => b.textContent?.trim() === 'Edit');
-          (editBtn ?? node)?.click();
+        case 'e': case 'Enter':
+          if (focused) { e.preventDefault(); setOpenId(focused.id); }
           break;
-        }
         case 'Escape':
+          // Close the panel first if it's open; otherwise clear focus and selection.
+          if (openId != null) { setOpenId(null); break; }
           setFocusIdx(-1); setSelected(new Set()); setShowHelp(false); break;
         case '?':
           setShowHelp(v => !v); break;
@@ -243,7 +246,7 @@ export const PostQueue = () => {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [ordered, focusIdx]);
+  }, [ordered, focusIdx, openId]);
 
   // Keep the focused card in view as J/K walks past the fold.
   useEffect(() => {
@@ -260,6 +263,7 @@ export const PostQueue = () => {
   for (const p of posts) if (p.type_code) typeCounts.set(p.type_code, (typeCounts.get(p.type_code) ?? 0) + 1);
 
   const actionsFor = (p: QueuePost) => ({
+    onOpen: () => setOpenId(p.id),
     onSelect: () => toggleSelect(p.id),
     onApprove: () => approve(p.id),
     onUnapprove: () => call(`/api/posts/${p.id}/unapprove`, { method: 'POST' }),
@@ -497,6 +501,10 @@ export const PostQueue = () => {
               </div>
             ))}
           </div>
+
+          {openPost && (
+            <PostDetail post={openPost} types={types} onClose={() => setOpenId(null)} onChanged={load} />
+          )}
         </div>
       ) : view === 'week' ? (
         <PostQueueWeek
@@ -507,14 +515,14 @@ export const PostQueue = () => {
           busy={busy}
           onMove={moveToDay}
           onGenerate={generate}
-          onOpen={id => { setView('timeline'); setFocusIdx(ordered.findIndex(p => p.id === id)); }}
+          onOpen={id => setOpenId(id)}
         />
       ) : (
         <PostQueueBoard
           posts={posts}
           conflictIds={conflictIds}
           onTransition={transition}
-          onOpen={id => { setView('timeline'); setFocusIdx(ordered.findIndex(p => p.id === id)); }}
+          onOpen={id => setOpenId(id)}
         />
       )}
     </div>

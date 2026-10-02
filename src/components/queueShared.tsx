@@ -6,7 +6,7 @@
  * that makes a queue untrustworthy at a glance.
  */
 import { useState } from 'react';
-import { Check, Clock, Trash2, Copy, SkipForward, AlertTriangle, Hourglass } from 'lucide-react';
+import { Check, Clock, Trash2, Copy, SkipForward, AlertTriangle, AlertCircle, Hourglass } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { etDisplayTime, localDisplayTime } from '../services/time';
 import { ageHours, isStale } from '../services/slots';
@@ -27,7 +27,10 @@ export interface QueuePost {
   type_color?: string | null;
   length_mode?: string | null;
   staleness_hours?: number | null;
+  notes?: string | null;
   et_date?: string;
+  /** Rule-check summary computed server-side, so the card and the gate never disagree. */
+  rule?: { ok: boolean; errors: number; warnings: number; weightedLength: number; first: string | null };
 }
 
 export interface EmptySlot {
@@ -80,6 +83,7 @@ export function dayHeading(etDate: string, todayEt: string): string {
 }
 
 export interface CardActions {
+  onOpen: () => void;
   onSelect: () => void;
   onApprove: () => void;
   onUnapprove: () => void;
@@ -156,8 +160,26 @@ export function PostCard({
               <AlertTriangle size={9} /> under {spacing}m spacing
             </span>
           )}
+          {/* Rule verdict, from the same checker the approval gate enforces. */}
+          {post.rule && (
+            post.rule.errors > 0 ? (
+              <span className="flex items-center gap-1 text-[8px] font-mono uppercase text-red-400"
+                    title={post.rule.first ?? undefined}>
+                <AlertCircle size={9} /> {post.rule.errors} blocking
+              </span>
+            ) : post.rule.warnings > 0 ? (
+              <span className="flex items-center gap-1 text-[8px] font-mono uppercase text-amber-400/80"
+                    title={post.rule.first ?? undefined}>
+                <AlertTriangle size={9} /> {post.rule.warnings}
+              </span>
+            ) : (
+              <span className="flex items-center gap-1 text-[8px] font-mono uppercase text-green-400/70" title="Rule check passed">
+                <Check size={9} /> ok
+              </span>
+            )
+          )}
           <span className={cn('text-[8px] font-mono ml-auto', overFold ? 'text-amber-400/70' : 'text-gray-600')}>
-            {chars}{overFold ? ' · past the fold' : ''}
+            {post.rule?.weightedLength ?? chars}{overFold ? ' · past the fold' : ''}
           </span>
         </div>
 
@@ -177,7 +199,8 @@ export function PostCard({
             </div>
           </div>
         ) : (
-          <p className="text-xs text-gray-400 leading-relaxed line-clamp-2">
+          <p onClick={actions.onOpen}
+             className="text-xs text-gray-400 leading-relaxed line-clamp-2 cursor-pointer hover:text-gray-300">
             {post.body || <em className="text-gray-600">empty draft</em>}
           </p>
         )}
