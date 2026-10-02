@@ -48,6 +48,7 @@ export const Tweets = () => {
   const [types, setTypes] = useState<PostType[]>([]);
   const [spacing, setSpacing] = useState(60);
   const [posting, setPosting] = useState<{ enabled: boolean } | null>(null);
+  const [source, setSource] = useState<any>({ hasReport: false, total: 0, unused: 0 });
 
   const [openId, setOpenId] = useState<number | null>(null);
   const [selected, setSelected] = useState<Set<number>>(new Set());
@@ -75,6 +76,7 @@ export const Tweets = () => {
       setEmptySlots(d.emptySlots ?? []);
       setConflicts(d.conflicts ?? []);
       setTypes(d.types ?? []);
+      setSource(d.source ?? { hasReport: false, total: 0, unused: 0 });
       setSpacing(d.settings?.min_spacing_minutes ?? 60);
       setPosting(await pRes.json().catch(() => null));
     } catch {
@@ -228,8 +230,9 @@ export const Tweets = () => {
           {section === 'generation' && (
             <GenerationSection
               types={types} emptySlots={emptySlots} busy={busy}
+              source={source}
               onGenerate={(typeId, unscheduled) =>
-                call('/api/posts', { method: 'POST', body: JSON.stringify({ typeId, unscheduled, body: '' }) })}
+                call('/api/posts', { method: 'POST', body: JSON.stringify({ typeId, unscheduled, body: '', generate: !unscheduled }) })}
               onTypesChanged={load}
             />
           )}
@@ -264,11 +267,12 @@ export const Tweets = () => {
 // ─── Generation ────────────────────────────────────────────────────────────────
 
 function GenerationSection({
-  types, emptySlots, busy, onGenerate, onTypesChanged,
+  types, emptySlots, busy, source, onGenerate, onTypesChanged,
 }: {
   types: PostType[];
   emptySlots: EmptySlot[];
   busy: boolean;
+  source: { hasReport: boolean; reportType?: string | null; updatedAt?: string | null; total: number; unused: number };
   onGenerate: (typeId: number | null, unscheduled: boolean) => void;
   onTypesChanged: () => void;
 }) {
@@ -284,10 +288,12 @@ function GenerationSection({
 
   return (
     <div className="space-y-4">
+      <SourceBanner source={source} />
+
       <div className="flex items-center justify-between">
         <p className="text-[11px] text-gray-500">
           Each type is a recurring segment with its own slot, rules and prompt. Generating
-          drops a draft into the next open slot for that type.
+          writes a post into the next open slot for that type.
         </p>
         <button onClick={() => setShowSettings(v => !v)}
                 className={cn(btn, 'shrink-0 ml-3 text-gray-400 border-btc-orange/20 hover:bg-btc-orange/10')}>
@@ -342,18 +348,47 @@ function GenerationSection({
         </button>
       </div>
 
-      <div className="border border-amber-400/25 bg-amber-400/5 px-3 py-2">
-        <p className="text-[11px] text-amber-400">
-          Generate currently creates an <strong>empty</strong> draft at the right slot with the
-          right rules — it does not write the text yet.
-        </p>
-        <p className="text-[10px] text-amber-400/70 mt-1">
-          The engine that writes posts lives in geminiService (the socialPost prompt + hashtag
-          pass). Wiring it per-slot through each type's prompt template is the next piece.
+      {showSettings && <TypeSettings types={types} onChanged={onTypesChanged} />}
+    </div>
+  );
+}
+
+/**
+ * Tweets are written FROM report headlines — the report generator writes a fold-tuned
+ * socialPost for each one as part of the report run. So an empty or stale report is the
+ * real blocker, and it belongs at the top of Generation rather than surfacing as a
+ * failed click on Generate.
+ */
+function SourceBanner({ source }: { source: { hasReport: boolean; reportType?: string | null; updatedAt?: string | null; total: number; unused: number } }) {
+  if (!source.hasReport) {
+    return (
+      <div className="border border-red-500/30 bg-red-500/5 px-3 py-2">
+        <p className="text-[11px] text-red-400">No intelligence report to draw from.</p>
+        <p className="text-[10px] text-red-400/70 mt-1">
+          Tweets are written from report headlines. Generate a report on the Reports page first.
         </p>
       </div>
-
-      {showSettings && <TypeSettings types={types} onChanged={onTypesChanged} />}
+    );
+  }
+  const stale = source.updatedAt
+    ? (Date.now() - new Date(String(source.updatedAt).replace(' ', 'T') + 'Z').getTime()) / 3_600_000 > 36
+    : false;
+  return (
+    <div className={cn('px-3 py-2 border',
+      source.unused === 0 ? 'border-amber-400/30 bg-amber-400/5'
+      : stale ? 'border-amber-400/25 bg-amber-400/5'
+      : 'border-btc-orange/20 bg-btc-orange/5')}>
+      <p className="text-[11px] text-gray-300">
+        Writing from the latest <strong className="text-btc-orange">{source.reportType}</strong> report —{' '}
+        <strong className={source.unused === 0 ? 'text-amber-400' : 'text-white'}>{source.unused}</strong> of {source.total} stories unused.
+      </p>
+      <p className="text-[10px] text-gray-500 mt-1">
+        {source.unused === 0
+          ? 'Every story is already spoken for. Generate a fresh report for new material.'
+          : stale
+            ? 'This report is over a day old — the stories may have moved on.'
+            : 'Short slots reuse the post the report already wrote. Long slots synthesise across stories.'}
+      </p>
     </div>
   );
 }

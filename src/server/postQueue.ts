@@ -19,6 +19,7 @@ import {
 } from '../services/slots.ts';
 import { etDateString, normaliseScheduledAt } from '../services/time.ts';
 import { checkPost, type RuleCheckResult } from '../services/ruleCheck.ts';
+import { generateSlotPost, headlineId } from '../services/geminiService.ts';
 
 export interface PostQueueDeps {
   db: Database.Database;
@@ -570,7 +571,31 @@ export function createPostQueueRouter({ db, requireAuth }: PostQueueDeps): expre
     const types = allTypes();
     const windowPosts = postsInWindow(nowIso, horizonIso);
 
+    // What the tweet engine has to draw from. Tweets are written from report headlines,
+    // so an empty or stale report is the first thing to show rather than a failed click.
+    const reportRow = db.prepare(
+      "SELECT id, type, updated_at, content FROM reports ORDER BY updated_at DESC LIMIT 1"
+    ).get() as any;
+    let source = { hasReport: false, reportId: null as string | null, reportType: null as string | null,
+                   updatedAt: null as string | null, total: 0, unused: 0 };
+    if (reportRow) {
+      try {
+        const parsed = JSON.parse(reportRow.content);
+        const hl = parsed.headlines || parsed.events || [];
+        const usedIds = new Set(
+          (db.prepare("SELECT DISTINCT event_id FROM posts WHERE event_id IS NOT NULL AND status NOT IN ('archived','skipped')")
+            .all() as any[]).map(r => r.event_id),
+        );
+        source = {
+          hasReport: true, reportId: reportRow.id, reportType: reportRow.type,
+          updatedAt: reportRow.updated_at, total: hl.length,
+          unused: hl.filter((h: any) => !usedIds.has(h.url || `title:${(h.title || '').slice(0, 120)}`)).length,
+        };
+      } catch { /* unparseable report counts as none */ }
+    }
+
     res.json({
+      source,
       drafts: decorate(drafts),
       planned: decorate(planned),
       archive: decorate(archive),
@@ -593,8 +618,37 @@ export function createPostQueueRouter({ db, requireAuth }: PostQueueDeps): expre
    * draft in the right spot" half of Phase B's done-when. Content generation itself
    * comes later; placement is what Phase B owns.
    */
-  router.post('/api/posts', requireAuth, (req, res) => {
-    const { typeId, body = '', at, unscheduled } = req.body ?? {};
+  /**
+   * Pull the headlines from the most recent report, plus the story ids already spoken
+   * for by existing posts. This is the engine's own output — the report generator wrote
+   * these, and the slot generator reuses or synthesises from them rather than starting
+   * a second content pipeline.
+   */
+  const latestReportHeadlines = () => {
+    const row = db.prepare(
+      "SELECT content FROM reports ORDER BY updated_at DESC LIMIT 1"
+    ).get() as any;
+    if (!row?.content) return { headlines: [] as any[], used: new Set<string>() };
+
+    let headlines: any[] = [];
+    try {
+      const parsed = JSON.parse(row.content);
+      headlines = parsed.headlines || parsed.events || [];
+    } catch {
+      return { headlines: [], used: new Set<string>() };
+    }
+
+    // A story already used by any live post must not be written again.
+    const used = new Set<string>(
+      (db.prepare(
+        "SELECT DISTINCT event_id FROM posts WHERE event_id IS NOT NULL AND status NOT IN ('archived','skipped')"
+      ).all() as any[]).map(r => r.event_id),
+    );
+    return { headlines, used };
+  };
+
+  router.post('/api/posts', requireAuth, async (req, res) => {
+    const { typeId, body = '', at, unscheduled, generate = false } = req.body ?? {};
 
     const type = typeId != null ? (db.prepare('SELECT * FROM post_types WHERE id = ?').get(typeId) as PostType | undefined) : undefined;
     if (typeId != null && !type) return res.status(404).json({ error: 'Post type not found' });
@@ -627,21 +681,67 @@ export function createPostQueueRouter({ db, requireAuth }: PostQueueDeps): expre
       // A type with no slot (Manual, link reply) legitimately yields an unscheduled draft.
     }
 
-    const info = db.prepare(`
-      INSERT INTO posts (type_id, status, body, proposed_at, scheduled_at, time_confirmed,
-                         is_long, user_id)
-      VALUES (?, 'draft', ?, ?, ?, 0, ?, ?)
-    `).run(
-      type?.id ?? null, String(body), scheduledAt, scheduledAt,
-      type?.length_mode === 'long' ? 1 : 0,
-      (req.session as any)?.userId ?? null,
-    );
+    // Write the text, unless the caller supplied it or asked for a blank draft.
+    let text = String(body);
+    let sourceUrl: string | null = null;
+    let eventId: string | null = null;
+    let reused = false;
 
-    if (String(body).trim()) {
-      recordVersion(Number(info.lastInsertRowid), String(body), (req.session as any)?.userId ?? null, 'created');
+    if (generate && type) {
+      const { headlines, used } = latestReportHeadlines();
+      if (!headlines.length) {
+        return res.status(409).json({
+          error: 'No report to draw from. Generate an intelligence report first — the tweet engine writes from its headlines.',
+        });
+      }
+      try {
+        const out = await generateSlotPost({
+          promptTemplate: type.prompt_template,
+          typeName: type.name,
+          typeCode: type.code,
+          lengthMode: type.length_mode === 'long' ? 'long' : 'short',
+          cashtagMax: type.cashtag_max,
+          hashtagMax: type.hashtag_max,
+          headlines,
+        }, used);
+        text = out.text;
+        sourceUrl = out.sourceUrl ?? null;
+        eventId = out.eventId ?? null;
+        reused = out.reused;
+      } catch (err) {
+        // A spend cap or provider outage must say so plainly, not leave a blank draft.
+        const msg = err instanceof Error ? err.message : String(err);
+        return res.status(502).json({ error: `Could not write the post: ${msg}` });
+      }
     }
 
-    res.status(201).json(getPost.get(info.lastInsertRowid));
+    const info = db.prepare(`
+      INSERT INTO posts (type_id, status, body, proposed_at, scheduled_at, time_confirmed,
+                         is_long, user_id, source_url, event_id)
+      VALUES (?, 'draft', ?, ?, ?, 0, ?, ?, ?, ?)
+    `).run(
+      type?.id ?? null, text, scheduledAt, scheduledAt,
+      type?.length_mode === 'long' ? 1 : 0,
+      (req.session as any)?.userId ?? null,
+      sourceUrl, eventId,
+    );
+
+    // The source the post was written from becomes an attached source, which is what
+    // the rule checker looks for before it will allow approval.
+    if (sourceUrl) {
+      try {
+        db.prepare(
+          `INSERT INTO post_sources (post_id, name, url, pulled_at, confirmed) VALUES (?, ?, ?, ?, 1)`
+        ).run(info.lastInsertRowid, new URL(sourceUrl).hostname.replace(/^www\./, ''), sourceUrl, new Date().toISOString());
+      } catch { /* a malformed URL must not fail the whole generation */ }
+    }
+
+    if (text.trim()) {
+      recordVersion(Number(info.lastInsertRowid), text,
+        (req.session as any)?.userId ?? null, reused ? 'generated (reused report text)' : 'generated');
+    }
+
+    res.status(201).json({ ...(getPost.get(info.lastInsertRowid) as any), reused });
   });
 
   /**
