@@ -24,6 +24,7 @@ import {
 import { backupDatabase } from "./src/services/backup.ts";
 import { createAnalytics } from "./src/server/analytics.ts";
 import { createMarketsRouter } from "./src/server/markets.ts";
+import { createPostQueueRouter } from "./src/server/postQueue.ts";
 
 import fs from "fs";
 
@@ -1841,19 +1842,44 @@ app.post("/api/schedule-post", requireAuth, (req, res) => {
     return res.status(400).json({ error: "scheduledAt not understood — use 'YYYY-MM-DD HH:MM' (Eastern) or a full ISO-8601 timestamp" });
   }
 
-  db.prepare(`INSERT INTO scheduled_posts (user_id, content, scheduled_at, kind) VALUES (?, ?, ?, 'tweet')`)
-    .run(userId, content, iso);
-  res.json({ success: true, scheduledAt: iso });
+  // Lands as needs_review with the time confirmed: Mike typed an explicit time, so the
+  // *schedule* is settled, but the publisher still requires an explicit approval before
+  // it will send. See the approval gate in the publisher below.
+  const manualType = db.prepare("SELECT id FROM post_types WHERE code = 'MAN'").get() as any;
+  const info = db.prepare(`
+    INSERT INTO posts (type_id, status, body, proposed_at, scheduled_at, time_confirmed, user_id)
+    VALUES (?, 'needs_review', ?, ?, ?, 1, ?)
+  `).run(manualType?.id ?? null, content, iso, iso, userId);
+
+  res.json({ success: true, scheduledAt: iso, id: info.lastInsertRowid, status: 'needs_review' });
 });
 
+// Kept at the old path and old field names so the existing /schedule screen keeps working
+// until Phase B replaces it with the Post Queue timeline. `body`/`error` are aliased back
+// to `content`/`last_error`, which is what ScheduledPost in the client still expects.
 app.get("/api/scheduled-posts", requireAuth, (req, res) => {
   const userId = (req.session as any).userId;
-  const posts = db.prepare("SELECT * FROM scheduled_posts WHERE user_id = ? ORDER BY scheduled_at ASC").all(userId);
+  const posts = db.prepare(`
+    SELECT p.id, p.body AS content, p.scheduled_at, p.status, p.error AS last_error,
+           p.x_post_id AS posted_tweet_id, p.source_url, p.attempts, p.time_confirmed,
+           p.created_at, t.code AS kind
+    FROM posts p
+    LEFT JOIN post_types t ON t.id = p.type_id
+    WHERE (p.user_id = ? OR p.user_id IS NULL) AND p.status != 'archived'
+    ORDER BY p.scheduled_at ASC
+  `).all(userId);
   res.json(posts);
 });
 
 app.delete("/api/scheduled-posts/:id", requireAuth, (req, res) => {
-  db.prepare("DELETE FROM scheduled_posts WHERE id = ? AND user_id = ?").run(req.params.id, (req.session as any).userId);
+  // A post mid-flight must not vanish from under the publisher — it has already been
+  // claimed and may have reached X.
+  const row = db.prepare("SELECT status FROM posts WHERE id = ?").get(req.params.id) as any;
+  if (row?.status === 'posting') {
+    return res.status(409).json({ error: "That post is being sent right now and can't be deleted." });
+  }
+  db.prepare("DELETE FROM posts WHERE id = ? AND (user_id = ? OR user_id IS NULL)")
+    .run(req.params.id, (req.session as any).userId);
   res.json({ success: true });
 });
 
@@ -1914,28 +1940,33 @@ app.post("/api/auto-schedule/confirm", requireAuth, (req, res) => {
   let count = 0;
   const rejected: Array<{ time: unknown; reason: string }> = [];
 
-  const insert = db.prepare(
-    "INSERT INTO scheduled_posts (user_id, content, scheduled_at, status, source_url, kind) VALUES (?, ?, ?, 'pending', ?, ?)"
-  );
+  const insert = db.prepare(`
+    INSERT INTO posts (type_id, status, body, proposed_at, scheduled_at, time_confirmed, source_url, user_id)
+    VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+  `);
+  const typeByCode = (code: string) =>
+    (db.prepare("SELECT id FROM post_types WHERE code = ?").get(code) as any)?.id ?? null;
+  const manualTypeId = typeByCode('MAN');
 
   for (const item of items) {
     if (!item.enabled) continue;
 
-    const kind = item.type === 'tweet' ? 'tweet'
-               : item.type === 'instagram' ? 'instagram'
-               : 'substack';
+    const isTweet = item.type === 'tweet';
 
-    // The '[INSTAGRAM] '/'[SUBSTACK] ' prefix stays for display compatibility with
-    // Schedule.tsx, but `kind` is now what the publisher filters on — a prefix on a
-    // text column was never a safe way to keep a reminder out of the X API.
-    const content = kind === 'tweet' ? item.content
-                  : kind === 'instagram' ? `[INSTAGRAM] ${item.content}`
+    // The Instagram/Substack entries are reminders to Mike, not things to publish.
+    // They go in as 'archived' so they are visible in the queue but can never satisfy
+    // the publisher's approved + time_confirmed predicate.
+    const status = isTweet ? 'needs_review' : 'archived';
+    const content = isTweet ? item.content
+                  : item.type === 'instagram' ? `[INSTAGRAM] ${item.content}`
                   : `[SUBSTACK] ${item.content}`;
 
     const iso = normaliseScheduledAt(item.time);
     if (!iso) { rejected.push({ time: item.time, reason: 'unparseable time' }); continue; }
 
-    insert.run(userId, content, iso, kind === 'tweet' ? (item.sourceUrl || null) : null, kind);
+    // time_confirmed = 0: the generator *proposed* this slot. Mike confirms it in the
+    // queue, which is what makes it eligible to send.
+    insert.run(manualTypeId, status, content, iso, iso, isTweet ? (item.sourceUrl || null) : null, userId);
     count++;
   }
 
@@ -2191,18 +2222,20 @@ setInterval(async () => {
     // rows must still age out, otherwise re-enabling the switch would dump an entire
     // paused period's backlog onto the live account at once.
     //
-    // Only `kind='tweet'` rows are time-sensitive — the Instagram/Substack reminders
-    // are notes to self and are excluded from the publisher entirely (below).
+    // Scoped to APPROVED posts. A draft sitting past its proposed time isn't "missed" —
+    // it was simply never approved, and it stays in the queue for Mike to deal with.
     const latenessCutoff = new Date(Date.now() - MAX_SLOT_LATENESS_MIN * 60_000).toISOString();
     const overdue = db.prepare(
-      "SELECT id, scheduled_at, substr(content, 1, 80) preview FROM scheduled_posts WHERE status='pending' AND kind='tweet' AND scheduled_at < ?"
+      `SELECT id, scheduled_at, substr(body, 1, 80) preview FROM posts
+       WHERE status='approved' AND time_confirmed=1 AND scheduled_at < ?`
     ).all(latenessCutoff) as any[];
 
     if (overdue.length) {
       db.prepare(
-        `UPDATE scheduled_posts SET status='skipped',
-           last_error='missed slot — more than ${MAX_SLOT_LATENESS_MIN} min late, skipped rather than publishing stale content'
-         WHERE status='pending' AND kind='tweet' AND scheduled_at < ?`
+        `UPDATE posts SET status='skipped',
+           error='missed slot — more than ${MAX_SLOT_LATENESS_MIN} min late, skipped rather than publishing stale content',
+           updated_at=CURRENT_TIMESTAMP
+         WHERE status='approved' AND time_confirmed=1 AND scheduled_at < ?`
       ).run(latenessCutoff);
 
       log.warn('posts_skipped_stale', {
@@ -2231,20 +2264,30 @@ setInterval(async () => {
       // crash happened after the API call, retrying would post a duplicate. Losing a post
       // is recoverable; double-posting to a public account is not.
       const stale = db.prepare(
-        `UPDATE scheduled_posts SET status='failed', last_error='stranded in posting state — not retried to avoid duplicate'
+        `UPDATE posts SET status='failed', error='stranded in posting state — not retried to avoid duplicate',
+                          updated_at=CURRENT_TIMESTAMP
          WHERE status='posting' AND claimed_at < ?`
       ).run(new Date(Date.now() - CLAIM_TIMEOUT_MIN * 60_000).toISOString());
       if (stale.changes) log.warn('posts_stranded_reclaimed', { count: stale.changes });
 
-      // `kind='tweet'` is the fix for reminder rows reaching the X API: the
-      // '[INSTAGRAM] …' text was only ever stripped by the frontend, so without this
-      // filter the publisher would tweet the reminder verbatim.
+      // ─── The approval gate ───
+      //
+      // Only `approved` posts with a CONFIRMED time are sendable. Both halves matter:
+      // status alone would let a post go out at a time Mike never agreed to (the
+      // generator's proposed slot), and a confirmed time alone would send unreviewed
+      // text. Draft, needs_review, skipped and archived are all unreachable from here.
+      //
+      // This also replaces the old `kind='tweet'` filter — the Instagram/Substack
+      // reminders migrated in as 'archived' and can never satisfy this predicate.
       const due = db.prepare(
-        "SELECT * FROM scheduled_posts WHERE status = 'pending' AND kind = 'tweet' AND scheduled_at <= ? ORDER BY scheduled_at ASC LIMIT ?"
+        `SELECT * FROM posts
+         WHERE status='approved' AND time_confirmed=1 AND scheduled_at <= ?
+         ORDER BY scheduled_at ASC LIMIT ?`
       ).all(nowIso, MAX_POSTS_PER_RUN) as any[];
 
       const backlog = db.prepare(
-        "SELECT COUNT(*) c FROM scheduled_posts WHERE status='pending' AND kind='tweet' AND scheduled_at <= ?"
+        `SELECT COUNT(*) c FROM posts
+         WHERE status='approved' AND time_confirmed=1 AND scheduled_at <= ?`
       ).get(nowIso) as any;
       if (backlog.c > due.length) {
         // Never silently truncate — a growing backlog means something upstream is wrong.
@@ -2255,26 +2298,30 @@ setInterval(async () => {
         const tokenRecord = getXTokenRecord(post.user_id);
         if (!tokenRecord) { log.warn('post_skipped_no_token', { id: post.id, user: post.user_id }); continue; }
 
-        // Atomic claim: the WHERE guards against any second worker taking the same row.
+        // Atomic claim: the WHERE re-asserts the full approval predicate, so a post
+        // un-approved between the SELECT and here is dropped rather than sent.
         const claimed = db.prepare(
-          "UPDATE scheduled_posts SET status='posting', claimed_at=?, attempts=COALESCE(attempts,0)+1 WHERE id=? AND status='pending'"
+          `UPDATE posts SET status='posting', claimed_at=?, attempts=COALESCE(attempts,0)+1,
+                            updated_at=CURRENT_TIMESTAMP
+           WHERE id=? AND status='approved' AND time_confirmed=1`
         ).run(new Date().toISOString(), post.id);
         if (!claimed.changes) continue;
 
         if (POSTING_DRY_RUN) {
-          db.prepare("UPDATE scheduled_posts SET status='pending', claimed_at=NULL WHERE id=?").run(post.id);
-          log.info('post_dry_run', { id: post.id, chars: (post.content || '').length, preview: (post.content || '').slice(0, 80) });
+          db.prepare("UPDATE posts SET status='approved', claimed_at=NULL WHERE id=?").run(post.id);
+          log.info('post_dry_run', { id: post.id, chars: (post.body || '').length, preview: (post.body || '').slice(0, 80) });
           continue;
         }
 
         try {
           const accessToken = await refreshXToken(tokenRecord);
           const client = new TwitterApi(accessToken);
-          const posted = await client.v2.tweet(post.content);
-          db.prepare("UPDATE scheduled_posts SET status='posted', posted_tweet_id=?, last_error=NULL WHERE id=?")
-            .run(posted.data.id, post.id);
-          recordSpend(xSpend('post', 1, { scheduled_post_id: post.id, tweet_id: posted.data.id }));
-          log.info('post_published', { id: post.id, tweet_id: posted.data.id, chars: (post.content || '').length });
+          const posted = await client.v2.tweet(post.body);
+          db.prepare(
+            "UPDATE posts SET status='posted', x_post_id=?, posted_at=CURRENT_TIMESTAMP, error=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?"
+          ).run(posted.data.id, post.id);
+          recordSpend(xSpend('post', 1, { post_id: post.id, tweet_id: posted.data.id }));
+          log.info('post_published', { id: post.id, tweet_id: posted.data.id, chars: (post.body || '').length });
 
           // Cite the source as a REPLY, never in the body — a link in the post costs 30-50%
           // of reach. A failed reply must not mark the post failed; the post already went out.
@@ -2282,7 +2329,7 @@ setInterval(async () => {
             try {
               await client.v2.tweet({ text: `Source: ${post.source_url}`, reply: { in_reply_to_tweet_id: posted.data.id } });
               // Billed at the URL rate — this is the cost of citing sources.
-              recordSpend(xSpend('post_with_link', 1, { scheduled_post_id: post.id, kind: 'source_reply' }));
+              recordSpend(xSpend('post_with_link', 1, { post_id: post.id, kind: 'source_reply' }));
               log.info('source_reply_published', { id: post.id });
             } catch (replyErr) {
               log.warn('source_reply_failed', { id: post.id, ...errInfo(replyErr) });
@@ -2290,14 +2337,14 @@ setInterval(async () => {
           }
         } catch (error) {
           const msg = String(error instanceof Error ? error.message : error).slice(0, 500);
-          db.prepare("UPDATE scheduled_posts SET status='failed', last_error=? WHERE id=?")
+          db.prepare("UPDATE posts SET status='failed', error=?, updated_at=CURRENT_TIMESTAMP WHERE id=?")
             .run(msg, post.id);
           log.error('post_failed', { id: post.id, ...errInfo(error) });
-          // A 'failed' row is terminal — nothing re-queues it and the UI offers no retry,
-          // so an unnoticed failure is a silently missing post.
+          // A 'failed' row is terminal — nothing re-queues it automatically, so an
+          // unnoticed failure is a silently missing post.
           void notifyOps(
             `Scheduled post #${post.id} failed to publish`,
-            `Post #${post.id} (due ${post.scheduled_at}) could not be published and has been marked failed. It will NOT be retried automatically.\n\nError: ${msg}\n\nPreview: "${String(post.content || '').slice(0, 200)}…"`,
+            `Post #${post.id} (due ${post.scheduled_at}) could not be published and has been marked failed. It will NOT be retried automatically.\n\nError: ${msg}\n\nPreview: "${String(post.body || '').slice(0, 200)}…"`,
           );
         }
       }
@@ -2467,6 +2514,10 @@ app.delete("/api/watchlist/:symbol", requireAuth, (req, res) => {
 // ─── Markets / Live Data ───────────────────────────────────────────────────────
 // Extracted to src/server/markets.ts (self-contained: no db, no shared helpers).
 app.use(createMarketsRouter());
+
+// ─── Post Queue ────────────────────────────────────────────────────────────────
+// Phase A: post types only. The queue itself (timeline, detail panel) lands in B–C.
+app.use(createPostQueueRouter({ db, requireAuth }));
 
 // ─── Connections / Live API Status ────────────────────────────────────────────
 

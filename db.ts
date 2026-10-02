@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3';
 import path from 'path';
 import { normaliseScheduledAt } from './src/services/time.ts';
+import { SEED_POST_TYPES } from './src/services/postTypes.ts';
 
 // Overridable so a throwaway instance can be pointed at a COPY of the database —
 // migrations and the publisher can then be exercised without risking the real one,
@@ -212,6 +213,212 @@ try {
   db.exec("CREATE INDEX IF NOT EXISTS idx_scheduled_posts_due ON scheduled_posts(status, kind, scheduled_at)");
 } catch (err) {
   console.error("scheduled_posts index migration error:", err);
+}
+
+// ─── Post Queue (Phase A) ──────────────────────────────────────────────────────
+//
+// post_types holds the recurring segments as DATA, editable on screen — slot time,
+// days, length and tag rules, prompt template. The generator reads these; none of it
+// is a hardcoded branch.
+//
+// posts supersedes scheduled_posts. The important change is the status vocabulary:
+// the publisher now sends only status='approved' AND time_confirmed=1. Everything
+// arrives as 'draft', which is not sendable, so a generated post cannot reach X
+// without an explicit human approval.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS post_types (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT NOT NULL,
+    code            TEXT NOT NULL UNIQUE,
+    color           TEXT DEFAULT '#f7931a',
+    default_time_et TEXT,                      -- "HH:MM" Eastern, or NULL for no fixed slot
+    days_of_week    TEXT DEFAULT '',           -- "1,2,3,4,5"; 0=Sun. Empty = never auto-schedules
+    max_per_day     INTEGER,                   -- NULL = unlimited
+    prompt_template TEXT DEFAULT '',
+    card_type       TEXT DEFAULT 'none',
+    cashtag_min     INTEGER DEFAULT 0,
+    cashtag_max     INTEGER DEFAULT 0,
+    hashtag_max     INTEGER DEFAULT 1,
+    length_mode     TEXT DEFAULT 'short',      -- 'short' (280) | 'long' (Premium long-form)
+    source_required INTEGER DEFAULT 1,
+    staleness_hours INTEGER,                   -- NULL = never goes stale
+    active          INTEGER DEFAULT 1,
+    sort_order      INTEGER DEFAULT 0,
+    created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at      DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS posts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    type_id         INTEGER REFERENCES post_types(id),
+
+    -- draft | needs_review | approved | posting | posted | failed | skipped | archived
+    status          TEXT NOT NULL DEFAULT 'draft',
+    body            TEXT,
+    is_long         INTEGER DEFAULT 0,
+
+    -- proposed_at is the type's default slot, suggested by the generator.
+    -- scheduled_at is only authoritative once time_confirmed = 1.
+    proposed_at     DATETIME,
+    scheduled_at    DATETIME,
+    time_confirmed  INTEGER DEFAULT 0,
+
+    event_id        TEXT,
+    priority        INTEGER DEFAULT 0,
+    tags            TEXT,
+    notes           TEXT,
+
+    -- Threading: a reply carries its parent and an offset (e.g. +60 min).
+    parent_post_id  INTEGER REFERENCES posts(id),
+    offset_minutes  INTEGER,
+
+    x_post_id       TEXT,
+    posted_at       DATETIME,
+    error           TEXT,
+    locked          INTEGER DEFAULT 0,
+
+    -- Retained from scheduled_posts and deliberately NOT dropped. The build plan's
+    -- table omits all three, but user_id is how the publisher finds the X token, and
+    -- attempts/claimed_at are the atomic claim that stops a crash mid-publish from
+    -- double-posting. Removing them would silently undo the Phase 0 crash-safety.
+    user_id         TEXT,
+    attempts        INTEGER DEFAULT 0,
+    claimed_at      DATETIME,
+
+    -- Until post_sources is populated (Phase D), the publisher still reads this for
+    -- the source-as-reply behaviour.
+    source_url      TEXT,
+
+    created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at      DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  -- The publisher polls this every 60s.
+  CREATE INDEX IF NOT EXISTS idx_posts_due ON posts(status, time_confirmed, scheduled_at);
+  CREATE INDEX IF NOT EXISTS idx_posts_type ON posts(type_id, scheduled_at);
+
+  -- Scaffolding for later phases. Created now so the schema is settled and the UI can
+  -- read them without special-casing a missing table; populated in Phase D.
+  CREATE TABLE IF NOT EXISTS post_versions (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    post_id    INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+    body       TEXT,
+    media_id   INTEGER,
+    changed_by TEXT,
+    changed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    reason     TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS post_media (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    post_id          INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+    card_type        TEXT,
+    card_fields_json TEXT,
+    file_path        TEXT,
+    alt_text         TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS post_sources (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    post_id   INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+    name      TEXT,
+    url       TEXT,
+    pulled_at DATETIME,
+    confirmed INTEGER DEFAULT 0
+  );
+
+  CREATE TABLE IF NOT EXISTS post_metrics (
+    post_id        INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+    checkpoint     TEXT NOT NULL,              -- '1h' | '24h' | '7d'
+    impressions    INTEGER,
+    replies        INTEGER,
+    reposts        INTEGER,
+    likes          INTEGER,
+    bookmarks      INTEGER,
+    profile_visits INTEGER,
+    follows        INTEGER,
+    sampled_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (post_id, checkpoint)
+  );
+`);
+
+// Seed the nine shipped post types. Idempotent per code, so a type Mike later deletes
+// stays deleted rather than reappearing on the next boot — only genuinely missing codes
+// are inserted, and an existing row is never overwritten (his edits win).
+try {
+  const exists = db.prepare("SELECT COUNT(*) c FROM post_types WHERE code = ?");
+  const insert = db.prepare(`
+    INSERT INTO post_types (name, code, color, default_time_et, days_of_week, max_per_day,
+                            prompt_template, card_type, cashtag_min, cashtag_max, hashtag_max,
+                            length_mode, source_required, staleness_hours, active, sort_order)
+    VALUES (@name, @code, @color, @default_time_et, @days_of_week, @max_per_day,
+            @prompt_template, @card_type, @cashtag_min, @cashtag_max, @hashtag_max,
+            @length_mode, @source_required, @staleness_hours, @active, @sort_order)
+  `);
+
+  // Only seed into a table that has never been populated. Once there is any row, the
+  // table is Mike's to manage.
+  const anyRows = db.prepare("SELECT COUNT(*) c FROM post_types").get() as any;
+  if (anyRows.c === 0) {
+    const seedAll = db.transaction((types: typeof SEED_POST_TYPES) => {
+      for (const t of types) {
+        if ((exists.get(t.code) as any).c === 0) insert.run(t as any);
+      }
+    });
+    seedAll(SEED_POST_TYPES);
+    console.log(`Seeded ${SEED_POST_TYPES.length} post types (cashtags off by default)`);
+  }
+} catch (err) {
+  console.error("post_types seed error:", err);
+}
+
+// Migration: move scheduled_posts into posts.
+//
+// Runs once, guarded by the posts table being empty. Everything lands as 'draft' with
+// time_confirmed = 0 — i.e. NOT sendable — regardless of its old status. That is
+// deliberate: a row that the old publisher would have sent autonomously must not become
+// instantly live under the new approval model just because the schema changed.
+try {
+  const already = db.prepare("SELECT COUNT(*) c FROM posts").get() as any;
+  const legacyExists = db.prepare(
+    "SELECT COUNT(*) c FROM sqlite_master WHERE type='table' AND name='scheduled_posts'"
+  ).get() as any;
+
+  if (already.c === 0 && legacyExists.c > 0) {
+    const legacy = db.prepare("SELECT * FROM scheduled_posts ORDER BY id").all() as any[];
+    if (legacy.length) {
+      const manualType = db.prepare("SELECT id FROM post_types WHERE code = 'MAN'").get() as any;
+      const insert = db.prepare(`
+        INSERT INTO posts (type_id, status, body, proposed_at, scheduled_at, time_confirmed,
+                           x_post_id, posted_at, error, user_id, attempts, claimed_at,
+                           source_url, created_at)
+        VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+
+      let moved = 0;
+      for (const row of legacy) {
+        // Terminal states keep their meaning; anything live becomes a draft.
+        // The Instagram/Substack reminders were never tweetable, so they archive.
+        const status =
+          row.kind && row.kind !== 'tweet' ? 'archived'
+          : row.status === 'posted' ? 'posted'
+          : row.status === 'failed' ? 'failed'
+          : row.status === 'skipped' ? 'skipped'
+          : 'draft';
+
+        insert.run(
+          manualType?.id ?? null, status, row.content, row.scheduled_at, row.scheduled_at,
+          row.posted_tweet_id ?? null, row.status === 'posted' ? row.scheduled_at : null,
+          row.last_error ?? null, row.user_id ?? null, row.attempts ?? 0, null,
+          row.source_url ?? null, row.created_at ?? null,
+        );
+        moved++;
+      }
+      console.log(`Migrated scheduled_posts -> posts: ${moved} row(s), all live rows reset to 'draft' (not sendable)`);
+    }
+  }
+} catch (err) {
+  console.error("posts migration error:", err);
 }
 
 // Migration: add platform column to pending_auth if missing

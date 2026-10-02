@@ -21,6 +21,7 @@ const NAV_ITEMS = [
 const AUTH_NAV_ITEMS = [
   { to: '/compose', label: 'Compose' },
   { to: '/schedule', label: 'Schedule' },
+  { to: '/post-types', label: 'Post Types' },
   { to: '/weights', label: 'Weights' },
   { to: '/spend', label: 'Spend' },
 ];

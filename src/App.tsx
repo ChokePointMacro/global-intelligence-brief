@@ -16,6 +16,7 @@ import { TradeFlow } from './components/TradeFlow';
 import { Connections } from './components/Connections';
 import { WeightsAndMeasures } from './components/WeightsAndMeasures';
 import { ApiSpend } from './components/ApiSpend';
+import { PostTypes } from './components/PostTypes';
 import type { UserData } from './types';
 
 export default function App() {
@@ -86,6 +87,7 @@ export default function App() {
           <Route path="/connections" element={<Connections />} />
           <Route path="/weights" element={<WeightsAndMeasures />} />
           <Route path="/spend" element={<ApiSpend />} />
+          <Route path="/post-types" element={<PostTypes />} />
         </Routes>
       </Layout>
     </BrowserRouter>
