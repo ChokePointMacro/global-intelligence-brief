@@ -201,3 +201,24 @@ test('a spaced dash next to a number is still a connector', () => {
     'Output fell 12%: the steepest drop since 2020.',
   );
 });
+
+// ─── Browser safety ────────────────────────────────────────────────────────────
+
+test('REGRESSION: the module loads with no global `process` (the browser bundle)', async () => {
+  // ruleCheck.ts imports this module and the Post Detail / queue components import
+  // ruleCheck, so humanVoice is bundled into the browser too. A bare `process.env`
+  // read at module scope throws "process is not defined" there and white-screens the
+  // whole app. Shipped once; caught only by loading the page.
+  const saved = globalThis.process;
+  try {
+    // Deliberately simulating a runtime with no process global.
+    delete (globalThis as Record<string, unknown>).process;
+    // The query string forces a fresh module evaluation rather than a cache hit.
+    const spec = '../src/services/humanVoice.ts?no-process';
+    const fresh = (await import(/* @vite-ignore */ spec)) as typeof import('../src/services/humanVoice.ts');
+    assert.equal(fresh.SCRUB_ENABLED, true, 'defaults to on when there is no env to read');
+    assert.equal(fresh.scrubAiTells('a \u2014 b'), 'a: b', 'and the scrub still works');
+  } finally {
+    globalThis.process = saved;
+  }
+});

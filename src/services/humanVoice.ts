@@ -21,7 +21,17 @@
  * Kill switch: HUMANIZE_OUTPUT=off disables the scrub pass (detection still runs).
  */
 
-export const SCRUB_ENABLED = process.env.HUMANIZE_OUTPUT !== 'off';
+/**
+ * This module is imported by ruleCheck.ts, which the Post Detail and queue components
+ * import, so it is bundled into the BROWSER as well as run on the server. `process`
+ * does not exist there and a bare `process.env` read at module scope white-screens the
+ * whole app. The kill switch is a server-side concern anyway: in the browser nothing
+ * generates text, it only checks it, so the default is the right answer.
+ */
+export const SCRUB_ENABLED =
+  typeof process !== 'undefined' && process?.env
+    ? process.env.HUMANIZE_OUTPUT !== 'off'
+    : true;
 
 // ─── Prompt blocks ─────────────────────────────────────────────────────────────
 
