@@ -19,6 +19,7 @@
 // which a plain `.length` gets right.
 import twitterText from 'twitter-text';
 import type { PostType } from './postTypes.ts';
+import { detectAiTells } from './humanVoice.ts';
 
 const { parseTweet, extractHashtags, extractCashtags, extractUrls } = twitterText;
 
@@ -196,6 +197,16 @@ export function checkPost(body: string, ctx: CheckContext = {}): RuleCheckResult
       'unsourced_number',
       'Contains a figure with no source attached.',
     );
+  }
+
+  // ── House voice ──
+  // The AI tells from humanVoice.ts, surfaced on anything about to be published,
+  // including a post Mike typed or pasted himself. Warnings, never errors: the
+  // generators already scrub their own output, so a tell reaching here is either a
+  // judgement call the scrub refused to make or a human's deliberate choice. Blocking
+  // approval on "stock AI vocabulary" would get the checker switched off within a week.
+  for (const t of detectAiTells(text)) {
+    add('warning', t.code, t.samples.length ? `${t.message} ("${t.samples[0]}")` : t.message);
   }
 
   // Same reasoning: no media support exists yet, so this cannot be a blocker.

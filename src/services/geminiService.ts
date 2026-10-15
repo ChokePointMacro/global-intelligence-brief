@@ -1,4 +1,8 @@
 import { generateReportWithFallback, generateTextWithFallback, parseJSONResponse } from "./aiService";
+import {
+  HUMAN_VOICE_RULES, HUMAN_VOICE_RULES_COMPACT,
+  scrubAiTells, scrubAiTellsVerbose, scrubField, detectAiTells, summariseTells,
+} from './humanVoice.ts';
 
 // ── Interfaces ────────────────────────────────────────────────────────────────
 
@@ -462,6 +466,47 @@ const REPORT_CONFIGS: Record<string, ReportConfig> = {
   },
 };
 
+/**
+ * Run the house voice over every prose field of a finished report, then fold whatever
+ * survived into the report's warnings.
+ *
+ * The prompt is the primary defence (see humanVoice.ts). This is the backstop that
+ * makes the absolute rules actually hold in what gets published: no em dashes, no
+ * curly quotes, no chatbot residue. Anything that needs judgement to fix is reported
+ * rather than rewritten, because a wrong mechanical edit to an argument is worse than
+ * a surviving tell.
+ */
+function applyHouseVoice(
+  headlines: Headline[] | undefined,
+  analysis: Analysis | undefined,
+  warnings: string[],
+  label: string,
+): void {
+  const prose: string[] = [];
+
+  for (const h of headlines ?? []) {
+    h.title      = scrubField(h.title);
+    h.summary    = scrubField(h.summary);
+    h.socialPost = scrubField(h.socialPost);
+    prose.push(h.summary ?? '', h.socialPost ?? '');
+  }
+
+  if (analysis) {
+    analysis.performanceRanking = scrubField(analysis.performanceRanking);
+    analysis.overallSummary     = scrubField(analysis.overallSummary);
+    analysis.globalSocialPost   = scrubField(analysis.globalSocialPost);
+    prose.push(analysis.overallSummary ?? '', analysis.globalSocialPost ?? '');
+  }
+
+  const line = summariseTells(detectAiTells(prose.join('\n\n')), `${label} voice check`);
+  if (line) {
+    warnings.push(line);
+    console.warn(`[${label}] ${line}`);
+  } else {
+    console.log(`[${label}] voice check clean`);
+  }
+}
+
 // ── Speculation report ────────────────────────────────────────────────────────
 
 /**
@@ -481,7 +526,9 @@ export const X_POST_CRAFT_RULES = `  THE FOLD — X truncates every post in the 
   * Judge by information density, not word count. Ask: does this story's importance justify the attention this length demands? A single-actor, single-number development almost never does. A multi-actor causal chain often does.
 
   Name entities explicitly and canonically — companies, countries, institutions, tickers, waterways, agencies. X classifies and distributes posts by reading the text semantically, so precise entity naming does more for reach than any hashtag.
-  Format: if the post runs past the fold, use short paragraphs separated by blank lines.`;
+  Format: if the post runs past the fold, use short paragraphs separated by blank lines.
+
+${HUMAN_VOICE_RULES_COMPACT}`;
 
 export async function generateSpeculationReport(onProgress?: ProgressCallback): Promise<WeeklyReport & { _sources?: SourceStatus[]; _warnings?: string[] }> {
   const currentDate = formatCurrentDate();
@@ -514,6 +561,8 @@ PRIORITY RANKING — weight by:
 2. Presence of specific ticker symbols, company names, or dates (actionability)
 3. Cross-subreddit confirmation (same rumour appearing in multiple subs = higher weight)
 4. Recency (last 48h scores highest)
+
+${HUMAN_VOICE_RULES}
 
 HEADLINE FIELDS (repeat for all 20):
 - title: factual headline ≤20 words describing the speculation/rumour/leak
@@ -560,6 +609,7 @@ OUTPUT RULES:
     warnings.push('Analysis section was missing — synthesized from headlines.');
   }
   parsed.headlines.sort((a, b) => (b.trendScore ?? 0) - (a.trendScore ?? 0));
+  applyHouseVoice(parsed.headlines, parsed.analysis, warnings, 'generateSpeculationReport');
   onProgress?.('Complete', 100, specSources);
   console.log(`[generateSpeculationReport] ✓ ${parsed.headlines.length} items`);
   return { ...parsed, _sources: specSources, _warnings: warnings.length ? warnings : undefined };
@@ -622,6 +672,8 @@ For each event, provide a rigorous probabilistic assessment and dual-outcome imp
 
 RANKING: Sort events by (probability × expected magnitude of impact). Most impactful expected outcome = rank 1.
 
+${HUMAN_VOICE_RULES}
+
 EVENT FIELDS (repeat for all 10):
 - rank: integer 1–10
 - title: clear event name ≤15 words — WHAT, WHERE, WHEN
@@ -663,6 +715,29 @@ OUTPUT RULES:
     if (!parsed.analysis) warnings.push('Analysis section was missing.');
 
     parsed.events.sort((a, b) => a.rank - b.rank);
+
+    // The same house-voice backstop as the headline reports, over this shape's fields.
+    const forecastProse: string[] = [];
+    for (const e of parsed.events) {
+      e.title                = scrubField(e.title);
+      e.summary              = scrubField(e.summary);
+      e.effectIfHappens      = scrubField(e.effectIfHappens);
+      e.effectIfDoesntHappen = scrubField(e.effectIfDoesntHappen);
+      forecastProse.push(e.summary ?? '', e.effectIfHappens ?? '', e.effectIfDoesntHappen ?? '');
+    }
+    if (parsed.analysis) {
+      parsed.analysis.dominantTheme      = scrubField(parsed.analysis.dominantTheme);
+      parsed.analysis.highestImpactEvent = scrubField(parsed.analysis.highestImpactEvent);
+      parsed.analysis.globalSocialPost   = scrubField(parsed.analysis.globalSocialPost);
+      forecastProse.push(
+        parsed.analysis.dominantTheme ?? '',
+        parsed.analysis.highestImpactEvent ?? '',
+        parsed.analysis.globalSocialPost ?? '',
+      );
+    }
+    const forecastVoice = summariseTells(detectAiTells(forecastProse.join('\n\n')), 'generateForecastReport voice check');
+    if (forecastVoice) { warnings.push(forecastVoice); console.warn(`[generateForecastReport] ${forecastVoice}`); }
+
     onProgress?.('Complete', 100, sourceStatuses);
     console.log(`[generateForecastReport] ✓ Generated ${parsed.events.length} forecast events`);
     return { ...parsed, _sources: sourceStatuses, _warnings: warnings.length ? warnings : undefined };
@@ -748,8 +823,10 @@ ${trendingWeightInstructions}
 
 ${conspiracyAddition}
 
+${HUMAN_VOICE_RULES}
+
 HEADLINE FIELDS (repeat for all 20):
-- title: factual headline ≤20 words — WHAT, WHERE, WHEN
+- title: factual headline ≤20 words. WHAT, WHERE, WHEN
 - trendScore: integer 1–100 (trending weight as described above)
 - summary: 150–200 words. Cover: what happened, who is involved, key numbers/dates, and why it matters strategically. Be specific and factual.
 - url: primary source URL (Reuters, AP, Bloomberg, BBC, WSJ, FT, etc.)
@@ -816,7 +893,9 @@ Produce ONLY the analysis object for this report as valid JSON, no markdown:
 - performanceRanking: top 3 stories by strategic importance, one sentence each
 - verificationScore / integrityScore: integers 1-100
 - overallSummary: 100-150 word synthesis of dominant trends and forward outlook
-- globalSocialPost: standalone X post digesting the single theme tying these stories together. No target length — decide it from how much substance the digest carries. No hashtags, no URLs, no emoji.`;
+- globalSocialPost: standalone X post digesting the single theme tying these stories together. No target length: decide it from how much substance the digest carries. No hashtags, no URLs, no emoji.
+
+${HUMAN_VOICE_RULES_COMPACT}`;
         const repair = await generateReportWithFallback(repairPrompt, ["claude", "gpt"], 2000, `analysis_repair_${type}`);
         const repaired = parseJSONResponse<{ analysis: Analysis }>(repair);
         if (repaired?.analysis?.overallSummary) {
@@ -852,6 +931,9 @@ Produce ONLY the analysis object for this report as valid JSON, no markdown:
 
     parsed.headlines.sort((a, b) => (b.trendScore ?? 0) - (a.trendScore ?? 0));
     validateHeadlines(parsed.headlines);
+
+    // Before the hashtag pass, so socialPostWithTags is composed from scrubbed text.
+    applyHouseVoice(parsed.headlines, parsed.analysis, warnings, 'generateWeeklyReport');
 
     // Second pass: analyse the finished posts and attach reach tags.
     onProgress?.('Analysing reach / hashtags...', 92, sourceStatuses);
@@ -1019,7 +1101,9 @@ ARTICLE STRUCTURE (follow exactly):
 6. **BOTTOM LINE** (200–250 words) — concise, direct conclusion summarising actionable insight for investors and analysts. No fluff.
 7. **EDITOR'S NOTE** (50–80 words) — short disclosure paragraph in ChokePoint Macro voice: data sourced from major news networks, analysis is for informational purposes only
 
-TONE: Authoritative, analytical, direct. Think The Economist meets Zerohedge — sophisticated but not jargon-heavy. First-person plural ("we") is appropriate.
+TONE: Authoritative, analytical, direct. Think The Economist meets Zerohedge: sophisticated, not jargon-heavy. First-person plural ("we") is appropriate.
+
+${HUMAN_VOICE_RULES}
 
 FORMATTING: Use markdown headers (##), bold for key terms, and keep paragraphs short (3–5 sentences max).
 
@@ -1041,9 +1125,18 @@ ${report.analysis.overallSummary}`;
     // survives a Claude outage and is metered like every other call.
     const response = await generateTextWithFallback(prompt, ["claude", "gpt"], 4000, 'substack_article',
       "You are a senior financial and geopolitical intelligence analyst. Write in a professional, authoritative style.");
-    const article = response.content;
-    if (!article) throw new Error("Empty response from AI providers");
-    console.log("[generateSubstackArticle] ✓ Article generated");
+    const raw = response.content;
+    if (!raw) throw new Error("Empty response from AI providers");
+
+    // House-voice backstop. The article is the one output nothing downstream checks,
+    // so the scrub runs here and anything it could not fix safely is logged for Mike
+    // rather than silently published.
+    const { text: article, changed } = scrubAiTellsVerbose(raw);
+    if (changed.length) console.log(`[generateSubstackArticle] voice scrub fixed: ${changed.join(', ')}`);
+    const leftover = summariseTells(detectAiTells(article), 'generateSubstackArticle voice check');
+    if (leftover) console.warn(`[generateSubstackArticle] ${leftover}`);
+
+    console.log("[generateSubstackArticle] Article generated");
     return article;
   } catch (error) {
     console.error("[generateSubstackArticle] Failed:", error);
@@ -1076,6 +1169,8 @@ STRICT REQUIREMENTS:
 6. Maintain a sharp, insight-focused tone.
 7. Include 5-10 relevant hashtags.
 8. Do NOT just list the 20 headlines. Synthesize them.
+
+${HUMAN_VOICE_RULES_COMPACT}
 `;
 
   console.log("[generateInstagramCaption] Starting caption generation...");
@@ -1085,7 +1180,7 @@ STRICT REQUIREMENTS:
   try {
     const response = await generateTextWithFallback(prompt, ["claude", "gpt"], 2200, 'instagram_caption',
       "You are an expert social media strategist. Create engaging Instagram captions.");
-    if (response.content) return truncateToInstagram(response.content);
+    if (response.content) return truncateToInstagram(scrubAiTells(response.content));
   } catch (err) {
     console.error("[generateInstagramCaption] all providers failed:", err instanceof Error ? err.message : String(err));
   }
@@ -1178,6 +1273,8 @@ Keep the hardest number, the named entities and the causal point. Cut setup, res
 and anything that is not load-bearing. Do not add new facts. Do not add hashtags, cashtags,
 URLs or emoji. Return ONLY the shortened post.
 
+${HUMAN_VOICE_RULES_COMPACT}
+
 POST:
 ${text}`;
       const condensed = await generateTextWithFallback(condensePrompt, ['claude', 'gpt'], 1000, `slot_condense_${ctx.typeCode}`);
@@ -1186,7 +1283,7 @@ ${text}`;
       else text = text.slice(0, limit).replace(/\s+\S*$/, '');   // last resort: clean cut
     }
 
-    return { text, sourceUrl: pick.url, eventId: headlineId(pick), reused: true };
+    return { text: scrubAiTells(text), sourceUrl: pick.url, eventId: headlineId(pick), reused: true };
   }
 
   // ── Path 2: synthesise ──
@@ -1227,7 +1324,7 @@ STORIES
 Return ONLY the post text. No JSON, no preamble, no quotes around it.`;
 
   const res = await generateTextWithFallback(prompt, ['claude', 'gpt'], 2000, `slot_${ctx.typeCode}`);
-  let text = res.content.trim().replace(/^["'`]|["'`]$/g, '');
+  let text = scrubAiTells(res.content.trim().replace(/^["'`]|["'`]$/g, ''));
 
   // Models overshoot a stated limit often enough that it cannot be left to the prompt.
   // Trim on a word boundary rather than mid-word; the rule checker is the backstop.
