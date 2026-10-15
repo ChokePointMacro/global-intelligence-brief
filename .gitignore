@@ -8,3 +8,20 @@ coverage/
 !.env.example
 *.sqlite
 sessions/
+
+# nightly VACUUM INTO snapshots (see backupDatabase() in server.ts).
+# Already covered by *.sqlite above, but listed explicitly because these must never be
+# committed: the database contains live X OAuth access and refresh tokens.
+backups/
+
+# uploaded post images (post_media.file_path)
+media/
+
+# runtime logs (structured JSONL from src/services/log.ts)
+logs/
+*.jsonl
+
+# local scratch
+tmp-*.ts
+.env.bak-*
+.env.bak2-*

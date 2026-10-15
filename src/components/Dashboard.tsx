@@ -216,17 +216,23 @@ export const Dashboard = () => {
     setAudioUrl(null);
     abortControllerRef.current = new AbortController();
 
-    // Simulate progress bar stages
-    const progressInterval = setInterval(() => {
-      setLoadingPercent(prev => {
-        if (prev < 15) { setLoadingStage('Fetching news sources...'); return prev + 3; }
-        if (prev < 30) { setLoadingStage('Filtering & scoring articles...'); return prev + 2; }
-        if (prev < 50) { setLoadingStage('Sending to AI provider...'); return prev + 1; }
-        if (prev < 85) { setLoadingStage('AI generating report...'); return prev + 0.5; }
-        if (prev < 92) { setLoadingStage('Parsing AI response...'); return prev + 0.3; }
-        return prev;
-      });
-    }, 800);
+    // Poll the server for REAL progress. This used to be a timer-driven fake that
+    // counted up to 92.1999% and froze there, while showing a stage label unrelated
+    // to what the server was doing. Generation legitimately takes ~4 minutes, so the
+    // bar must reflect actual state or it reads as a hang.
+    const progressInterval = setInterval(async () => {
+      try {
+        const r = await apiFetch(`/api/generate-report/progress?type=${encodeURIComponent(reportType)}`);
+        if (!r.ok) return;
+        const p = await r.json();
+        if (!p.active) return;
+        const secs = Math.floor((p.elapsedMs ?? 0) / 1000);
+        const mmss = `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}`;
+        // Never move backwards — milestones can repeat across retries.
+        setLoadingPercent(prev => Math.max(prev, p.percent));
+        setLoadingStage(`${p.stage} · ${mmss} elapsed`);
+      } catch { /* transient poll failure: keep the last known state */ }
+    }, 1500);
 
     try {
       const response = await apiFetch('/api/generate-report', {
@@ -503,12 +509,18 @@ export const Dashboard = () => {
       instaFolder.file('report-summary.txt', summaryLines);
 
       weeklyReport!.headlines.forEach((h, i) => {
-        const tweetContent = [h.socialPost, '', `Source: ${h.url}`].join('\n');
+        const tweetContent = [h.socialPostWithTags || h.socialPost, '', `Source: ${h.url}`].join('\n');
         tweetsFolder.file(`${date}-${String(i + 1).padStart(2, '0')}-${slugify(h.title)}.txt`, tweetContent);
       });
 
       const allTweets = weeklyReport!.headlines
-        .map((h, i) => `--- Tweet ${String(i + 1).padStart(2, '0')} [${h.category}] ---\n${h.socialPost}\n${h.url}`)
+        .map((h, i) => [
+          `--- Tweet ${String(i + 1).padStart(2, '0')} [${h.category}] ---`,
+          h.socialPostWithTags || h.socialPost,
+          h.url,
+          h.audience ? `# targets: ${h.audience}` : '',
+          h.hashtagRationale ? `# why: ${h.hashtagRationale}` : '',
+        ].filter(Boolean).join('\n'))
         .join('\n\n');
       tweetsFolder.file('all-tweets.txt', allTweets);
 
@@ -962,15 +974,36 @@ export const Dashboard = () => {
                           </div>
                           <h4 className="text-sm font-serif font-medium leading-tight group-hover:italic transition-all text-white">{h.title}</h4>
                           <p className="text-[11px] leading-snug text-gray-300">{h.summary}</p>
+
+                          {/* The post that actually goes to X. The card used to show only the
+                              summary, and the buttons below posted that summary — so the
+                              generated social post and its hashtags never reached X at all. */}
+                          {(h.socialPostWithTags || h.socialPost) && (
+                            <div className="mt-2 pt-2 border-t" style={{ borderColor: T.borderLight }}>
+                              <div className="flex items-center gap-1.5 mb-1">
+                                <Send size={8} style={{ color: T.hex }} />
+                                <span className="text-[7px] font-mono uppercase tracking-widest" style={{ color: T.textFaint }}>
+                                  X post · {(h.socialPostWithTags || h.socialPost).length} chars
+                                </span>
+                              </div>
+                              <p className="text-[11px] leading-snug whitespace-pre-line" style={{ color: T.hex }}>
+                                {h.socialPostWithTags || h.socialPost}
+                              </p>
+                              {h.audience && (
+                                <p className="text-[8px] font-mono mt-1" style={{ color: T.textFaint }}>targets: {h.audience}</p>
+                              )}
+                            </div>
+                          )}
                         </div>
 
                         <div className="mt-1.5 pt-1.5 border-t flex items-center justify-between" style={{ borderColor: T.borderLight }}>
                           <span className="text-[7px] font-mono uppercase tracking-widest" style={{ color: T.textFaint }}>#{i + 1}</span>
                           <div className="flex gap-0.5">
-                            <button onClick={() => handlePost(h.summary)} className="p-1.5 hover:bg-white/5 rounded-sm transition-colors" style={{ color: T.hex }} title="Post to X">
+                            {/* Post the crafted social post, NOT the analyst summary. */}
+                            <button onClick={() => handlePost(h.socialPostWithTags || h.socialPost || h.summary)} className="p-1.5 hover:bg-white/5 rounded-sm transition-colors" style={{ color: T.hex }} title="Post to X">
                               <Send size={12} />
                             </button>
-                            <button onClick={() => handleSchedule(h.summary)} className="p-1.5 hover:bg-white/5 rounded-sm transition-colors" style={{ color: T.hex }} title="Schedule Post">
+                            <button onClick={() => handleSchedule(h.socialPostWithTags || h.socialPost || h.summary)} className="p-1.5 hover:bg-white/5 rounded-sm transition-colors" style={{ color: T.hex }} title="Schedule Post">
                               <Clock size={12} />
                             </button>
                           </div>

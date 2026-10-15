@@ -15,7 +15,9 @@ export const PLATFORM_CONFIG = {
     instructions: 'Create an app → Settings → User authentication settings → enable OAuth 2.0 → set redirect URI to your APP_URL/auth/x/callback',
     fields: [
       { key: 'client_id',     label: 'OAuth 2.0 Client ID',     placeholder: 'xxxxxxxxxxxxxxxxxxxxxxxxx',  type: 'text'     },
-      { key: 'client_secret', label: 'OAuth 2.0 Client Secret', placeholder: 'xxxxxxxxxxxxxxxxxxxxxxxxx', type: 'password' },
+      // Optional: "Native App" / "Single page App" types are public clients and X issues
+      // them no secret at all. Leave blank for those — PKCE alone authenticates.
+      { key: 'client_secret', label: 'OAuth 2.0 Client Secret (blank if Native / SPA app)', placeholder: 'leave empty for public clients', type: 'password', optional: true },
     ],
   },
   instagram: {
@@ -149,8 +151,22 @@ export const CredentialsModal = ({
             {cfg.fields.map(f => (
               <div key={f.key}>
                 <label className="text-[9px] font-mono uppercase tracking-widest text-white/30 block mb-1">{f.label}</label>
+                {/* Autofill defences. Without these Chrome reads this as a login form and
+                    injects saved email/password (or stray X 1.0a tokens) into the OAuth
+                    fields — which then get saved as credentials and silently break auth.
+                    `new-password` is required because Chrome ignores `off` on password
+                    inputs; the unguessable name keeps its field heuristics from matching. */}
                 <input
                   type={f.type}
+                  name={`gib-${platform}-${f.key}-nofill`}
+                  id={`gib-${platform}-${f.key}-nofill`}
+                  autoComplete={f.type === 'password' ? 'new-password' : 'off'}
+                  data-1p-ignore
+                  data-lpignore="true"
+                  data-form-type="other"
+                  spellCheck={false}
+                  autoCorrect="off"
+                  autoCapitalize="off"
                   placeholder={f.placeholder}
                   value={fields[f.key] || ''}
                   onChange={e => setFields(prev => ({ ...prev, [f.key]: e.target.value }))}
@@ -167,7 +183,7 @@ export const CredentialsModal = ({
           <div className="flex gap-2">
             <button
               onClick={handleSave}
-              disabled={saving || testing || cfg.fields.some(f => !fields[f.key]?.trim())}
+              disabled={saving || testing || cfg.fields.some(f => !(f as any).optional && !fields[f.key]?.trim())}
               className={`flex-1 flex items-center justify-center gap-2 py-2.5 border ${cfg.border} ${cfg.bg} ${cfg.color} text-[10px] font-mono uppercase tracking-widest hover:opacity-80 transition-all disabled:opacity-30`}
             >
               {saving ? <Loader2 size={11} className="animate-spin" /> :

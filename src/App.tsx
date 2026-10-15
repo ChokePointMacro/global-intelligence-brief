@@ -1,18 +1,21 @@
 import { useState, useEffect } from 'react';
-import { BrowserRouter, Routes, Route } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { Loader2 } from 'lucide-react';
 import { apiFetch } from './lib/api';
 import { Layout } from './components/Layout';
 import { Dashboard } from './components/Dashboard';
 import { Profile } from './components/Profile';
 import { Compose } from './components/Compose';
-import { Schedule } from './components/Schedule';
 import { Settings } from './components/Settings';
 import { Markets } from './components/Markets';
 import { Reports } from './components/Reports';
 import { AutomatedReports } from './components/AutomatedReports';
 import { Terminal } from './components/Terminal';
 import { TradeFlow } from './components/TradeFlow';
+import { Connections } from './components/Connections';
+import { WeightsAndMeasures } from './components/WeightsAndMeasures';
+import { ApiSpend } from './components/ApiSpend';
+import { Tweets } from './components/Tweets';
 import type { UserData } from './types';
 
 export default function App() {
@@ -21,10 +24,11 @@ export default function App() {
 
   const checkAuth = async () => {
     try {
-      const res = await apiFetch('/api/me');
+      const res = await apiFetch('/api/auth/me');
       if (res.ok) {
         const data = await res.json();
-        setUser(data.user || null);
+        // /api/auth/me returns the user at the top level, not wrapped in { user }.
+        setUser(data.user ?? (data.id ? data : null));
       } else {
         setUser(null);
       }
@@ -36,7 +40,7 @@ export default function App() {
   };
 
   const handleLogout = async () => {
-    await apiFetch('/api/logout', { method: 'POST' });
+    await apiFetch('/api/auth/logout', { method: 'POST' });
     window.localStorage.removeItem('debug_sid');
     setUser(null);
   };
@@ -72,13 +76,21 @@ export default function App() {
           <Route path="/" element={<Dashboard />} />
           <Route path="/profile" element={<Profile user={user} onLogout={handleLogout} />} />
           <Route path="/compose" element={<Compose user={user} />} />
-          <Route path="/schedule" element={<Schedule />} />
           <Route path="/settings" element={<Settings user={user} onLogout={handleLogout} />} />
           <Route path="/markets" element={<Markets user={user} />} />
           <Route path="/reports" element={<Reports />} />
           <Route path="/automated" element={<AutomatedReports />} />
           <Route path="/terminal" element={<Terminal />} />
           <Route path="/trade-flow" element={<TradeFlow />} />
+          <Route path="/connections" element={<Connections />} />
+          <Route path="/weights" element={<WeightsAndMeasures />} />
+          <Route path="/spend" element={<ApiSpend />} />
+          <Route path="/tweets" element={<Tweets />} />
+          {/* The tweet workflow used to be split across four screens. They now redirect
+              to the one page so old links and muscle memory keep working. */}
+          <Route path="/queue" element={<Navigate to="/tweets" replace />} />
+          <Route path="/post-types" element={<Navigate to="/tweets" replace />} />
+          <Route path="/schedule" element={<Navigate to="/tweets" replace />} />
         </Routes>
       </Layout>
     </BrowserRouter>

@@ -304,11 +304,11 @@ export const Profile = ({ user, onLogout }: { user: UserData | null; onLogout: (
                               <button onClick={() => disconnectPlatform('x')} className="text-[9px] font-mono text-red-400/60 hover:text-red-400 uppercase tracking-wider transition-colors">Disconnect</button>
                             </>
                           : <div className="flex items-center gap-1.5">
-                            {!configuredPlatforms['x'] && (
-                              <button onClick={() => setCredModal('x')} className="flex items-center gap-1 px-2 py-1.5 border border-white/10 text-white/30 text-[9px] font-mono uppercase tracking-wider hover:text-btc-orange/60 hover:border-btc-orange/20 transition-all" title="Configure OAuth App">
-                                <SettingsIcon size={9} /> Configure
-                              </button>
-                            )}
+                            {/* Always offered. Credentials that are present but WRONG are the
+                                common case, and hiding this once configured left no way to fix them. */}
+                            <button onClick={() => setCredModal('x')} className="flex items-center gap-1 px-2 py-1.5 border border-white/10 text-white/30 text-[9px] font-mono uppercase tracking-wider hover:text-btc-orange/60 hover:border-btc-orange/20 transition-all" title="Configure OAuth App">
+                              <SettingsIcon size={9} /> {configuredPlatforms['x'] ? 'Replace Keys' : 'Configure'}
+                            </button>
                             <button
                               onClick={() => connectOAuth('x/connect', 'OAUTH_X_CONNECT_SUCCESS')}
                               disabled={connectingPlatform === 'x/connect'}

@@ -14,13 +14,50 @@ import db from "./db.ts";
 import dotenv from "dotenv";
 import path from "path";
 import { generateWeeklyReport, generateInstagramCaption, generateSubstackArticle, generateForecastReport, generateSpeculationReport, type WeeklyReport } from "./src/services/geminiService.ts";
+import { rateLimits as aiRateLimits, onAISpend, setSpendGuard } from "./src/services/aiService.ts";
+import { log, errInfo, installProcessHandlers } from "./src/services/log.ts";
+import { aiSpend, xSpend } from "./src/services/spend.ts";
+import {
+  etParts, etToUtc, etMinutesOfDay, etDateString, parseHhMm,
+  nextEtWeekdayMidnight, normaliseScheduledAt, parseSqliteUtc,
+} from "./src/services/time.ts";
+import { backupDatabase } from "./src/services/backup.ts";
+import { createAnalytics } from "./src/server/analytics.ts";
+import { createMarketsRouter } from "./src/server/markets.ts";
+import { createPostQueueRouter } from "./src/server/postQueue.ts";
 
 import fs from "fs";
 
 dotenv.config();
 
 const app = express();
-const PORT = 3000;
+// 3000 by default. Overridable so a throwaway instance can be booted against a copy of
+// the database (with posting disabled) to exercise the publisher without touching the
+// real one — the OAuth redirect already follows whatever loopback port you browse.
+const PORT = Number(process.env.PORT) || 3000;
+
+// ─── Connection Rate Limit Tracker ────────────────────────────────────────────
+
+interface RateLimitSnapshot {
+  limitRequests?: number;
+  limitTokens?: number;
+  remainingRequests?: number;
+  remainingTokens?: number;
+  resetRequests?: string;
+  resetTokens?: string;
+  inputTokensUsed?: number;
+  outputTokensUsed?: number;
+  lastCallAt?: string;
+  lastModel?: string;
+  lastError?: string;
+}
+
+const connectionTracker: Record<string, RateLimitSnapshot> = {
+  anthropic: {},
+  gemini: {},
+  x: {},
+  public: {},
+};
 
 // ─── Startup Security Checks ───────────────────────────────────────────────────
 
@@ -84,9 +121,30 @@ const emailLimiter = rateLimit({
   message: { error: "Email rate limit exceeded. Maximum 5 emails per hour." },
 });
 
+// ─── Local single-user mode ────────────────────────────────────────────────────
+// This runs only on the owner's machine as the posting/automation engine. There is
+// no multi-user story and it is never forward-facing, so the login gate is bypassed
+// and every request runs as the owner. Two things keep that safe: the server binds
+// to loopback only (see app.listen), and LOCAL_MODE=false in .env restores the gate.
+const LOCAL_MODE = process.env.LOCAL_MODE !== 'false';
+const LOCAL_USER_ID = process.env.LOCAL_USER_ID || 'm@aol.com';
+
+if (LOCAL_MODE) {
+  // The X token row is keyed by user_id, so the owner row must exist for the
+  // connect flow and /api/auth/me to have something to join against.
+  const owner = db.prepare("SELECT id FROM users WHERE email = ?").get(LOCAL_USER_ID) as any;
+  if (!owner) {
+    db.prepare("INSERT INTO users (email, username, display_name) VALUES (?, ?, ?)")
+      .run(LOCAL_USER_ID, LOCAL_USER_ID.split('@')[0], 'Operator');
+    console.log(`[local-mode] created owner row for ${LOCAL_USER_ID}`);
+  }
+  console.log(`[local-mode] auth bypassed — every request runs as ${LOCAL_USER_ID}`);
+}
+
 // ─── Auth Middleware ───────────────────────────────────────────────────────────
 
 const requireAuth = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (LOCAL_MODE) return next();
   if (!(req.session as any).userId) return res.status(401).json({ error: "Not authenticated" });
   next();
 };
@@ -124,6 +182,16 @@ app.use(
   })
 );
 
+// Local mode: stamp every request as the owner. Downstream code reads the user off
+// the session, so setting it here means the X connect flow, posting, and scheduling
+// all keep working unchanged instead of needing an auth refactor.
+app.use((req, _res, next) => {
+  if (LOCAL_MODE && (req.session as any).userId !== LOCAL_USER_ID) {
+    (req.session as any).userId = LOCAL_USER_ID;
+  }
+  next();
+});
+
 // Reduced logging verbosity - usually only needed in dev or for errors
 app.use((req, res, next) => {
   if (process.env.NODE_ENV !== 'production') {
@@ -152,7 +220,10 @@ function hasValidCreds(platform: string): boolean {
   if (platform === 'x') {
     const id = getPlatformCred('x', 'client_id');
     const sec = getPlatformCred('x', 'client_secret');
-    return !!(id && sec && !id.includes('dummy') && !sec.includes('dummy'));
+    // A secret is optional: X "Native App" / "Single page App" types are public
+    // clients that have no secret at all and authenticate with PKCE alone.
+    if (!id || id.includes('dummy')) return false;
+    return !sec || !sec.includes('dummy');
   }
   if (platform === 'instagram') return !!(getPlatformCred('instagram', 'app_id') && getPlatformCred('instagram', 'app_secret'));
   if (platform === 'linkedin')  return !!(getPlatformCred('linkedin',  'client_id') && getPlatformCred('linkedin',  'client_secret'));
@@ -161,10 +232,142 @@ function hasValidCreds(platform: string): boolean {
 }
 
 function getXClient(): TwitterApi {
-  return new TwitterApi({
-    clientId:     getPlatformCred('x', 'client_id'),
-    clientSecret: getPlatformCred('x', 'client_secret'),
-  });
+  const clientId = getPlatformCred('x', 'client_id');
+  const clientSecret = getPlatformCred('x', 'client_secret');
+  // Passing a clientSecret makes twitter-api-v2 send a Basic auth header. X rejects
+  // that outright for public clients (Native / SPA app types), which have no secret
+  // and authenticate with PKCE alone — so omit it entirely when none is configured.
+  return clientSecret ? new TwitterApi({ clientId, clientSecret }) : new TwitterApi({ clientId });
+}
+
+// X Premium allows long-form posts (25,000 chars); the free tier is capped at 280.
+// This is only a sanity bound — X itself is the real authority and will reject an
+// over-length post with a clear error. Set X_MAX_POST_CHARS=280 to enforce free-tier.
+const X_MAX_POST_CHARS = Number(process.env.X_MAX_POST_CHARS) || 25000;
+
+// Cite sources as a reply to the post rather than inside it. X reduces reach ~30-50% on
+// posts containing external links, so the body stays clean and the citation goes one level
+// down. Costs one extra API post per tweet (a link post is billed higher than a plain one),
+// which is why this is opt-in: set POST_SOURCE_AS_REPLY=true in .env to enable.
+const POST_SOURCE_AS_REPLY = process.env.POST_SOURCE_AS_REPLY === 'true';
+
+// ─── Publisher safety rails ────────────────────────────────────────────────────
+// This posts to a live public account on a timer and each post costs money, so the
+// scheduler needs bounds.
+const POSTING_DRY_RUN = process.env.POSTING_DRY_RUN === 'true';    // log, never send
+const MAX_POSTS_PER_RUN = Number(process.env.MAX_POSTS_PER_RUN) || 5;
+const CLAIM_TIMEOUT_MIN = Number(process.env.POST_CLAIM_TIMEOUT_MIN) || 10;
+
+// How late a slot may fire. Past this, the post is skipped rather than published.
+//
+// Without this bound the due-query is an open-ended backward window: every pending
+// row whose scheduled_at is in the past qualifies, oldest first. Sleep the laptop over
+// a weekend and the whole backlog publishes at MAX_POSTS_PER_RUN/minute on wake —
+// stalest market commentary first, which is both wrong and a good way to get flagged.
+// Losing a slot is recoverable; publishing Friday's "what matters today" on Monday is not.
+const MAX_SLOT_LATENESS_MIN = Number(process.env.POST_MAX_LATE_MIN) || 30;
+
+// A report generation may still catch up later in the day — a brief is not as
+// perishable as a market post, and regenerating uses live data anyway.
+const MAX_REPORT_LATENESS_MIN = Number(process.env.REPORT_MAX_LATE_MIN) || 360;
+
+/**
+ * Posting kill switch — DB-backed so it can be flipped without a restart.
+ *
+ * Deliberately FAIL-CLOSED: with nothing configured, posting is OFF. The previous
+ * default was fail-open (`!== 'false'`), meaning a fresh checkout, a lost .env, or a
+ * typo in the variable name all resulted in a live account posting on a timer. For an
+ * irreversible, public, billable action the safe default is silence.
+ *
+ * Resolution order: app_settings.posting_enabled (UI toggle) → POSTING_ENABLED env → off.
+ */
+function isPostingEnabled(): boolean {
+  try {
+    const row = db.prepare("SELECT value FROM app_settings WHERE key = 'posting_enabled'").get() as any;
+    if (row?.value != null) return row.value === 'true' || row.value === '1';
+  } catch (err) {
+    // A DB read failure must not be interpreted as consent to post.
+    log.warn('posting_toggle_read_failed', errInfo(err));
+    return false;
+  }
+  return process.env.POSTING_ENABLED === 'true';
+}
+
+/**
+ * Out-of-band notification for things the operator must know about but would never
+ * see in a terminal: a skipped slot, a tripped spend cap, a failed publish.
+ *
+ * Email because that is the only channel this app already has configured. The build
+ * plan's Tailscale/Telegram approval path lands in a later phase; until then this is
+ * the honest ceiling — if SMTP isn't configured it logs loudly and nothing more.
+ */
+async function notifyOps(subject: string, body: string): Promise<void> {
+  log.warn('ops_notify', { subject, body: body.slice(0, 500) });
+
+  const to = (() => {
+    try {
+      const row = db.prepare("SELECT value FROM app_settings WHERE key = 'digest_email'").get() as any;
+      return row?.value || null;
+    } catch { return null; }
+  })();
+
+  if (!to || !process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
+    log.warn('ops_notify_undeliverable', { reason: 'no digest_email or SMTP not configured', subject });
+    return;
+  }
+
+  try {
+    const transporter = nodemailer.createTransport({
+      host: process.env.SMTP_HOST,
+      port: parseInt(process.env.SMTP_PORT || '587'),
+      secure: process.env.SMTP_PORT === '465',
+      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+    });
+    await transporter.sendMail({
+      from: process.env.SMTP_FROM || process.env.SMTP_USER,
+      to,
+      subject: `[ChokePoint Macro] ${subject}`,
+      text: body,
+    });
+  } catch (err) {
+    // Never let a failed notification break the task that raised it.
+    log.error('ops_notify_failed', { subject, ...errInfo(err) });
+  }
+}
+
+
+
+/**
+ * Token exchange against X, handling BOTH OAuth2 client types.
+ *
+ * twitter-api-v2 can't do the public-client flow: with no clientSecret it sends no
+ * Authorization header AND a `client_secret: undefined` field, which is just a
+ * malformed request. So we issue the request ourselves.
+ *
+ *  - Confidential client (Web App / Automated App / Bot): HTTP Basic clientId:clientSecret.
+ *  - Public client (Native App / Single page App): no Basic header, client_id in the
+ *    body, PKCE alone proves the caller. X issues no secret for these at all.
+ */
+async function xTokenRequest(params: Record<string, string>): Promise<any> {
+  const clientId = getPlatformCred('x', 'client_id');
+  const clientSecret = getPlatformCred('x', 'client_secret');
+
+  const headers: Record<string, string> = { 'Content-Type': 'application/x-www-form-urlencoded' };
+  const body = new URLSearchParams({ ...params, client_id: clientId });
+  if (clientSecret) {
+    headers.Authorization = 'Basic ' + Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
+  }
+
+  const resp = await fetch('https://api.x.com/2/oauth2/token', { method: 'POST', headers, body });
+  const text = await resp.text();
+  let json: any;
+  try { json = JSON.parse(text); } catch { json = { raw: text }; }
+
+  if (!resp.ok) {
+    const mode = clientSecret ? 'confidential' : 'public';
+    throw new Error(`X token request failed (${resp.status}, ${mode} client): ${json.error || ''} ${json.error_description || text.slice(0, 200)}`);
+  }
+  return json;
 }
 
 if (!hasValidCreds('x')) {
@@ -173,10 +376,18 @@ if (!hasValidCreds('x')) {
 
 // ─── Auth helpers ──────────────────────────────────────────────────────────────
 
+// Only ever trusted for loopback hosts — never let a spoofed Host header steer
+// the OAuth redirect on a real deployment.
+const LOOPBACK_HOST = /^(localhost|127\.0\.0\.1|\[::1\]|::1)(:\d+)?$/;
+
 const getAppOrigin = (req: express.Request): string => {
+  const host = req.headers.host || '';
+  // Local dev: use the host we were actually reached on, so the OAuth redirect
+  // follows whatever port/hostname you happen to be browsing. Each variant still
+  // has to be registered as a callback URL in the X developer portal.
+  if (LOOPBACK_HOST.test(host)) return `http://${host}`;
   if (process.env.APP_URL) return process.env.APP_URL;
   const protocol = req.headers['x-forwarded-proto'] || 'https';
-  const host = req.headers.host;
   return `${protocol}://${host}`;
 };
 
@@ -343,6 +554,13 @@ const PLATFORM_KEYS: Record<string, string[]> = {
   threads:   ['app_id', 'app_secret'],
 };
 
+// Keys that may legitimately be left blank. X public clients (Native / SPA app types)
+// have no client secret at all, so requiring one made those apps impossible to configure.
+// Submitting a blank value clears the stored override rather than saving an empty string.
+const OPTIONAL_CRED_KEYS: Record<string, string[]> = {
+  x: ['client_secret'],
+};
+
 // Returns which platforms are configured (never returns actual values)
 app.get("/api/platform-credentials", requireAuth, (req, res) => {
   const status: Record<string, { configured: boolean; keys: string[] }> = {};
@@ -360,16 +578,24 @@ app.post("/api/platform-credentials/:platform", requireAuth, (req, res) => {
   if (!credentials || typeof credentials !== 'object') return res.status(400).json({ error: "credentials object required" });
 
   const requiredKeys = PLATFORM_KEYS[platform];
+  const optionalKeys = OPTIONAL_CRED_KEYS[platform] || [];
   for (const key of requiredKeys) {
+    if (optionalKeys.includes(key)) continue;
     if (!credentials[key]?.trim()) return res.status(400).json({ error: `Missing required field: ${key}` });
   }
 
   for (const key of requiredKeys) {
+    const value = credentials[key]?.trim() || '';
+    if (!value) {
+      // Blank optional key — drop the override so lookups fall through to .env / public-client mode.
+      db.prepare("DELETE FROM platform_credentials WHERE platform = ? AND key_name = ?").run(platform, key);
+      continue;
+    }
     db.prepare(`
       INSERT INTO platform_credentials (platform, key_name, key_value, updated_at)
       VALUES (?, ?, ?, CURRENT_TIMESTAMP)
       ON CONFLICT(platform, key_name) DO UPDATE SET key_value = excluded.key_value, updated_at = CURRENT_TIMESTAMP
-    `).run(platform, key, credentials[key].trim());
+    `).run(platform, key, value);
   }
 
   res.json({ success: true, configured: hasValidCreds(platform) });
@@ -389,9 +615,16 @@ app.get("/api/platform-credentials/:platform/test", requireAuth, async (req, res
   if (!hasValidCreds(platform)) return res.json({ ok: false, error: "Credentials not saved" });
   try {
     if (platform === 'x') {
-      const redirectUri = getRedirectUri(req, 'x');
-      getXClient().generateOAuth2AuthLink(redirectUri, { scope: ['tweet.read', 'users.read'] });
-      return res.json({ ok: true });
+      // This used to call generateOAuth2AuthLink, which is pure local string building and
+      // makes no network request — it returned ok:true against completely dead credentials.
+      // Do a real round trip instead: refresh if near expiry, then hit the API.
+      const tokenRecord = getXTokenRecord((req.session as any).userId);
+      if (!tokenRecord?.access_token) {
+        return res.json({ ok: false, error: "Credentials saved, but no X account connected yet — click Connect." });
+      }
+      const accessToken = await refreshXToken(tokenRecord);
+      const me = await new TwitterApi(accessToken).v2.me();
+      return res.json({ ok: true, handle: `@${me.data.username}` });
     }
     if (platform === 'linkedin') {
       const clientId = getPlatformCred('linkedin', 'client_id');
@@ -597,16 +830,26 @@ app.get("/auth/x/connect/callback", async (req, res) => {
 
   const pending = db.prepare("SELECT code_verifier FROM pending_auth WHERE state = ? AND platform = 'x_connect'").get(state) as any;
   if (!pending || !code) return res.status(400).send("Invalid state or missing code. Please try again.");
+  // No session here means the callback landed on a different hostname than the one
+  // the flow started on (localhost vs 127.0.0.1 have separate cookie jars). Filing the
+  // token under 'anonymous' would look like success but leave posting broken, so stop.
+  if (!userId) return res.status(401).send("Session lost during the X handshake — start Connect from the same hostname you're signed in on, then try again.");
   db.prepare("DELETE FROM pending_auth WHERE state = ?").run(state);
 
   try {
     const redirectUri = getRedirectUri(req, 'x/connect');
-    const { client: loggedClient, accessToken, refreshToken, expiresIn } = await getXClient().loginWithOAuth2({
+    const tok = await xTokenRequest({
+      grant_type: 'authorization_code',
       code: code as string,
-      codeVerifier: pending.code_verifier,
-      redirectUri,
+      code_verifier: pending.code_verifier,
+      redirect_uri: redirectUri,
     });
+    const accessToken: string = tok.access_token;
+    const refreshToken: string | undefined = tok.refresh_token;
+    const expiresIn: number = tok.expires_in;
+    console.log(`[x-connect] token OK — scopes: ${tok.scope} | refresh_token: ${refreshToken ? 'yes' : 'NO'}`);
 
+    const loggedClient = new TwitterApi(accessToken);
     const { data: xUser } = await loggedClient.v2.me({ "user.fields": ["profile_image_url", "username", "name"] });
 
     const expiresAt = Date.now() + (expiresIn || 0) * 1000;
@@ -619,7 +862,7 @@ app.get("/auth/x/connect/callback", async (req, res) => {
         handle = excluded.handle,
         expires_at = excluded.expires_at,
         updated_at = CURRENT_TIMESTAMP
-    `).run(userId || 'anonymous', accessToken, refreshToken || '', `@${xUser.username}`, expiresAt);
+    `).run(userId, accessToken, refreshToken || '', `@${xUser.username}`, expiresAt);
 
     const xHandle = JSON.stringify('@' + xUser.username);
     const origin = JSON.stringify(getAppOrigin(req));
@@ -894,21 +1137,30 @@ app.post("/api/social/post", requireAuth, postLimiter, async (req, res) => {
     }
   }
 
-  // Post to X via OAuth 1.0a (free tier — uses app-level keys)
+  // Post to X via the OAuth 2.0 user connection — the same token the scheduler and
+  // /api/post-to-x use. This previously required a separate set of OAuth 1.0a app keys
+  // (X_API_KEY/X_API_SECRET/X_ACCESS_TOKEN/X_ACCESS_SECRET) that were never configured,
+  // so Compose always failed with "OAuth 1.0a credentials not configured" even with a
+  // perfectly healthy OAuth 2.0 connection.
   if (platforms.includes('x')) {
     try {
-      const apiKey    = process.env.X_API_KEY;
-      const apiSecret = process.env.X_API_SECRET;
-      const accToken  = process.env.X_ACCESS_TOKEN;
-      const accSecret = process.env.X_ACCESS_SECRET;
-      if (!apiKey || !apiSecret || !accToken || !accSecret) {
-        throw new Error("X OAuth 1.0a credentials not configured");
+      const tokenRecord = getXTokenRecord(userId);
+      if (!tokenRecord?.access_token) {
+        throw new Error("X account not connected — connect it on the Profile page.");
       }
-      const client = new TwitterApi({ appKey: apiKey, appSecret: apiSecret, accessToken: accToken, accessSecret: accSecret });
-      const result = await client.v1.tweet(text.substring(0, 280));
-      results.x = { success: true, id: result.id_str };
-    } catch (err) {
-      results.x = { success: false, error: err instanceof Error ? err.message : String(err) };
+      if (text.length > X_MAX_POST_CHARS) {
+        throw new Error(`Post too long: ${text.length}/${X_MAX_POST_CHARS} characters`);
+      }
+      const accessToken = await refreshXToken(tokenRecord);
+      const result = await new TwitterApi(accessToken).v2.tweet(text);
+      recordSpend(xSpend(/https?:\/\//.test(text) ? 'post_with_link' : 'post', 1, { source: 'compose', tweet_id: result.data.id }));
+      results.x = { success: true, id: result.data.id };
+    } catch (err: any) {
+      // Surface X's own response body. A bare "Request failed with code NNN" hides the
+      // reason (wrong tier, duplicate post, suspended app), which makes these unfixable.
+      const detail = err?.data ? JSON.stringify(err.data).slice(0, 500) : '';
+      console.error(`[x-post] failed code=${err?.code ?? '?'} len=${text.length} msg=${err?.message ?? err} detail=${detail}`);
+      results.x = { success: false, error: `${err instanceof Error ? err.message : String(err)}${detail ? ` — ${detail}` : ''}` };
     }
   }
 
@@ -1000,7 +1252,27 @@ app.get("/api/debug/models", requireAuth, async (_req, res) => {
   }
 });
 
-const REPORT_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes max per report
+// Report generation is now TWO sequential AI calls: the report itself, then the hashtag
+// reach pass. At 3 minutes the request timed out while the second call was still running —
+// the work completed and was then discarded, which looked like a silent failure.
+const REPORT_TIMEOUT_MS = Number(process.env.REPORT_TIMEOUT_MS) || 8 * 60 * 1000;
+
+// In-flight report generation progress, published for the client to poll.
+// Bounded by construction: one entry per (report type, user) and deleted on completion.
+const genProgress = new Map<string, { stage: string; percent: number; at: number; startedAt: number }>();
+
+app.get("/api/generate-report/progress", requireAuth, (req, res) => {
+  const type = String(req.query.type || '');
+  const p = genProgress.get(`${type}:${(req.session as any).userId ?? 'anon'}`);
+  if (!p) return res.json({ active: false });
+  res.json({
+    active: true,
+    stage: p.stage,
+    percent: p.percent,
+    elapsedMs: Date.now() - p.startedAt,
+    staleMs: Date.now() - p.at,
+  });
+});
 
 app.post("/api/generate-report", requireAuth, reportGenLimiter, async (req, res) => {
   try {
@@ -1019,10 +1291,22 @@ app.post("/api/generate-report", requireAuth, reportGenLimiter, async (req, res)
       setTimeout(() => reject(new Error("REPORT_TIMEOUT")), REPORT_TIMEOUT_MS)
     );
 
-    // Progress callback just logs server-side
+    // Publish real progress so the client can read it. The UI previously ran a fake
+    // timer-driven bar that froze at 92.2% and showed a stage label unrelated to what
+    // the server was actually doing.
+    const jobKey = `${type}:${(req.session as any).userId ?? 'anon'}`;
+    let lastLogged = -1;
     const logProgress = (stage: string, percent: number) => {
-      console.log(`[API] ${type} progress: ${percent}% — ${stage}`);
+      const pct = Math.round(percent * 10) / 10;
+      // Token-level ticks fire several times a second; only log on a whole-percent
+      // change so the console stays readable while the map stays current.
+      if (Math.floor(pct) !== lastLogged) {
+        lastLogged = Math.floor(pct);
+        console.log(`[API] ${type} progress: ${pct}% — ${stage}`);
+      }
+      genProgress.set(jobKey, { stage, percent: pct, at: Date.now(), startedAt: genProgress.get(jobKey)?.startedAt ?? Date.now() });
     };
+    genProgress.set(jobKey, { stage: 'Starting...', percent: 2, at: Date.now(), startedAt: Date.now() });
 
     let resultPromise: Promise<any>;
 
@@ -1031,10 +1315,30 @@ app.post("/api/generate-report", requireAuth, reportGenLimiter, async (req, res)
     } else if (type === 'speculation') {
       resultPromise = generateSpeculationReport(logProgress);
     } else {
-      resultPromise = generateWeeklyReport(type, customTopic, logProgress);
+      resultPromise = generateWeeklyReport(type, customTopic, logProgress, getContentGuidance());
     }
 
-    const report = await Promise.race([resultPromise, timeoutPromise]);
+    // The client is what normally persists a report, so losing the race used to discard a
+    // finished generation along with everything it cost. Salvage it server-side instead.
+    let raceLost = false;
+    resultPromise
+      .then((r: any) => {
+        if (!raceLost) return;
+        const items = r?.headlines?.length ?? r?.events?.length ?? 0;
+        if (!items) return;
+        const id = `${type}-${Date.now()}`;
+        db.prepare(`INSERT INTO reports (id, type, content, custom_topic, updated_at)
+                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(id) DO UPDATE SET content = excluded.content, updated_at = CURRENT_TIMESTAMP`)
+          .run(id, type, JSON.stringify(r), customTopic || null);
+        log.warn('report_salvaged_after_timeout', { id, type, items });
+      })
+      .catch((e: unknown) => log.error('report_background_failure', errInfo(e)));
+
+    const report = await Promise.race([resultPromise, timeoutPromise]).catch((e) => {
+      if (e instanceof Error && e.message === 'REPORT_TIMEOUT') raceLost = true;
+      throw e;
+    });
 
     if (type === 'forecast') {
       if (!report?.events?.length) return res.status(500).json({ error: "Failed to generate forecast: no events returned" });
@@ -1044,8 +1348,10 @@ app.post("/api/generate-report", requireAuth, reportGenLimiter, async (req, res)
       console.log(`[API] Successfully generated ${type} report with ${report.headlines.length} headlines`);
     }
 
+    genProgress.delete(`${type}:${(req.session as any).userId ?? 'anon'}`);
     res.json(report);
   } catch (error) {
+    try { genProgress.delete(`${req.body?.type}:${(req.session as any).userId ?? 'anon'}`); } catch { /* ignore */ }
     console.error("[API] Report generation error:", error);
     const message = error instanceof Error ? error.message : String(error);
 
@@ -1055,7 +1361,7 @@ app.post("/api/generate-report", requireAuth, reportGenLimiter, async (req, res)
 
     if (message === "REPORT_TIMEOUT") {
       errorType = "TIMEOUT"; statusCode = 504;
-      userMessage = "Report generation timed out after 3 minutes. The AI provider may be slow — please try again.";
+      userMessage = `Report generation exceeded ${Math.round(REPORT_TIMEOUT_MS / 60000)} minutes. It may still finish in the background — check Reports shortly before retrying.`;
     } else if (message.includes("AbortError") || message.includes("aborted") || message.includes("cancelled") || message.includes("canceled")) {
       errorType = "CANCELLED"; statusCode = 499;
       userMessage = "Report generation was cancelled.";
@@ -1284,9 +1590,45 @@ app.get("/api/reports/automated", (req, res) => {
 
 // ─── App Settings ──────────────────────────────────────────────────────────────
 
-app.get("/api/app-settings/:key", (req, res) => {
+// requireAuth added: app_settings holds operator configuration (digest_email, the
+// content_guidance prompt block, the posting kill switch). Readable without a session it
+// was the one un-gated settings route. In LOCAL_MODE this is a no-op, as intended.
+app.get("/api/app-settings/:key", requireAuth, (req, res) => {
   const row = db.prepare("SELECT value FROM app_settings WHERE key = ?").get(req.params.key) as any;
   res.json({ value: row?.value ?? null });
+});
+
+// ─── Posting kill switch ───────────────────────────────────────────────────────
+//
+// Separate from the generic settings route so it has its own explicit shape and an
+// audit log line. Takes effect on the next cron tick (<= 60s) with no restart.
+
+app.get("/api/posting/status", requireAuth, (_req, res) => {
+  const row = db.prepare("SELECT value, updated_at FROM app_settings WHERE key = 'posting_enabled'").get() as any;
+  res.json({
+    enabled: isPostingEnabled(),
+    // Distinguishes "explicitly turned on/off" from "never configured, defaulting to off".
+    source: row?.value != null ? 'app_settings' : (process.env.POSTING_ENABLED === 'true' ? 'env' : 'default'),
+    updatedAt: row?.updated_at ?? null,
+    dryRun: POSTING_DRY_RUN,
+    maxPostsPerRun: MAX_POSTS_PER_RUN,
+    maxSlotLatenessMin: MAX_SLOT_LATENESS_MIN,
+  });
+});
+
+app.put("/api/posting/status", requireAuth, (req, res) => {
+  const { enabled } = req.body ?? {};
+  if (typeof enabled !== 'boolean') {
+    return res.status(400).json({ error: "enabled must be true or false" });
+  }
+  db.prepare(`
+    INSERT INTO app_settings (key, value, updated_at) VALUES ('posting_enabled', ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+  `).run(enabled ? 'true' : 'false');
+
+  // Worth a log line either way: this flag decides whether a public account posts.
+  log.warn('posting_toggle_changed', { enabled, by: (req.session as any)?.userId ?? 'unknown' });
+  res.json({ success: true, enabled });
 });
 
 app.put("/api/app-settings", requireAuth, (req, res) => {
@@ -1337,13 +1679,95 @@ app.delete("/api/scheduled-reports/:id", requireAuth, (req, res) => {
   res.json({ success: true });
 });
 
+
+/** Human-editable content guidance injected into every report generation.
+ *  Edited by hand via PUT /api/app-settings, or proposed by the weekly audience sample. */
+function getContentGuidance(): string | undefined {
+  try {
+    const row = db.prepare("SELECT value FROM app_settings WHERE key = 'content_guidance'").get() as any;
+    return row?.value?.trim() || undefined;
+  } catch { return undefined; }
+}
+
+
+// ─── Analytics (spend ledger, scoring weights, audience samples) ───────────────
+// Extracted to src/server/analytics.ts. recordSpend is destructured out because the
+// posting paths below write to the ledger; the routes only read from it.
+const analytics = createAnalytics({
+  db,
+  requireAuth,
+  onLedgerError: (err) => log.warn('spend_record_failed', errInfo(err)),
+});
+app.use(analytics.router);
+const { recordSpend, getScoringWeights } = analytics;
+
+// Route every AI call's token usage into the ledger.
+onAISpend(({ model, inputTokens, outputTokens, label }) => {
+  recordSpend(aiSpend(label, model, inputTokens, outputTokens));
+});
+
+// ─── AI spend cap ──────────────────────────────────────────────────────────────
+//
+// The ledger measures; this enforces. Without it a stuck retry loop bills without
+// limit and the only symptom is a bigger number in the spend UI tomorrow.
+//
+// Calendar-month window, matching how the providers bill. 0 disables the cap.
+const AI_MONTHLY_CAP_USD = Number(process.env.AI_MONTHLY_CAP_USD ?? 80);
+
+/** Month-to-date AI spend in USD. X posting costs are billed separately and excluded. */
+function aiSpendThisMonthUsd(): number {
+  const since = etDateString().slice(0, 7) + '-01T00:00:00.000Z';
+  const row = db.prepare(
+    "SELECT COALESCE(SUM(cost_usd), 0) total FROM api_spend WHERE provider != 'x' AND ts >= ?"
+  ).get(since) as any;
+  return Number(row?.total ?? 0);
+}
+
+// Warn once per server run as the cap approaches, so the first signal isn't a hard stop.
+let capWarningSent = false;
+
+setSpendGuard(() => {
+  if (!AI_MONTHLY_CAP_USD || AI_MONTHLY_CAP_USD <= 0) return { allowed: true };
+
+  let spent: number;
+  try {
+    spent = aiSpendThisMonthUsd();
+  } catch (err) {
+    // Deliberately fail OPEN here, unlike the posting switch. A broken ledger read
+    // should not take content generation offline — generation is reversible and
+    // bounded by max_tokens, whereas a published post is neither.
+    log.warn('spend_cap_check_failed', errInfo(err));
+    return { allowed: true };
+  }
+
+  if (spent >= AI_MONTHLY_CAP_USD) {
+    const reason = `AI spend cap reached: $${spent.toFixed(2)} of $${AI_MONTHLY_CAP_USD.toFixed(2)} month-to-date. Raise AI_MONTHLY_CAP_USD or wait for the next calendar month.`;
+    log.error('spend_cap_exceeded', { spent, cap: AI_MONTHLY_CAP_USD });
+    void notifyOps('AI spend cap reached — generation paused', reason);
+    return { allowed: false, reason };
+  }
+
+  if (!capWarningSent && spent >= AI_MONTHLY_CAP_USD * 0.8) {
+    capWarningSent = true;
+    log.warn('spend_cap_approaching', { spent, cap: AI_MONTHLY_CAP_USD });
+    void notifyOps(
+      'AI spend at 80% of monthly cap',
+      `Month-to-date AI spend is $${spent.toFixed(2)} against a $${AI_MONTHLY_CAP_USD.toFixed(2)} cap. Generation will stop when the cap is reached.`,
+    );
+  }
+
+  return { allowed: true };
+});
+
+
 // ─── X Posting ─────────────────────────────────────────────────────────────────
 
 async function refreshXToken(tokenRecord: any) {
   if (tokenRecord.expires_at && tokenRecord.expires_at > Date.now() + 60000) return tokenRecord.access_token;
-  const client = new TwitterApi({ clientId: getPlatformCred('x', 'client_id'), clientSecret: getPlatformCred('x', 'client_secret') });
-  const { accessToken, refreshToken, expiresIn } = await client.refreshOAuth2Token(tokenRecord.refresh_token);
-  const expiresAt = Date.now() + expiresIn * 1000;
+  const tok = await xTokenRequest({ grant_type: 'refresh_token', refresh_token: tokenRecord.refresh_token });
+  const accessToken: string = tok.access_token;
+  const refreshToken: string | undefined = tok.refresh_token;
+  const expiresAt = Date.now() + tok.expires_in * 1000;
   if (tokenRecord.x_id) {
     // X-login user — update users table
     db.prepare(`UPDATE users SET access_token = ?, refresh_token = ?, expires_at = ? WHERE x_id = ?`).run(accessToken, refreshToken || tokenRecord.refresh_token, expiresAt, tokenRecord.x_id);
@@ -1377,7 +1801,7 @@ app.post("/api/post-to-x", postLimiter, async (req, res) => {
   const tokenRecord = getXTokenRecord(userId);
   if (!tokenRecord) return res.status(401).json({ error: "X account not connected — go to Settings to connect your X account" });
   if (!text?.trim()) return res.status(400).json({ error: "Cannot post empty content" });
-  if (text.length > 280) return res.status(400).json({ error: `Post too long: ${text.length}/280 characters` });
+  if (text.length > X_MAX_POST_CHARS) return res.status(400).json({ error: `Post too long: ${text.length}/${X_MAX_POST_CHARS} characters` });
 
   try {
     const accessToken = await refreshXToken(tokenRecord);
@@ -1385,6 +1809,7 @@ app.post("/api/post-to-x", postLimiter, async (req, res) => {
 
     const client = new TwitterApi(accessToken);
     const result = await client.v2.tweet(text);
+    recordSpend(xSpend(/https?:\/\//.test(text) ? 'post_with_link' : 'post', 1, { source: 'post-to-x', tweet_id: result.data.id }));
     res.json({ success: true, tweetId: result.data.id });
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
@@ -1402,18 +1827,59 @@ app.post("/api/schedule-post", requireAuth, (req, res) => {
   const { content, scheduledAt } = req.body;
   if (!content?.trim()) return res.status(400).json({ error: "content required" });
   if (!scheduledAt) return res.status(400).json({ error: "scheduledAt required" });
-  db.prepare(`INSERT INTO scheduled_posts (user_id, content, scheduled_at) VALUES (?, ?, ?)`).run(userId, content, scheduledAt);
-  res.json({ success: true });
+
+  // Reject over-length here rather than letting it fail at X an hour later, where it
+  // lands as a 'failed' row with a truncated API error and no way to retry.
+  if (content.length > X_MAX_POST_CHARS) {
+    return res.status(400).json({ error: `content exceeds ${X_MAX_POST_CHARS} characters`, chars: content.length });
+  }
+
+  // Canonicalise to ISO UTC. A zone-less value is read as Eastern wall clock, matching
+  // how every other slot time in the app is defined. Storing the raw client string is
+  // what let '2026-10-01 23:59' compare as due at UTC midnight and publish early.
+  const iso = normaliseScheduledAt(scheduledAt);
+  if (!iso) {
+    return res.status(400).json({ error: "scheduledAt not understood — use 'YYYY-MM-DD HH:MM' (Eastern) or a full ISO-8601 timestamp" });
+  }
+
+  // Lands as needs_review with the time confirmed: Mike typed an explicit time, so the
+  // *schedule* is settled, but the publisher still requires an explicit approval before
+  // it will send. See the approval gate in the publisher below.
+  const manualType = db.prepare("SELECT id FROM post_types WHERE code = 'MAN'").get() as any;
+  const info = db.prepare(`
+    INSERT INTO posts (type_id, status, body, proposed_at, scheduled_at, time_confirmed, user_id)
+    VALUES (?, 'needs_review', ?, ?, ?, 1, ?)
+  `).run(manualType?.id ?? null, content, iso, iso, userId);
+
+  res.json({ success: true, scheduledAt: iso, id: info.lastInsertRowid, status: 'needs_review' });
 });
 
+// Kept at the old path and old field names so the existing /schedule screen keeps working
+// until Phase B replaces it with the Post Queue timeline. `body`/`error` are aliased back
+// to `content`/`last_error`, which is what ScheduledPost in the client still expects.
 app.get("/api/scheduled-posts", requireAuth, (req, res) => {
   const userId = (req.session as any).userId;
-  const posts = db.prepare("SELECT * FROM scheduled_posts WHERE user_id = ? ORDER BY scheduled_at ASC").all(userId);
+  const posts = db.prepare(`
+    SELECT p.id, p.body AS content, p.scheduled_at, p.status, p.error AS last_error,
+           p.x_post_id AS posted_tweet_id, p.source_url, p.attempts, p.time_confirmed,
+           p.created_at, t.code AS kind
+    FROM posts p
+    LEFT JOIN post_types t ON t.id = p.type_id
+    WHERE (p.user_id = ? OR p.user_id IS NULL) AND p.status != 'archived'
+    ORDER BY p.scheduled_at ASC
+  `).all(userId);
   res.json(posts);
 });
 
 app.delete("/api/scheduled-posts/:id", requireAuth, (req, res) => {
-  db.prepare("DELETE FROM scheduled_posts WHERE id = ? AND user_id = ?").run(req.params.id, (req.session as any).userId);
+  // A post mid-flight must not vanish from under the publisher — it has already been
+  // claimed and may have reached X.
+  const row = db.prepare("SELECT status FROM posts WHERE id = ?").get(req.params.id) as any;
+  if (row?.status === 'posting') {
+    return res.status(409).json({ error: "That post is being sent right now and can't be deleted." });
+  }
+  db.prepare("DELETE FROM posts WHERE id = ? AND (user_id = ? OR user_id IS NULL)")
+    .run(req.params.id, (req.session as any).userId);
   res.json({ success: true });
 });
 
@@ -1442,18 +1908,22 @@ app.post("/api/auto-schedule/preview", requireAuth, (req, res) => {
   if (content.headlines?.length) {
     const slots = calculateTweetSlots(nextDate, content.headlines);
     for (const s of slots) {
-      items.push({ type: 'tweet', time: s.time, content: s.content, title: s.title, trendScore: s.trendScore, enabled: true });
+      items.push({ type: 'tweet', time: s.time, content: s.content, title: s.title, trendScore: s.trendScore, sourceUrl: s.sourceUrl, enabled: true });
     }
   }
 
-  // Instagram reminder (9am EST = 14:00 UTC)
-  const instaTime = new Date(nextDate.getTime() + 4 * 60 * 60 * 1000); // +4h from midnight EST = 9am EST
-  items.push({ type: 'instagram', time: instaTime.toISOString(), content: 'Post your 21-slide Instagram carousel for today\'s report.', enabled: true });
+  // Reminders at 9am ET. These were previously `midnight + 4h`, which the comment
+  // called 9am but which actually produced 4am ET — midnight ET to 9am ET is nine
+  // hours, not four. Stating the wall clock directly removes the arithmetic entirely.
+  const at9amEt = (day: Date) => {
+    const p = etParts(day);
+    return etToUtc(p.year, p.month, p.day, 9, 0).toISOString();
+  };
 
-  // Substack reminder (next Monday 9am EST)
-  const nextMonday = getNextWeekday(1);
-  const substackTime = new Date(nextMonday.getTime() + 4 * 60 * 60 * 1000);
-  items.push({ type: 'substack', time: substackTime.toISOString(), content: 'Publish your Substack article for this week\'s intelligence brief.', enabled: true });
+  items.push({ type: 'instagram', time: at9amEt(nextDate), content: 'Post your 21-slide Instagram carousel for today\'s report.', enabled: true });
+
+  // Substack reminder (next Monday 9am ET)
+  items.push({ type: 'substack', time: at9amEt(getNextWeekday(1)), content: 'Publish your Substack article for this week\'s intelligence brief.', enabled: true });
 
   // Sort chronologically
   items.sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime());
@@ -1468,17 +1938,43 @@ app.post("/api/auto-schedule/confirm", requireAuth, (req, res) => {
   if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "No items provided" });
 
   let count = 0;
+  const rejected: Array<{ time: unknown; reason: string }> = [];
+
+  const insert = db.prepare(`
+    INSERT INTO posts (type_id, status, body, proposed_at, scheduled_at, time_confirmed, source_url, user_id)
+    VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+  `);
+  const typeByCode = (code: string) =>
+    (db.prepare("SELECT id FROM post_types WHERE code = ?").get(code) as any)?.id ?? null;
+  const manualTypeId = typeByCode('MAN');
+
   for (const item of items) {
     if (!item.enabled) continue;
-    const content = item.type === 'tweet' ? item.content :
-                    item.type === 'instagram' ? `[INSTAGRAM] ${item.content}` :
-                    `[SUBSTACK] ${item.content}`;
-    db.prepare("INSERT INTO scheduled_posts (user_id, content, scheduled_at, status) VALUES (?, ?, ?, 'pending')")
-      .run(userId, content, item.time);
+
+    const isTweet = item.type === 'tweet';
+
+    // The Instagram/Substack entries are reminders to Mike, not things to publish.
+    // They go in as 'archived' so they are visible in the queue but can never satisfy
+    // the publisher's approved + time_confirmed predicate.
+    const status = isTweet ? 'needs_review' : 'archived';
+    const content = isTweet ? item.content
+                  : item.type === 'instagram' ? `[INSTAGRAM] ${item.content}`
+                  : `[SUBSTACK] ${item.content}`;
+
+    const iso = normaliseScheduledAt(item.time);
+    if (!iso) { rejected.push({ time: item.time, reason: 'unparseable time' }); continue; }
+
+    // time_confirmed = 0: the generator *proposed* this slot. Mike confirms it in the
+    // queue, which is what makes it eligible to send.
+    insert.run(manualTypeId, status, content, iso, iso, isTweet ? (item.sourceUrl || null) : null, userId);
     count++;
   }
 
-  res.json({ success: true, scheduled: count });
+  // Surface partial failure rather than reporting a success count that silently
+  // under-counts what the operator confirmed.
+  if (rejected.length) log.warn('auto_schedule_items_rejected', { count: rejected.length, rejected });
+
+  res.json({ success: true, scheduled: count, rejected: rejected.length });
 });
 
 // ─── Debug ─────────────────────────────────────────────────────────────────────
@@ -1574,58 +2070,62 @@ app.get("/api/debug/session", (req, res) => {
 
 // ─── Auto-Schedule Helpers ─────────────────────────────────────────────────────
 
-// Returns the next Date (midnight EST) for the given day-of-week (0=Sun…6=Sat)
-// If today IS that day, schedules for next week.
+// Returns the next instant corresponding to midnight Eastern on the given day-of-week
+// (0=Sun…6=Sat). If today IS that day in ET, schedules for next week.
+//
+// Was: `now - 5h`, hardcoding EST. Eastern has no fixed offset — it is UTC-5 in winter
+// and UTC-4 under DST — so for ~8 months a year that put every derived slot an hour off.
+// nextEtWeekdayMidnight asks the timezone database instead. See src/services/time.ts.
 function getNextWeekday(targetDay: number): Date {
-  const now = new Date();
-  // EST = UTC-5; get current EST day-of-week
-  const estNow = new Date(now.getTime() - 5 * 60 * 60 * 1000);
-  let daysUntil = (targetDay - estNow.getDay() + 7) % 7;
-  if (daysUntil === 0) daysUntil = 7;
-  // Midnight EST = 05:00 UTC
-  const result = new Date(estNow);
-  result.setDate(result.getDate() + daysUntil);
-  result.setUTCHours(5, 0, 0, 0); // midnight EST
-  return result;
+  return nextEtWeekdayMidnight(targetDay);
 }
 
-// Assign tweets to time slots from 7am–7pm EST, highest trendScore to highest engagement hour
-function calculateTweetSlots(baseDate: Date, tweets: any[]): Array<{ time: string; content: string; trendScore: number; title: string }> {
+// Assign tweets to time slots from 7am–7pm ET, highest trendScore to highest engagement hour
+function calculateTweetSlots(baseDate: Date, tweets: any[]): Array<{ time: string; content: string; trendScore: number; title: string; sourceUrl?: string }> {
   const count = tweets.length;
   if (count === 0) return [];
 
-  const startMinEST = 7 * 60;  // 420
-  const endMinEST  = 19 * 60;  // 1140
-  const totalMins  = endMinEST - startMinEST; // 720
+  const startMinET = 7 * 60;  // 420
+  const endMinET   = 19 * 60; // 1140
+  const totalMins  = endMinET - startMinET; // 720
   const interval   = totalMins / count;
 
-  // Finance/politics Twitter engagement score per EST hour
+  // Finance/politics X engagement score per ET hour
   const engHour: Record<number, number> = {
     7:8, 8:10, 9:9, 10:6, 11:5, 12:8, 13:7, 14:5, 15:6, 16:10, 17:9, 18:7,
   };
 
-  // Build evenly-spaced slots (stored as UTC)
+  // Build evenly-spaced slots as ET wall-clock times, each resolved to a real instant.
+  // Adding milliseconds to a midnight timestamp (the old approach) breaks across a DST
+  // boundary, because the day is 23 or 25 hours long — so the wall clock is computed
+  // first and converted second.
+  const base = etParts(baseDate);
   const slots: Date[] = Array.from({ length: count }, (_, i) => {
-    const minFromMidnightEST = startMinEST + Math.round(i * interval);
-    const d = new Date(baseDate);
-    // baseDate is midnight EST = 05:00 UTC; add EST minutes
-    d.setTime(baseDate.getTime() + minFromMidnightEST * 60000);
-    return d;
+    const minFromMidnightET = startMinET + Math.round(i * interval);
+    return etToUtc(
+      base.year, base.month, base.day,
+      Math.floor(minFromMidnightET / 60),
+      minFromMidnightET % 60,
+    );
   });
 
-  // Score each slot (EST hour = UTC hour - 5)
-  const scored = slots.map((d, i) => ({ i, slot: d, score: engHour[d.getUTCHours() - 5] ?? 5 }));
+  // Score each slot by its actual ET hour.
+  const scored = slots.map((d, i) => ({ i, slot: d, score: engHour[etParts(d).hour] ?? 5 }));
   // Sort slot indices by engagement descending
   const slotsByEng = [...scored].sort((a, b) => b.score - a.score).map(s => s.i);
 
   // Assign tweet[i] (sorted by trendScore desc already) → slot with ith highest engagement
-  const assigned: Array<{ time: string; content: string; trendScore: number; title: string }> = new Array(count);
+  const assigned: Array<{ time: string; content: string; trendScore: number; title: string; sourceUrl?: string }> = new Array(count);
   for (let ti = 0; ti < count; ti++) {
     assigned[ti] = {
       time: slots[slotsByEng[ti]].toISOString(),
-      content: tweets[ti].socialPost,
+      // Prefer the tagged variant from the hashtag pass; fall back to the bare post
+      // for reports generated before that pass existed.
+      content: tweets[ti].socialPostWithTags || tweets[ti].socialPost,
       trendScore: tweets[ti].trendScore ?? (count - ti),
       title: tweets[ti].title,
+      // Carried so the poster can cite it in a reply rather than in the post body.
+      sourceUrl: tweets[ti].url,
     };
   }
 
@@ -1661,6 +2161,32 @@ try {
 
 let isCronRunning = false; // Lock to prevent overlapping cron executions
 
+// Remembers which (schedule, ET day) pairs have already logged a miss, so a report that
+// blew past its catch-up window warns once rather than every 60 seconds until midnight.
+const reportSkipLogged = new Set<string>();
+
+// ─── Nightly database backup ───────────────────────────────────────────────────
+//
+// Logic lives in src/services/backup.ts so `npm run backup` can use the same code path.
+function runBackup(): void {
+  try {
+    const { target, bytes, pruned } = backupDatabase(db);
+    log.info('db_backup_written', { target, bytes, pruned });
+  } catch (err) {
+    log.error('db_backup_failed', errInfo(err));
+    void notifyOps(
+      'Nightly database backup failed',
+      `The SQLite backup did not complete. The database holds your X tokens, reports and spend ledger, and is not stored anywhere else.\n\nError: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+// On boot, then daily. Backing up at startup matters because this app runs on a laptop
+// that sleeps: an app up for only part of each day would otherwise keep resetting a 24h
+// timer it never reaches. Same "the machine isn't always on" problem as the publisher.
+runBackup();
+setInterval(runBackup, 24 * 60 * 60 * 1000);
+
 // Clean up stale pending_auth records older than 1 hour (abandoned OAuth flows)
 setInterval(() => {
   try {
@@ -1675,41 +2201,240 @@ setInterval(async () => {
 
   // Process scheduled social posts
   try {
-    const pending = db.prepare("SELECT * FROM scheduled_posts WHERE status = 'pending' AND scheduled_at <= ?").all(new Date().toISOString()) as any[];
-    for (const post of pending) {
-      const tokenRecord = getXTokenRecord(post.user_id);
-      if (!tokenRecord) continue;
-      try {
-        const accessToken = await refreshXToken(tokenRecord);
-        const client = new TwitterApi(accessToken);
-        await client.v2.tweet(post.content);
-        db.prepare("UPDATE scheduled_posts SET status = 'posted' WHERE id = ?").run(post.id);
-      } catch (error) {
-        console.error(`Background task failed for post ${post.id}:`, error);
-        db.prepare("UPDATE scheduled_posts SET status = 'failed' WHERE id = ?").run(post.id);
+    const nowIso = new Date().toISOString();
+
+    // Expire slots that are too late to be worth publishing.
+    //
+    // This runs BEFORE the kill-switch check on purpose: if posting is paused, stale
+    // rows must still age out, otherwise re-enabling the switch would dump an entire
+    // paused period's backlog onto the live account at once.
+    //
+    // Scoped to APPROVED posts. A draft sitting past its proposed time isn't "missed" —
+    // it was simply never approved, and it stays in the queue for Mike to deal with.
+    const latenessCutoff = new Date(Date.now() - MAX_SLOT_LATENESS_MIN * 60_000).toISOString();
+    const overdue = db.prepare(
+      `SELECT id, scheduled_at, substr(body, 1, 80) preview FROM posts
+       WHERE status='approved' AND time_confirmed=1 AND scheduled_at < ?`
+    ).all(latenessCutoff) as any[];
+
+    if (overdue.length) {
+      db.prepare(
+        `UPDATE posts SET status='skipped',
+           error='missed slot — more than ${MAX_SLOT_LATENESS_MIN} min late, skipped rather than publishing stale content',
+           updated_at=CURRENT_TIMESTAMP
+         WHERE status='approved' AND time_confirmed=1 AND scheduled_at < ?`
+      ).run(latenessCutoff);
+
+      log.warn('posts_skipped_stale', {
+        count: overdue.length,
+        lateness_limit_min: MAX_SLOT_LATENESS_MIN,
+        ids: overdue.map(o => o.id),
+      });
+
+      // The operator needs to know a slot was dropped — silence here reads as "it posted".
+      void notifyOps(
+        `${overdue.length} scheduled post${overdue.length === 1 ? '' : 's'} skipped`,
+        [
+          `${overdue.length} post(s) were more than ${MAX_SLOT_LATENESS_MIN} minutes past their slot and were skipped rather than published stale.`,
+          '',
+          'This usually means the machine was asleep or the app was not running.',
+          '',
+          ...overdue.map(o => `  · #${o.id}  due ${o.scheduled_at}  "${o.preview}…"`),
+        ].join('\n'),
+      );
+    }
+
+    if (!isPostingEnabled()) {
+      log.warn('posting_disabled_skip');
+    } else {
+      // Reclaim rows stranded by a crash. Deliberately marked failed, NOT retried: if the
+      // crash happened after the API call, retrying would post a duplicate. Losing a post
+      // is recoverable; double-posting to a public account is not.
+      const stale = db.prepare(
+        `UPDATE posts SET status='failed', error='stranded in posting state — not retried to avoid duplicate',
+                          updated_at=CURRENT_TIMESTAMP
+         WHERE status='posting' AND claimed_at < ?`
+      ).run(new Date(Date.now() - CLAIM_TIMEOUT_MIN * 60_000).toISOString());
+      if (stale.changes) log.warn('posts_stranded_reclaimed', { count: stale.changes });
+
+      // ─── The approval gate ───
+      //
+      // Only `approved` posts with a CONFIRMED time are sendable. Both halves matter:
+      // status alone would let a post go out at a time Mike never agreed to (the
+      // generator's proposed slot), and a confirmed time alone would send unreviewed
+      // text. Draft, needs_review, skipped and archived are all unreachable from here.
+      //
+      // This also replaces the old `kind='tweet'` filter — the Instagram/Substack
+      // reminders migrated in as 'archived' and can never satisfy this predicate.
+      const due = db.prepare(
+        `SELECT * FROM posts
+         WHERE status='approved' AND time_confirmed=1 AND scheduled_at <= ?
+         ORDER BY scheduled_at ASC LIMIT ?`
+      ).all(nowIso, MAX_POSTS_PER_RUN) as any[];
+
+      const backlog = db.prepare(
+        `SELECT COUNT(*) c FROM posts
+         WHERE status='approved' AND time_confirmed=1 AND scheduled_at <= ?`
+      ).get(nowIso) as any;
+      if (backlog.c > due.length) {
+        // Never silently truncate — a growing backlog means something upstream is wrong.
+        log.warn('post_backlog_capped', { due: backlog.c, cap: MAX_POSTS_PER_RUN, deferred: backlog.c - due.length });
+      }
+
+      for (const post of due) {
+        const tokenRecord = getXTokenRecord(post.user_id);
+        if (!tokenRecord) { log.warn('post_skipped_no_token', { id: post.id, user: post.user_id }); continue; }
+
+        // Atomic claim: the WHERE re-asserts the full approval predicate, so a post
+        // un-approved between the SELECT and here is dropped rather than sent.
+        const claimed = db.prepare(
+          `UPDATE posts SET status='posting', claimed_at=?, attempts=COALESCE(attempts,0)+1,
+                            updated_at=CURRENT_TIMESTAMP
+           WHERE id=? AND status='approved' AND time_confirmed=1`
+        ).run(new Date().toISOString(), post.id);
+        if (!claimed.changes) continue;
+
+        if (POSTING_DRY_RUN) {
+          db.prepare("UPDATE posts SET status='approved', claimed_at=NULL WHERE id=?").run(post.id);
+          log.info('post_dry_run', { id: post.id, chars: (post.body || '').length, preview: (post.body || '').slice(0, 80) });
+          continue;
+        }
+
+        // A thread reply must not go out before the post it replies to. If the parent
+        // has not published yet, release the claim and try again next tick — the
+        // lateness guard eventually skips it if the parent never lands.
+        if (post.parent_post_id) {
+          const parent = db.prepare('SELECT status, x_post_id FROM posts WHERE id = ?').get(post.parent_post_id) as any;
+          if (!parent?.x_post_id) {
+            db.prepare("UPDATE posts SET status='approved', claimed_at=NULL WHERE id=?").run(post.id);
+            log.warn('reply_waiting_for_parent', { id: post.id, parent: post.parent_post_id, parentStatus: parent?.status ?? 'missing' });
+            continue;
+          }
+        }
+
+        try {
+          const accessToken = await refreshXToken(tokenRecord);
+          const client = new TwitterApi(accessToken);
+
+          // Attach the image if one is stored. Upload goes through v1.1 — v2 has no
+          // upload endpoint of its own and simply takes the resulting media id.
+          const mediaIds: string[] = [];
+          const mediaRows = db.prepare('SELECT * FROM post_media WHERE post_id = ? ORDER BY id LIMIT 4').all(post.id) as any[];
+          for (const m of mediaRows) {
+            if (!m.file_path) continue;
+            const full = path.join(path.resolve(process.env.MEDIA_DIR || 'media'), path.basename(m.file_path));
+            if (!fs.existsSync(full)) { log.warn('media_file_missing', { id: post.id, file: m.file_path }); continue; }
+            try {
+              const mediaId = await client.v1.uploadMedia(full);
+              // Alt text is a separate call. A chart with no description is unreadable
+              // to anyone on a screen reader.
+              if (m.alt_text) {
+                await client.v1.createMediaMetadata(mediaId, { alt_text: { text: String(m.alt_text).slice(0, 1000) } });
+              }
+              mediaIds.push(mediaId);
+            } catch (mediaErr) {
+              // Publishing text-only beats not publishing, but it must not be silent.
+              log.error('media_upload_failed', { id: post.id, ...errInfo(mediaErr) });
+            }
+          }
+
+          const parentXId = post.parent_post_id
+            ? (db.prepare('SELECT x_post_id FROM posts WHERE id = ?').get(post.parent_post_id) as any)?.x_post_id
+            : null;
+
+          const payload: any = { text: post.body };
+          if (mediaIds.length) payload.media = { media_ids: mediaIds.slice(0, 4) };
+          if (parentXId) payload.reply = { in_reply_to_tweet_id: parentXId };
+
+          const posted = await client.v2.tweet(payload);
+          db.prepare(
+            "UPDATE posts SET status='posted', x_post_id=?, posted_at=CURRENT_TIMESTAMP, error=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?"
+          ).run(posted.data.id, post.id);
+          recordSpend(xSpend('post', 1, { post_id: post.id, tweet_id: posted.data.id }));
+          log.info('post_published', { id: post.id, tweet_id: posted.data.id, chars: (post.body || '').length });
+
+          // Cite the source as a REPLY, never in the body — a link in the post costs 30-50%
+          // of reach. A failed reply must not mark the post failed; the post already went out.
+          if (POST_SOURCE_AS_REPLY && post.source_url) {
+            try {
+              await client.v2.tweet({ text: `Source: ${post.source_url}`, reply: { in_reply_to_tweet_id: posted.data.id } });
+              // Billed at the URL rate — this is the cost of citing sources.
+              recordSpend(xSpend('post_with_link', 1, { post_id: post.id, kind: 'source_reply' }));
+              log.info('source_reply_published', { id: post.id });
+            } catch (replyErr) {
+              log.warn('source_reply_failed', { id: post.id, ...errInfo(replyErr) });
+            }
+          }
+        } catch (error) {
+          const msg = String(error instanceof Error ? error.message : error).slice(0, 500);
+          db.prepare("UPDATE posts SET status='failed', error=?, updated_at=CURRENT_TIMESTAMP WHERE id=?")
+            .run(msg, post.id);
+          log.error('post_failed', { id: post.id, ...errInfo(error) });
+          // A 'failed' row is terminal — nothing re-queues it automatically, so an
+          // unnoticed failure is a silently missing post.
+          void notifyOps(
+            `Scheduled post #${post.id} failed to publish`,
+            `Post #${post.id} (due ${post.scheduled_at}) could not be published and has been marked failed. It will NOT be retried automatically.\n\nError: ${msg}\n\nPreview: "${String(post.body || '').slice(0, 200)}…"`,
+          );
+        }
       }
     }
   } catch (err) {
-    console.error("Scheduled posts task error:", err);
+    log.error('scheduled_posts_task_error', errInfo(err));
   }
 
   // Process scheduled report generation
   try {
     const now = new Date();
-    const currentTime = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
-    const currentDay = now.getDay().toString();
-    const todayStr = now.toISOString().split('T')[0];
+    const nowEt = etParts(now);
+    const todayEt = etDateString(now);
+    const nowMinEt = etMinutesOfDay(now);
 
-    const schedules = db.prepare(`
-      SELECT * FROM scheduled_reports
-      WHERE enabled = 1
-        AND schedule_time = ?
-        AND (last_run IS NULL OR date(last_run) != ?)
-    `).all(currentTime, todayStr) as any[];
+    // All comparisons are in Eastern. `schedule_time` was previously matched against
+    // server-LOCAL time, which on this machine (America/Los_Angeles) meant a schedule
+    // labelled "06:00 EST" in the UI actually fired at 6am Pacific.
+    const schedules = db.prepare("SELECT * FROM scheduled_reports WHERE enabled = 1").all() as any[];
 
     for (const schedule of schedules) {
-      const scheduleDays = schedule.days.split(',').map((d: string) => d.trim());
-      if (!scheduleDays.includes(currentDay)) continue;
+      const scheduleDays = String(schedule.days || '').split(',').map((d: string) => d.trim()).filter(Boolean);
+      if (!scheduleDays.includes(String(nowEt.weekday))) continue;
+
+      // Already generated today (Eastern calendar day)?
+      if (schedule.last_run && etDateString(parseSqliteUtc(schedule.last_run)) === todayEt) continue;
+
+      const schedMinEt = parseHhMm(schedule.schedule_time);
+      if (schedMinEt === null) {
+        log.warn('report_schedule_time_unparseable', { id: schedule.id, type: schedule.report_type, value: schedule.schedule_time });
+        continue;
+      }
+
+      // Window, not an exact minute match. The old `schedule_time = ?` required the tick
+      // to land on precisely the right HH:MM — one skewed or missed tick (asleep, busy,
+      // restarting) and the report silently never generated that day.
+      const lateByMin = nowMinEt - schedMinEt;
+      if (lateByMin < 0) continue; // not due yet today
+
+      if (lateByMin > MAX_REPORT_LATENESS_MIN) {
+        // Too late to be worth catching up. Log once per ET day rather than every
+        // 60 seconds until midnight.
+        const key = `${schedule.id}:${todayEt}`;
+        if (!reportSkipLogged.has(key)) {
+          reportSkipLogged.add(key);
+          log.warn('report_schedule_missed', {
+            id: schedule.id, type: schedule.report_type,
+            due: schedule.schedule_time, late_by_min: lateByMin, limit_min: MAX_REPORT_LATENESS_MIN,
+          });
+          void notifyOps(
+            `Scheduled report "${schedule.report_type}" missed`,
+            `The ${schedule.report_type} report was due at ${schedule.schedule_time} ET and is now ${Math.round(lateByMin / 60)}h late, past the ${Math.round(MAX_REPORT_LATENESS_MIN / 60)}h catch-up window. It was not generated today.\n\nThis usually means the machine was asleep or the app was not running.`,
+          );
+        }
+        continue;
+      }
+
+      if (lateByMin > 2) {
+        log.info('report_schedule_catchup', { id: schedule.id, type: schedule.report_type, late_by_min: lateByMin });
+      }
 
       try {
         console.log(`[Cron] Generating scheduled ${schedule.report_type} report...`);
@@ -1719,7 +2444,7 @@ setInterval(async () => {
           ? await generateForecastReport()
           : isSpec
             ? await generateSpeculationReport()
-            : await generateWeeklyReport(schedule.report_type, schedule.custom_topic || undefined);
+            : await generateWeeklyReport(schedule.report_type, schedule.custom_topic || undefined, undefined, getContentGuidance());
         const reportId = `${schedule.report_type}-${Date.now()}`;
         const reportJson = JSON.stringify(report);
         db.prepare(`
@@ -1816,931 +2541,242 @@ app.delete("/api/watchlist/:symbol", requireAuth, (req, res) => {
   res.json({ success: true });
 });
 
-// ─── Markets / Live Data (Public.com) ─────────────────────────────────────────
+// ─── Markets / Live Data ───────────────────────────────────────────────────────
+// Extracted to src/server/markets.ts (self-contained: no db, no shared helpers).
+app.use(createMarketsRouter());
 
-let publicAccessToken: string | null = null;
-let publicTokenExpiry = 0;
+// ─── Post Queue ────────────────────────────────────────────────────────────────
+// Phase A: post types only. The queue itself (timeline, detail panel) lands in B–C.
+app.use(createPostQueueRouter({ db, requireAuth }));
 
-// Price history for 24h change calculation: symbol → [{price, ts}]
-const priceHistory: Record<string, { price: number; ts: number }[]> = {};
-const HISTORY_THROTTLE = 60 * 1000; // Only store 1 point per minute to save memory
+// ─── Connections / Live API Status ────────────────────────────────────────────
 
-async function getPublicToken(): Promise<string> {
-  if (publicAccessToken && Date.now() < publicTokenExpiry) return publicAccessToken;
-  const res = await fetch("https://api.public.com/userapiauthservice/personal/access-tokens", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ validityInMinutes: 60, secret: process.env.PUBLIC_SECRET_KEY }),
-  });
-  const body = await res.text();
-  if (!res.ok) throw new Error(`Public.com token exchange failed ${res.status}: ${body.slice(0, 200)}`);
-  const data = JSON.parse(body) as any;
-  publicAccessToken = data.accessToken;
-  publicTokenExpiry = Date.now() + 55 * 60 * 1000;
-  return publicAccessToken!;
+// Ping a single service — returns { status, latencyMs, error?, rateLimits?, meta? }
+async function pingService(id: string): Promise<{ status: 'live' | 'error' | 'unconfigured'; latencyMs: number; error?: string; rateLimits?: any; meta?: any }> {
+  const start = Date.now();
+  try {
+    switch (id) {
+      case 'anthropic': {
+        if (!process.env.ANTHROPIC_API_KEY) return { status: 'unconfigured', latencyMs: 0 };
+        const Anthropic = (await import("@anthropic-ai/sdk")).default;
+        const client = new Anthropic();
+        const { data: resp, response: raw } = await client.messages.create({
+          model: "claude-sonnet-4-6", max_tokens: 5,
+          messages: [{ role: "user", content: "ping" }],
+        }).withResponse();
+        const rl = {
+          limitRequests: parseInt(raw.headers.get('x-ratelimit-limit-requests') || '') || undefined,
+          limitTokens: parseInt(raw.headers.get('x-ratelimit-limit-tokens') || '') || undefined,
+          remainingRequests: parseInt(raw.headers.get('x-ratelimit-remaining-requests') || '') || undefined,
+          remainingTokens: parseInt(raw.headers.get('x-ratelimit-remaining-tokens') || '') || undefined,
+          resetRequests: raw.headers.get('x-ratelimit-reset-requests') || undefined,
+          resetTokens: raw.headers.get('x-ratelimit-reset-tokens') || undefined,
+        };
+        aiRateLimits.anthropic = { ...rl, inputTokensUsed: resp.usage?.input_tokens, outputTokensUsed: resp.usage?.output_tokens, lastCallAt: new Date().toISOString(), lastModel: "claude-sonnet-4-6" };
+        return { status: 'live', latencyMs: Date.now() - start, rateLimits: rl, meta: { model: "claude-sonnet-4-6" } };
+      }
+      case 'openai': {
+        if (!process.env.OPENAI_API_KEY) return { status: 'unconfigured', latencyMs: 0 };
+        const OpenAI = (await import("openai")).default;
+        const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+        await client.chat.completions.create({ model: "gpt-4o", max_tokens: 5, messages: [{ role: "user", content: "ping" }] });
+        return { status: 'live', latencyMs: Date.now() - start, meta: { model: "gpt-4o" } };
+      }
+      case 'gemini': {
+        if (!process.env.GEMINI_API_KEY) return { status: 'unconfigured', latencyMs: 0 };
+        const { GoogleGenAI } = await import("@google/genai");
+        const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+        const geminiModels = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"];
+        let geminiOk = false;
+        let usedModel = "";
+        for (const gm of geminiModels) {
+          try {
+            const resp = await ai.models.generateContent({ model: gm, contents: [{ parts: [{ text: "ping" }], role: "user" }] });
+            aiRateLimits.gemini = { inputTokensUsed: (resp as any).usageMetadata?.promptTokenCount, outputTokensUsed: (resp as any).usageMetadata?.candidatesTokenCount, lastCallAt: new Date().toISOString(), lastModel: gm };
+            usedModel = gm;
+            geminiOk = true;
+            break;
+          } catch { continue; }
+        }
+        if (!geminiOk) throw new Error("All Gemini models unavailable");
+        return { status: 'live', latencyMs: Date.now() - start, meta: { model: usedModel } };
+      }
+      case 'x': {
+        if (!hasValidCreds('x')) return { status: 'unconfigured', latencyMs: 0 };
+        const tokenRow = db.prepare("SELECT access_token FROM platform_tokens WHERE platform = 'x'").get() as any;
+        if (!tokenRow?.access_token) return { status: 'error', latencyMs: 0, error: 'No OAuth token — sign in via Settings' };
+        const { TwitterApi } = await import("twitter-api-v2");
+        const client = new TwitterApi(tokenRow.access_token);
+        const me = await client.v2.me();
+        return { status: 'live', latencyMs: Date.now() - start, meta: { user: `@${me.data?.username}` } };
+      }
+      case 'linkedin': {
+        if (!hasValidCreds('linkedin')) return { status: 'unconfigured', latencyMs: 0 };
+        const tokenRow = db.prepare("SELECT access_token FROM platform_tokens WHERE platform = 'linkedin'").get() as any;
+        if (!tokenRow?.access_token) return { status: 'error', latencyMs: 0, error: 'No OAuth token — connect in Settings' };
+        const r = await fetch('https://api.linkedin.com/v2/userinfo', { headers: { Authorization: `Bearer ${tokenRow.access_token}` } });
+        if (!r.ok) return { status: 'error', latencyMs: Date.now() - start, error: `HTTP ${r.status}` };
+        const data = await r.json();
+        return { status: 'live', latencyMs: Date.now() - start, meta: { user: data.name || data.sub } };
+      }
+      case 'bluesky': {
+        const tokenRow = db.prepare("SELECT access_token, person_urn FROM platform_tokens WHERE platform = 'bluesky'").get() as any;
+        if (!tokenRow?.access_token) return { status: 'error', latencyMs: 0, error: 'No credentials — connect in Settings' };
+        // Bluesky tokens are short-lived, just check if we have one stored
+        return { status: 'live', latencyMs: Date.now() - start, meta: { handle: tokenRow.person_urn || 'connected' } };
+      }
+      case 'threads': {
+        if (!hasValidCreds('threads')) return { status: 'unconfigured', latencyMs: 0 };
+        const tokenRow = db.prepare("SELECT access_token FROM platform_tokens WHERE platform = 'threads'").get() as any;
+        if (!tokenRow?.access_token) return { status: 'error', latencyMs: 0, error: 'No OAuth token — connect in Settings' };
+        const r = await fetch(`https://graph.threads.net/v1.0/me?fields=id,username&access_token=${tokenRow.access_token}`);
+        if (!r.ok) return { status: 'error', latencyMs: Date.now() - start, error: `HTTP ${r.status}` };
+        const data = await r.json();
+        return { status: 'live', latencyMs: Date.now() - start, meta: { user: `@${data.username}` } };
+      }
+      case 'instagram': {
+        const tokenRow = db.prepare("SELECT access_token, person_urn FROM platform_tokens WHERE platform = 'instagram'").get() as any;
+        if (!tokenRow?.access_token) return { status: 'error', latencyMs: 0, error: 'No OAuth token — connect in Settings' };
+        const igId = tokenRow.person_urn;
+        const r = await fetch(`https://graph.facebook.com/v18.0/${igId}?fields=username&access_token=${tokenRow.access_token}`);
+        if (!r.ok) return { status: 'error', latencyMs: Date.now() - start, error: `HTTP ${r.status}` };
+        const data = await r.json();
+        return { status: 'live', latencyMs: Date.now() - start, meta: { user: `@${data.username}` } };
+      }
+      case 'substack': {
+        const substackRow = db.prepare("SELECT key_value FROM platform_credentials WHERE platform = 'substack' AND key_name = 'subdomain'").get() as any;
+        if (!substackRow?.key_value) return { status: 'error', latencyMs: 0, error: 'No subdomain configured — set in Settings' };
+        return { status: 'live', latencyMs: Date.now() - start, meta: { subdomain: substackRow.key_value } };
+      }
+      case 'vercel': {
+        const r = await fetch('https://api.vercel.com/v6/deployments?limit=1', {
+          headers: process.env.VERCEL_TOKEN ? { Authorization: `Bearer ${process.env.VERCEL_TOKEN}` } : {},
+        });
+        if (r.status === 403 || r.status === 401) return { status: process.env.VERCEL_TOKEN ? 'error' : 'unconfigured', latencyMs: Date.now() - start, error: !process.env.VERCEL_TOKEN ? 'Set VERCEL_TOKEN in .env' : 'Invalid token' };
+        return { status: 'live', latencyMs: Date.now() - start };
+      }
+      case 'sentry': {
+        if (!process.env.SENTRY_DSN) return { status: 'unconfigured', latencyMs: 0, error: 'Set SENTRY_DSN in .env' };
+        // Sentry DSN is a URL — just validate it parses and the host resolves
+        const dsnUrl = new URL(process.env.SENTRY_DSN);
+        const r = await fetch(`${dsnUrl.protocol}//${dsnUrl.host}/api/0/`, { method: 'GET' });
+        return { status: 'live', latencyMs: Date.now() - start, meta: { host: dsnUrl.host } };
+      }
+      case 'posthog': {
+        if (!process.env.NEXT_PUBLIC_POSTHOG_KEY) return { status: 'unconfigured', latencyMs: 0, error: 'Set NEXT_PUBLIC_POSTHOG_KEY in .env' };
+        const host = process.env.NEXT_PUBLIC_POSTHOG_HOST || 'https://us.i.posthog.com';
+        const r = await fetch(`${host}/decide?v=3`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ api_key: process.env.NEXT_PUBLIC_POSTHOG_KEY, distinct_id: 'ping' }) });
+        if (!r.ok) return { status: 'error', latencyMs: Date.now() - start, error: `HTTP ${r.status}` };
+        return { status: 'live', latencyMs: Date.now() - start };
+      }
+      case 'pinecone': {
+        if (!process.env.PINECONE_API_KEY) return { status: 'unconfigured', latencyMs: 0, error: 'Set PINECONE_API_KEY in .env' };
+        const r = await fetch('https://api.pinecone.io/indexes', { headers: { 'Api-Key': process.env.PINECONE_API_KEY } });
+        if (!r.ok) return { status: 'error', latencyMs: Date.now() - start, error: `HTTP ${r.status}` };
+        const data = await r.json();
+        const count = Array.isArray(data.indexes) ? data.indexes.length : 0;
+        return { status: 'live', latencyMs: Date.now() - start, meta: { indexes: `${count} indexes` } };
+      }
+      case 'upstash': {
+        if (!process.env.UPSTASH_REDIS_REST_URL || !process.env.UPSTASH_REDIS_REST_TOKEN) return { status: 'unconfigured', latencyMs: 0, error: 'Set UPSTASH_REDIS_REST_URL & TOKEN in .env' };
+        const r = await fetch(`${process.env.UPSTASH_REDIS_REST_URL}/ping`, { headers: { Authorization: `Bearer ${process.env.UPSTASH_REDIS_REST_TOKEN}` } });
+        if (!r.ok) return { status: 'error', latencyMs: Date.now() - start, error: `HTTP ${r.status}` };
+        return { status: 'live', latencyMs: Date.now() - start };
+      }
+      case 'supabase': {
+        if (!process.env.NEXT_PUBLIC_SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) return { status: 'unconfigured', latencyMs: 0, error: 'Set SUPABASE_URL & SERVICE_ROLE_KEY in .env' };
+        const r = await fetch(`${process.env.NEXT_PUBLIC_SUPABASE_URL}/rest/v1/`, { headers: { apikey: process.env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}` } });
+        if (!r.ok) return { status: 'error', latencyMs: Date.now() - start, error: `HTTP ${r.status}` };
+        return { status: 'live', latencyMs: Date.now() - start };
+      }
+      case 'clerk': {
+        if (!process.env.CLERK_SECRET_KEY) return { status: 'unconfigured', latencyMs: 0, error: 'Set CLERK_SECRET_KEY in .env' };
+        const r = await fetch('https://api.clerk.com/v1/users?limit=1', { headers: { Authorization: `Bearer ${process.env.CLERK_SECRET_KEY}` } });
+        if (!r.ok) return { status: 'error', latencyMs: Date.now() - start, error: `HTTP ${r.status}` };
+        return { status: 'live', latencyMs: Date.now() - start };
+      }
+      case 'resend': {
+        if (!process.env.RESEND_API_KEY) return { status: 'unconfigured', latencyMs: 0, error: 'Set RESEND_API_KEY in .env' };
+        const r = await fetch('https://api.resend.com/domains', { headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY}` } });
+        if (!r.ok) return { status: 'error', latencyMs: Date.now() - start, error: `HTTP ${r.status}` };
+        const data = await r.json();
+        const domains = Array.isArray(data.data) ? data.data.map((d: any) => d.name).join(', ') : '';
+        return { status: 'live', latencyMs: Date.now() - start, meta: domains ? { domains } : undefined };
+      }
+      case 'cloudflare': {
+        if (!process.env.CLOUDFLARE_API_TOKEN) return { status: 'unconfigured', latencyMs: 0, error: 'Set CLOUDFLARE_API_TOKEN in .env' };
+        const r = await fetch('https://api.cloudflare.com/client/v4/user/tokens/verify', { headers: { Authorization: `Bearer ${process.env.CLOUDFLARE_API_TOKEN}` } });
+        if (!r.ok) return { status: 'error', latencyMs: Date.now() - start, error: `HTTP ${r.status}` };
+        return { status: 'live', latencyMs: Date.now() - start };
+      }
+      default:
+        return { status: 'error', latencyMs: 0, error: 'Unknown service' };
+    }
+  } catch (err: any) {
+    return { status: 'error', latencyMs: Date.now() - start, error: err.message?.slice(0, 120) || String(err) };
+  }
 }
 
-const MARKET_INSTRUMENTS = [
-  { symbol: "BTC",  type: "CRYPTO", name: "Bitcoin",      isCrypto: true },
-  { symbol: "SPX",  type: "INDEX",  name: "S&P 500",      isIndex:  true },
-  { symbol: "NDX",  type: "INDEX",  name: "Nasdaq-100",   isIndex:  true },
-  { symbol: "MSTR", type: "EQUITY", name: "MicroStrategy"                },
-  { symbol: "TSLA", type: "EQUITY", name: "Tesla"                        },
-  { symbol: "MSFT", type: "EQUITY", name: "Microsoft"                    },
-  { symbol: "META", type: "EQUITY", name: "Meta"                         },
-  { symbol: "AAPL", type: "EQUITY", name: "Apple"                        },
-  { symbol: "AMZN", type: "EQUITY", name: "Amazon"                       },
-  { symbol: "NVDA", type: "EQUITY", name: "Nvidia"                       },
-  { symbol: "AMD",  type: "EQUITY", name: "AMD"                          },
+// Connection definitions (static info)
+const CONNECTION_DEFS = [
+  { id: 'anthropic', name: 'Anthropic (Claude)', category: 'ai', tier: 'Max', knownLimits: { rpm: 4000, tpmInput: 400000, tpmOutput: 80000 } },
+  { id: 'openai',    name: 'OpenAI (GPT-4o)',    category: 'ai', tier: 'Fallback', knownLimits: { rpm: 500, tpmInput: 800000, tpmOutput: 100000 } },
+  { id: 'gemini',    name: 'Google Gemini',       category: 'ai', tier: 'Pay-as-you-go', knownLimits: { rpm: 1000, rpd: 1500, tpmInput: 4000000 } },
+  { id: 'x',         name: 'X (Twitter)',         category: 'social', tier: 'Premium', knownLimits: { postsPerDay: 100, postsPerMonth: 3000 } },
+  { id: 'linkedin',  name: 'LinkedIn',            category: 'social', tier: 'OAuth', knownLimits: { postsPerDay: 150 } },
+  { id: 'bluesky',   name: 'Bluesky',             category: 'social', tier: 'AT Proto', knownLimits: { postsPerDay: 1666 } },
+  { id: 'threads',   name: 'Threads',             category: 'social', tier: 'OAuth', knownLimits: { postsPerDay: 250 } },
+  { id: 'instagram', name: 'Instagram',           category: 'social', tier: 'Graph API', knownLimits: { postsPerDay: 50 } },
+  { id: 'substack',  name: 'Substack',            category: 'publishing', tier: 'API', knownLimits: {} },
+  { id: 'vercel',    name: 'Vercel',              category: 'infra', tier: 'Pro', knownLimits: {} },
+  { id: 'sentry',    name: 'Sentry',              category: 'infra', tier: 'Developer', knownLimits: {} },
+  { id: 'posthog',   name: 'PostHog',             category: 'infra', tier: 'Free', knownLimits: {} },
+  { id: 'pinecone',  name: 'Pinecone',            category: 'infra', tier: 'Starter', knownLimits: {} },
+  { id: 'upstash',   name: 'Upstash',             category: 'infra', tier: 'Free', knownLimits: {} },
+  { id: 'supabase',  name: 'Supabase',            category: 'infra', tier: 'Free', knownLimits: {} },
+  { id: 'clerk',     name: 'Clerk',               category: 'infra', tier: 'Free', knownLimits: {} },
+  { id: 'resend',    name: 'Resend',              category: 'infra', tier: 'Free', knownLimits: {} },
+  { id: 'cloudflare',name: 'Cloudflare',          category: 'infra', tier: 'Free', knownLimits: {} },
 ];
 
-app.get("/api/markets", async (req, res) => {
+// GET — returns all 9 connections with live ping status
+app.get("/api/connections", async (_req, res) => {
   try {
-    const token     = await getPublicToken();
-    const accountId = process.env.PUBLIC_ACCOUNT_ID!;
-
-    const pRes = await fetch(
-      `https://api.public.com/userapigateway/marketdata/${accountId}/quotes`,
-      {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ instruments: MARKET_INSTRUMENTS.map(i => ({ symbol: i.symbol, type: i.type })) }),
-      }
-    );
-
-    if (!pRes.ok) {
-      const err = await pRes.text();
-      throw new Error(`Public.com quotes failed ${pRes.status}: ${err.slice(0, 200)}`);
-    }
-
-    const pData = await pRes.json() as any;
-    const list: any[] = pData.quotes || [];
-
-    // Build quote map keyed by instrument symbol
-    const quoteMap: Record<string, any> = {};
-    for (const q of list) {
-      const sym = q.instrument?.symbol ?? q.symbol;
-      if (sym) quoteMap[sym] = q;
-    }
-
-    const now = Date.now();
-    const WINDOW = 25 * 60 * 60 * 1000; // 25 hours
-
-    const result = MARKET_INSTRUMENTS.map(inst => {
-      const q     = quoteMap[inst.symbol] || {};
-      const price = q.last != null ? parseFloat(q.last) : null;
-
-      // Update price history
-      if (price != null) {
-        const history = priceHistory[inst.symbol] || (priceHistory[inst.symbol] = []);
-        const lastEntry = history[history.length - 1];
-        
-        // Optimization: Only push if enough time passed to avoid array bloat on high traffic
-        if (!lastEntry || now - lastEntry.ts > HISTORY_THROTTLE) {
-          history.push({ price, ts: now });
-        }
-        // Trim entries older than 25h
-        priceHistory[inst.symbol] = priceHistory[inst.symbol].filter(e => now - e.ts < WINDOW);
-      }
-
-      // 24h change: compare with oldest entry ≥ 23h ago, else first available
-      let change: number | null = null;
-      let changePercent: number | null = null;
-      const hist = priceHistory[inst.symbol] || [];
-      if (price != null && hist.length > 1) {
-        const old = hist.find(e => now - e.ts >= 23 * 60 * 60 * 1000) ?? hist[0];
-        if (old && old.price) {
-          change = price - old.price;
-          changePercent = (change / old.price) * 100;
-        }
-      }
-
-      const bid    = q.bid    != null ? parseFloat(q.bid)    : null;
-      const ask    = q.ask    != null ? parseFloat(q.ask)    : null;
-      const spread = bid != null && ask != null ? ask - bid : null;
-
-      return {
-        symbol:        inst.symbol,
-        name:          inst.name,
-        type:          inst.type,
-        isCrypto:      (inst as any).isCrypto || false,
-        isIndex:       (inst as any).isIndex  || false,
-        price,
-        change,
-        changePercent,
-        bid,
-        ask,
-        spread,
-        volume:        q.volume != null ? Number(q.volume) : null,
-        lastTimestamp: q.lastTimestamp ?? null,
-        outcome:       q.outcome ?? null,
-      };
-    });
-
-    res.json(result);
-  } catch (err) {
-    console.error("[Markets] Error:", err);
-    res.status(500).json({ error: String(err) });
-  }
-});
-
-// ─── Market History — 30-day candles (Yahoo Finance v8) ───────────────────────
-
-const YAHOO_MAP: Record<string, string> = {
-  BTC: "BTC-USD", SPX: "^GSPC", NDX: "^NDX",
-  MSTR: "MSTR", TSLA: "TSLA", MSFT: "MSFT",
-  META: "META", AAPL: "AAPL", AMZN: "AMZN", NVDA: "NVDA", AMD: "AMD",
-};
-
-const RANGE_MAP: Record<string, { interval: string; range: string }> = {
-  "1d": { interval: "5m",  range: "1d"  },
-  "1w": { interval: "1h",  range: "5d"  },
-  "1m": { interval: "1d",  range: "1mo" },
-  "3m": { interval: "1d",  range: "3mo" },
-  "6m": { interval: "1wk", range: "6mo" },
-  "1y": { interval: "1wk", range: "1y"  },
-};
-
-function yahooParams(rangeKey: string): { interval: string; range: string } {
-  return RANGE_MAP[rangeKey] || RANGE_MAP["1m"];
-}
-
-// Shared helper: parse Yahoo Finance chart response into candles + pivot levels
-function parseYahooCandles(chartResult: any): { candles: any[]; pivotLevels: any } {
-  const timestamps: number[] = chartResult.timestamp || [];
-  const q = chartResult.indicators?.quote?.[0] || {};
-  const candles = timestamps
-    .map((t: number, i: number) => ({
-      t: t * 1000, o: q.open?.[i], h: q.high?.[i], l: q.low?.[i], c: q.close?.[i], v: q.volume?.[i],
-    }))
-    .filter((c: any) => c.o != null && c.h != null && c.l != null && c.c != null);
-
-  let pivotLevels: any = null;
-  if (candles.length > 0) {
-    const periodH = Math.max(...candles.map((c: any) => c.h));
-    const periodL = Math.min(...candles.map((c: any) => c.l));
-    const periodC = (candles[candles.length - 1] as any).c;
-    const p = (periodH + periodL + periodC) / 3;
-    pivotLevels = {
-      p, r1: 2*p - periodL, r2: p + (periodH - periodL), r3: periodH + 2*(p - periodL),
-      s1: 2*p - periodH, s2: p - (periodH - periodL), s3: periodL - 2*(periodH - p),
-    };
-  }
-  return { candles, pivotLevels };
-}
-
-// Fetch candles for a single Yahoo symbol, returning empty result on failure
-async function fetchYahooCandles(yahooSym: string, interval: string, range: string): Promise<{ candles: any[]; pivotLevels: any }> {
-  const r = await fetch(
-    `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSym)}?interval=${interval}&range=${range}`,
-    { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" } }
-  );
-  if (!r.ok) return { candles: [], pivotLevels: null };
-  const j = await r.json() as any;
-  const result = j.chart?.result?.[0];
-  if (!result) return { candles: [], pivotLevels: null };
-  return parseYahooCandles(result);
-}
-
-app.get("/api/markets/history", async (req, res) => {
-  try {
-    const rangeKey = ((req.query.range as string) || "1m").toLowerCase();
-    const { interval, range } = yahooParams(rangeKey);
-    const singleSymbol = ((req.query.symbol as string) || "").toUpperCase();
-
-    // Single-symbol mode
-    if (singleSymbol) {
-      const yahooSym = YAHOO_MAP[singleSymbol] || singleSymbol;
-      try {
-        const { candles, pivotLevels } = await fetchYahooCandles(yahooSym, interval, range);
-        return res.json({ symbol: singleSymbol, candles, pivotLevels });
-      } catch { return res.json({ symbol: singleSymbol, candles: [], pivotLevels: null }); }
-    }
-
+    // Ping all 9 services in parallel
     const results = await Promise.all(
-      Object.entries(YAHOO_MAP).map(async ([sym, yahooSym]) => {
-        try {
-          const { candles, pivotLevels } = await fetchYahooCandles(yahooSym, interval, range);
-          return { symbol: sym, candles, pivotLevels };
-        } catch { return { symbol: sym, candles: [], pivotLevels: null }; }
+      CONNECTION_DEFS.map(async (def) => {
+        const ping = await pingService(def.id);
+        return {
+          ...def,
+          status: ping.status,
+          latencyMs: ping.latencyMs,
+          error: ping.error || null,
+          meta: ping.meta || null,
+          rateLimits: ping.rateLimits || aiRateLimits[def.id as keyof typeof aiRateLimits] || {},
+          checkedAt: new Date().toISOString(),
+        };
       })
     );
-    res.json(results);
+    res.json({ connections: results });
   } catch (err) {
+    console.error("[Connections]", err);
     res.status(500).json({ error: String(err) });
   }
 });
 
-// ─── Single-symbol history endpoint ──────────────────────────────────────────
-
-app.get("/api/markets/history/:symbol", async (req, res) => {
-  try {
-    const sym = (req.params.symbol || "").toUpperCase();
-    const rangeKey = ((req.query.range as string) || "1m").toLowerCase();
-    const { interval, range } = yahooParams(rangeKey);
-
-    // Check YAHOO_MAP first, then fallback to the symbol itself (or CRYPTO convention)
-    let yahooSym = YAHOO_MAP[sym];
-    if (!yahooSym) {
-      yahooSym = sym;
-    }
-
-    const { candles, pivotLevels } = await fetchYahooCandles(yahooSym, interval, range);
-    res.json({ symbol: sym, candles, pivotLevels });
-  } catch (err) {
-    res.status(500).json({ error: String(err) });
-  }
-});
-
-// ─── Options — most traded contracts (Public.com option-chain) ────────────────
-
-function nextMonthlyExpiry(): string {
-  const now = new Date();
-  for (let mo = 0; mo <= 3; mo++) {
-    const d = new Date(now.getFullYear(), now.getMonth() + mo, 1);
-    let fri = 0;
-    while (fri < 3) { if (d.getDay() === 5) fri++; if (fri < 3) d.setDate(d.getDate() + 1); }
-    if (d.getTime() - now.getTime() > 7 * 864e5) return d.toISOString().split("T")[0];
-  }
-  return "";
-}
-
-const EQUITY_SYMS = ["MSTR", "TSLA", "MSFT", "META", "AAPL", "AMZN", "NVDA", "AMD"];
-let optionsCache: any = null;
-let optionsCacheTime = 0;
-
-app.get("/api/markets/options", async (_req, res) => {
-  try {
-    if (optionsCache && Date.now() - optionsCacheTime < 5 * 60 * 1000) return res.json(optionsCache);
-
-    const token   = await getPublicToken();
-    const acctId  = process.env.PUBLIC_ACCOUNT_ID!;
-    const expiry  = nextMonthlyExpiry();
-
-    const results = await Promise.all(
-      EQUITY_SYMS.map(async (sym) => {
-        try {
-          const r = await fetch(
-            `https://api.public.com/userapigateway/marketdata/${acctId}/option-chain`,
-            {
-              method: "POST",
-              headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-              body: JSON.stringify({ instrument: { symbol: sym, type: "EQUITY" }, expirationDate: expiry }),
-            }
-          );
-          if (!r.ok) return { symbol: sym, expiry, contracts: [] };
-          const data = await r.json() as any;
-          const calls = (data.calls || []).map((o: any) => ({ ...o, side: "CALL" }));
-          const puts  = (data.puts  || []).map((o: any) => ({ ...o, side: "PUT" }));
-          const top = [...calls, ...puts]
-            .filter((o: any) => (o.volume || 0) > 0)
-            .sort((a: any, b: any) => (b.volume || 0) - (a.volume || 0))
-            .slice(0, 8)
-            .map((o: any) => {
-              const osiSym: string = o.instrument?.symbol || "";
-              const strike = osiSym.length >= 8 ? parseInt(osiSym.slice(-8)) / 1000 : null;
-              return {
-                symbol: osiSym, side: o.side, strike,
-                last:  o.last  != null ? parseFloat(o.last)  : null,
-                bid:   o.bid   != null ? parseFloat(o.bid)   : null,
-                ask:   o.ask   != null ? parseFloat(o.ask)   : null,
-                volume: o.volume || 0,
-                openInterest: o.openInterest || 0,
-              };
-            });
-          return { symbol: sym, expiry, contracts: top };
-        } catch { return { symbol: sym, expiry, contracts: [] }; }
-      })
-    );
-
-    optionsCache = results;
-    optionsCacheTime = Date.now();
-    res.json(results);
-  } catch (err) {
-    res.status(500).json({ error: String(err) });
-  }
-});
-
-// ─── Market Insights — AI-generated analysis from live data ──────────────────
-
-let insightsCache: { text: string; ts: number } | null = null;
-const INSIGHTS_TTL = 10 * 60 * 1000; // 10 minutes
-
-app.get("/api/markets/insights", async (_req, res) => {
-  if (insightsCache && Date.now() - insightsCache.ts < INSIGHTS_TTL) {
-    return res.json({ text: insightsCache.text, cached: true, generatedAt: new Date(insightsCache.ts).toISOString() });
-  }
-
-  try {
-    // Gather live prices
-    const token     = await getPublicToken();
-    const accountId = process.env.PUBLIC_ACCOUNT_ID!;
-    const pRes = await fetch(
-      `https://api.public.com/userapigateway/marketdata/${accountId}/quotes`,
-      {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ instruments: MARKET_INSTRUMENTS.map(i => ({ symbol: i.symbol, type: i.type })) }),
-      }
-    );
-    const pData = pRes.ok ? await pRes.json() as any : { quotes: [] };
-    const quoteMap: Record<string, any> = {};
-    for (const q of (pData.quotes || [])) {
-      const sym = q.instrument?.symbol ?? q.symbol;
-      if (sym) quoteMap[sym] = q;
-    }
-
-    // Gather 30-day history + pivots
-    const historyData = await Promise.all(
-      Object.entries(YAHOO_MAP).map(async ([sym, yahooSym]) => {
-        try {
-          const r = await fetch(
-            `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSym)}?interval=1d&range=1mo`,
-            { headers: { "User-Agent": "Mozilla/5.0" } }
-          );
-          if (!r.ok) return { sym, open30: null, close30: null, hi30: null, lo30: null, pivot: null };
-          const j = await r.json() as any;
-          const result = j.chart?.result?.[0];
-          if (!result) return { sym, open30: null, close30: null, hi30: null, lo30: null, pivot: null };
-          const ts: number[] = result.timestamp || [];
-          const q2 = result.indicators?.quote?.[0] || {};
-          const candles = ts.map((t, i) => ({
-            o: q2.open?.[i], h: q2.high?.[i], l: q2.low?.[i], c: q2.close?.[i],
-          })).filter((c: any) => c.o != null);
-          if (!candles.length) return { sym, open30: null, close30: null, hi30: null, lo30: null, pivot: null };
-          const last  = candles[candles.length - 1] as any;
-          const first = candles[0] as any;
-          const hi30  = Math.max(...candles.map((c: any) => c.h));
-          const lo30  = Math.min(...candles.map((c: any) => c.l));
-          const p = (last.h + last.l + last.c) / 3;
-          return {
-            sym, open30: first.o, close30: last.c, hi30, lo30,
-            pivot: { p, r1: 2*p - last.l, s1: 2*p - last.h },
-          };
-        } catch { return { sym, open30: null, close30: null, hi30: null, lo30: null, pivot: null }; }
-      })
-    );
-
-    // Build a compact data snapshot for the prompt
-    const lines = MARKET_INSTRUMENTS.map(inst => {
-      const q    = quoteMap[inst.symbol] || {};
-      const price = q.last != null ? parseFloat(q.last) : null;
-      const h    = historyData.find(d => d.sym === inst.symbol);
-      const pct30 = h?.open30 && price ? ((price - h.open30) / h.open30 * 100).toFixed(1) : "?";
-      const pivot = h?.pivot ? `P=${h.pivot.p.toFixed(0)} S1=${h.pivot.s1.toFixed(0)} R1=${h.pivot.r1.toFixed(0)}` : "";
-      const priceStr = price != null ? (inst.isIndex ? price.toFixed(0) : `$${price.toFixed(2)}`) : "N/A";
-      const rangeStr = h?.hi30 ? `30d range $${h.lo30?.toFixed(0)}–$${h.hi30?.toFixed(0)}` : "";
-      return `${inst.symbol} (${inst.name}): ${priceStr} | ${pct30}% vs 30d ago | ${rangeStr} | ${pivot}`;
-    });
-
-    const now = new Date().toUTCString();
-    const prompt = `You are a sharp, concise macro/markets analyst. Today is ${now}.
-
-Here is live market data:
-${lines.join('\n')}
-
-Write a tight, actionable market insights brief (aim for ~300 words). Structure it as:
-1. **Overall Tone** — one sentence: risk-on, risk-off, or mixed? Why?
-2. **Key Setups** — 3–5 bullet points, each covering a specific instrument or theme. Call out pivot levels, breakout/breakdown risks, relative strength/weakness, and what to watch.
-3. **Watch List** — 2–3 specific price levels or catalysts that will define the next move.
-
-Be direct. No filler. Use the actual numbers from the data. Format in markdown.`;
-
-    const anthropic = new (await import("@anthropic-ai/sdk")).default();
-    const msg = await anthropic.messages.create({
-      model: "claude-sonnet-4-6",
-      max_tokens: 600,
-      messages: [{ role: "user", content: prompt }],
-    });
-
-    const text = (msg.content[0] as any).text as string;
-    insightsCache = { text, ts: Date.now() };
-    res.json({ text, cached: false, generatedAt: new Date().toISOString() });
-  } catch (err) {
-    console.error("[Insights]", err);
-    res.status(500).json({ error: String(err) });
-  }
-});
-
-// ─── Ticker Lookup — arbitrary symbol on demand ───────────────────────────────
-
-app.get("/api/markets/lookup", async (req, res) => {
-  const raw  = ((req.query.symbol as string) || "").trim().toUpperCase();
-  const type = ((req.query.type  as string) || "EQUITY").toUpperCase();
-  if (!raw) return res.status(400).json({ error: "symbol required" });
-
-  try {
-    const token     = await getPublicToken();
-    const accountId = process.env.PUBLIC_ACCOUNT_ID!;
-
-    // Try the supplied type first; if that gets no quote, try the other two
-    const tryTypes = type === "CRYPTO"
-      ? ["CRYPTO", "EQUITY", "INDEX"]
-      : type === "INDEX"
-        ? ["INDEX", "EQUITY", "CRYPTO"]
-        : ["EQUITY", "CRYPTO", "INDEX"];
-
-    let quoteData: any = null;
-    let resolvedType = type;
-
-    for (const t of tryTypes) {
-      const qRes = await fetch(
-        `https://api.public.com/userapigateway/marketdata/${accountId}/quotes`,
-        {
-          method: "POST",
-          headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-          body: JSON.stringify({ instruments: [{ symbol: raw, type: t }] }),
-        }
-      );
-      if (!qRes.ok) continue;
-      const qData = await qRes.json() as any;
-      const q = (qData.quotes || [])[0];
-      if (q && (q.last != null || q.bid != null || q.ask != null)) {
-        quoteData = q;
-        resolvedType = t;
-        break;
-      }
-    }
-
-    if (!quoteData) return res.status(404).json({ error: `No quote found for ${raw}` });
-
-    const price  = quoteData.last  != null ? parseFloat(quoteData.last)  : null;
-    const bid    = quoteData.bid   != null ? parseFloat(quoteData.bid)   : null;
-    const ask    = quoteData.ask   != null ? parseFloat(quoteData.ask)   : null;
-    const spread = bid != null && ask != null ? ask - bid : null;
-
-    const tile = {
-      symbol:        raw,
-      name:          quoteData.instrument?.description || raw,
-      type:          resolvedType,
-      isCrypto:      resolvedType === "CRYPTO",
-      isIndex:       resolvedType === "INDEX",
-      price,
-      change:        null,
-      changePercent: null,
-      bid,
-      ask,
-      spread,
-      volume:        quoteData.volume != null ? Number(quoteData.volume) : null,
-      lastTimestamp: quoteData.lastTimestamp ?? null,
-    };
-
-    // Fetch candle history from Yahoo Finance
-    const lookupRange = ((req.query.range as string) || "1m").toLowerCase();
-    const { interval: lkInterval, range: lkRange } = yahooParams(lookupRange);
-    const yahooSym = resolvedType === "CRYPTO" ? `${raw}-USD` : raw;
-    let candles: any[] = [];
-    let pivotLevels: any = null;
-    try {
-      const history = await fetchYahooCandles(yahooSym, lkInterval, lkRange);
-      candles = history.candles;
-      pivotLevels = history.pivotLevels;
-    } catch { /* history is optional */ }
-
-    res.json({ tile, candles, pivotLevels });
-  } catch (err) {
-    console.error("[Lookup]", err);
-    res.status(500).json({ error: String(err) });
-  }
-});
-
-// ─── Market Quality Terminal ────────────────────────────────────────────────────
-
-let terminalCache: { data: any; ts: number } | null = null;
-const TERMINAL_TTL = 5 * 60 * 1000; // 5 minutes
-
-let terminalAnalysisCache: { text: string; ts: number } | null = null;
-const TERMINAL_ANALYSIS_TTL = 10 * 60 * 1000; // 10 minutes
-
-const TERMINAL_SYMBOLS = [
-  "^GSPC", "^NDX", "^VIX", "DX-Y.NYB", "^TNX", "GLD",
-  "XLE", "XLF", "XLK", "XLV", "XLI", "XLU", "XLY", "XLP", "XLB", "XLRE", "XLC",
-];
-
-const SECTOR_META: Record<string, string> = {
-  XLE: "Energy", XLF: "Financials", XLK: "Technology", XLV: "Health Care",
-  XLI: "Industrials", XLU: "Utilities", XLY: "Consumer Disc", XLP: "Consumer Staples",
-  XLB: "Materials", XLRE: "Real Estate", XLC: "Communications",
-};
-
-async function fetchYahooChart(symbol: string, interval = "1d", range = "3mo") {
-  const url = `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=${interval}&range=${range}`;
-  const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
-  if (!r.ok) return null;
-  const j = await r.json() as any;
-  const result = j.chart?.result?.[0];
-  if (!result) return null;
-  const timestamps: number[] = result.timestamp || [];
-  const q = result.indicators?.quote?.[0] || {};
-  const closes: number[] = [];
-  const candles: { t: number; o: number; h: number; l: number; c: number }[] = [];
-  for (let i = 0; i < timestamps.length; i++) {
-    if (q.close?.[i] != null) {
-      closes.push(q.close[i]);
-      candles.push({ t: timestamps[i] * 1000, o: q.open?.[i], h: q.high?.[i], l: q.low?.[i], c: q.close[i] });
-    }
-  }
-  const meta = result.meta || {};
-  const price = meta.regularMarketPrice ?? (closes.length ? closes[closes.length - 1] : null);
-  const prevClose = meta.chartPreviousClose ?? meta.previousClose ?? (closes.length > 1 ? closes[closes.length - 2] : null);
-  return { symbol, price, prevClose, closes, candles, meta };
-}
-
-function sma(arr: number[], period: number): number | null {
-  if (arr.length < period) return null;
-  const slice = arr.slice(-period);
-  return slice.reduce((a, b) => a + b, 0) / period;
-}
-
-async function buildTerminalData() {
-  // Fetch all symbols in parallel
-  const results = await Promise.all(TERMINAL_SYMBOLS.map(s => fetchYahooChart(s)));
-  const dataMap: Record<string, NonNullable<Awaited<ReturnType<typeof fetchYahooChart>>>> = {};
-  for (let i = 0; i < TERMINAL_SYMBOLS.length; i++) {
-    if (results[i]) dataMap[TERMINAL_SYMBOLS[i]] = results[i]!;
-  }
-
-  const spx = dataMap["^GSPC"];
-  const ndx = dataMap["^NDX"];
-  const vix = dataMap["^VIX"];
-  const dxy = dataMap["DX-Y.NYB"];
-  const tny = dataMap["^TNX"];
-  const gld = dataMap["GLD"];
-
-  // ─── Ticker bar ────────────────────────────────────────────────────────
-  const tickerItems = [
-    { sym: "SPX", data: spx },
-    { sym: "NDX", data: ndx },
-    { sym: "VIX", data: vix },
-    { sym: "DXY", data: dxy },
-    { sym: "10Y", data: tny },
-    { sym: "GLD", data: gld },
-  ].map(({ sym, data }) => {
-    if (!data) return { symbol: sym, price: 0, change: 0, changePercent: 0 };
-    const change = data.prevClose ? data.price - data.prevClose : 0;
-    const changePercent = data.prevClose ? change / data.prevClose : 0;
-    return { symbol: sym, price: +(data.price?.toFixed(2) ?? 0), change: +change.toFixed(2), changePercent: +changePercent.toFixed(4) };
-  });
-
-  // ─── VIX scoring ──────────────────────────────────────────────────────
-  const vixLevel = vix?.price ?? 20;
-  let vixScore: number;
-  if (vixLevel < 15) vixScore = 100;
-  else if (vixLevel < 20) vixScore = 75;
-  else if (vixLevel < 25) vixScore = 50;
-  else if (vixLevel < 30) vixScore = 25;
-  else vixScore = 0;
-
-  const vixCloses = vix?.closes ?? [];
-  const vix5d = sma(vixCloses, 5);
-  const vixTrend = vix5d && vixLevel > vix5d ? "Rising" : "Falling";
-  const vixTrendSignal = vixTrend === "Rising" ? "negative" : "positive";
-
-  // VIX IV percentile approximation: where current VIX is vs 3-month range
-  const vixHi = vixCloses.length ? Math.max(...vixCloses) : vixLevel;
-  const vixLo = vixCloses.length ? Math.min(...vixCloses) : vixLevel;
-  const vixIvPercentile = vixHi !== vixLo ? Math.round(((vixLevel - vixLo) / (vixHi - vixLo)) * 100) : 50;
-  const vixIvSignal = vixIvPercentile > 80 ? "elevated" : vixIvPercentile > 60 ? "normal" : "low";
-
-  // Put/Call ratio approximation from VIX level
-  const putCallRatio = +(0.7 + (vixLevel - 15) * 0.02).toFixed(2);
-  const putCallSignal = putCallRatio > 1.0 ? "elevated" : putCallRatio > 0.85 ? "normal" : "low";
-
-  // ─── Trend scoring ────────────────────────────────────────────────────
-  const spxCloses = spx?.closes ?? [];
-  const spxPrice = spx?.price ?? 0;
-  const spx20d = sma(spxCloses, 20);
-  const spx50d = sma(spxCloses, 50);
-  // 200d: we only have ~63 days, approximate from what we have
-  const spx200d = spxCloses.length >= 50 ? sma(spxCloses, spxCloses.length) : null;
-
-  let trendScore = 0;
-  if (spx200d && spxPrice > spx200d) trendScore += 30;
-  if (spx50d && spxPrice > spx50d) trendScore += 20;
-  if (spx20d && spxPrice > spx20d) trendScore += 10;
-
-  const ndxCloses = ndx?.closes ?? [];
-  const ndxPrice = ndx?.price ?? 0;
-  const ndx20d = sma(ndxCloses, 20);
-  const ndx50d = sma(ndxCloses, 50);
-  const ndx200d = ndxCloses.length >= 50 ? sma(ndxCloses, ndxCloses.length) : null;
-  if (ndx200d && ndxPrice > ndx200d) trendScore += 15;
-  if (ndx50d && ndxPrice > ndx50d) trendScore += 10;
-  if (ndx20d && ndxPrice > ndx20d) trendScore += 5;
-  // Normalize: max raw = 90, scale to 100
-  trendScore = Math.min(100, Math.round(trendScore * 100 / 90));
-
-  const spxVs20d = spx20d ? +((spxPrice - spx20d) / spx20d * 100).toFixed(2) : 0;
-  const spxVs50d = spx50d ? +((spxPrice - spx50d) / spx50d * 100).toFixed(2) : 0;
-  const spxVs200d = spx200d ? +((spxPrice - spx200d) / spx200d * 100).toFixed(2) : 0;
-
-  function trendSignalFor(val: number) {
-    if (val > 2) return "strong";
-    if (val > 0) return "intact";
-    if (val > -2) return "weak";
-    return "broken";
-  }
-
-  // QQQ regime
-  const qqqAbove50 = ndx50d && ndxPrice > ndx50d;
-  const qqqAbove20 = ndx20d && ndxPrice > ndx20d;
-  const qqqTrend = qqqAbove50 && qqqAbove20 ? "uptrend" : qqqAbove20 ? "correcting" : "downtrend";
-  const spxAbove50 = spx50d && spxPrice > spx50d;
-  const spxAbove20 = spx20d && spxPrice > spx20d;
-  const regime = spxAbove50 && spxAbove20 ? "uptrend" : spxAbove20 ? "correcting" : "downtrend";
-
-  // ─── Breadth scoring ──────────────────────────────────────────────────
-  const sectorSymbols = ["XLE", "XLF", "XLK", "XLV", "XLI", "XLU", "XLY", "XLP", "XLB", "XLRE", "XLC"];
-  let above50dCount = 0;
-  let above200dCount = 0;
-  for (const sym of sectorSymbols) {
-    const d = dataMap[sym];
-    if (!d) continue;
-    const c = d.closes;
-    const ma50 = sma(c, 50);
-    const ma200 = c.length >= 50 ? sma(c, c.length) : null;
-    if (ma50 && d.price > ma50) above50dCount++;
-    if (ma200 && d.price > ma200) above200dCount++;
-  }
-  const breadthScore = Math.round((above50dCount / 11) * 100);
-  const pctAbove50d = Math.round((above50dCount / 11) * 100);
-  const pctAbove200d = Math.round((above200dCount / 11) * 100);
-  const pctAbove50dSignal = pctAbove50d >= 70 ? "strong" : pctAbove50d >= 50 ? "neutral" : pctAbove50d >= 30 ? "weak" : "very weak";
-  const pctAbove200dSignal = pctAbove200d >= 70 ? "strong" : pctAbove200d >= 50 ? "neutral" : pctAbove200d >= 30 ? "weak" : "very weak";
-
-  // NYSE A/D approximation: use broad sector price vs 20d MA
-  let advancers = 0;
-  let decliners = 0;
-  for (const sym of sectorSymbols) {
-    const d = dataMap[sym];
-    if (!d) continue;
-    const ma20 = sma(d.closes, 20);
-    if (ma20 && d.price > ma20) advancers++;
-    else decliners++;
-  }
-  const nyseAd = advancers - decliners > 0 ? +((advancers - decliners) / 11).toFixed(2) : -+((decliners - advancers) / 11).toFixed(2);
-  const nyseAdSignal = nyseAd > 0.3 ? "positive" : nyseAd > -0.3 ? "neutral" : "negative";
-
-  // New highs/lows: count sectors at 3-month high vs 3-month low
-  let newHighs = 0;
-  let newLows = 0;
-  for (const sym of sectorSymbols) {
-    const d = dataMap[sym];
-    if (!d || !d.closes.length) continue;
-    const hi = Math.max(...d.closes);
-    const lo = Math.min(...d.closes);
-    const threshold = (hi - lo) * 0.05;
-    if (d.price >= hi - threshold) newHighs++;
-    if (d.price <= lo + threshold) newLows++;
-  }
-  const newHighsLows = `${newHighs}/${newLows * 15}`;
-  const newHighsLowsSignal = newHighs > newLows ? "good" : newHighs === newLows ? "neutral" : "poor";
-
-  // ─── Momentum scoring ─────────────────────────────────────────────────
-  const sectorPerf: { name: string; symbol: string; change: number }[] = [];
-  let sectorsPositive = 0;
-  for (const sym of sectorSymbols) {
-    const d = dataMap[sym];
-    if (!d) { sectorPerf.push({ name: SECTOR_META[sym], symbol: sym, change: 0 }); continue; }
-    const c = d.closes;
-    const fiveDayAgo = c.length > 5 ? c[c.length - 6] : c[0];
-    const change = fiveDayAgo ? +((d.price - fiveDayAgo) / fiveDayAgo * 100).toFixed(2) : 0;
-    if (change > 0) sectorsPositive++;
-    sectorPerf.push({ name: SECTOR_META[sym], symbol: sym, change });
-  }
-  const momentumScore = Math.round((sectorsPositive / 11) * 100);
-  sectorPerf.sort((a, b) => b.change - a.change);
-  const leader = sectorPerf[0] || { name: "N/A", change: 0 };
-  const laggard = sectorPerf[sectorPerf.length - 1] || { name: "N/A", change: 0 };
-  const sectorsSignal = sectorsPositive >= 8 ? "strong" : sectorsPositive >= 5 ? "neutral" : sectorsPositive >= 3 ? "weak" : "very weak";
-  const participation = sectorsPositive >= 8 ? "broad" : sectorsPositive >= 5 ? "moderate" : "low";
-
-  // ─── Macro scoring ────────────────────────────────────────────────────
-  const tenYearYield = tny?.price ?? 0;
-  const tnyCloses = tny?.closes ?? [];
-  const tny5d = sma(tnyCloses, 5);
-  const tenYearSignal = tny5d && tenYearYield > tny5d + 0.05 ? "rising" : tny5d && tenYearYield < tny5d - 0.05 ? "falling" : "stable";
-
-  const dxyPrice = dxy?.price ?? 0;
-  const dxyCloses = dxy?.closes ?? [];
-  const dxy5d = sma(dxyCloses, 5);
-  const dxySignal = dxy5d && dxyPrice > dxy5d + 0.3 ? "strengthening" : dxy5d && dxyPrice < dxy5d - 0.3 ? "weakening" : "stable";
-
-  let macroScore = 50; // start at neutral
-  if (tenYearSignal === "stable") macroScore += 20;
-  else if (tenYearSignal === "falling") macroScore += 10;
-  else macroScore -= 15;
-  if (dxySignal === "stable") macroScore += 15;
-  else if (dxySignal === "weakening") macroScore += 10;
-  else macroScore -= 10;
-  if (vixTrend === "Falling") macroScore += 15;
-  else macroScore -= 15;
-  macroScore = Math.max(0, Math.min(100, macroScore));
-
-  // FOMC detection: crude check for upcoming FOMC dates
-  const today = new Date();
-  // 2026 FOMC dates (approximate)
-  const fomcDates = [
-    "2026-01-28", "2026-03-18", "2026-05-06", "2026-06-17",
-    "2026-07-29", "2026-09-16", "2026-11-04", "2026-12-16",
-  ];
-  let fomc = "None scheduled";
-  let fomcSignal = "clear";
-  for (const fd of fomcDates) {
-    const diff = (new Date(fd).getTime() - today.getTime()) / (1000 * 60 * 60 * 24);
-    if (diff >= -1 && diff <= 0) { fomc = "TODAY"; fomcSignal = "event-risk"; break; }
-    if (diff > 0 && diff <= 1) { fomc = "TOMORROW"; fomcSignal = "event-risk"; break; }
-    if (diff > 1 && diff <= 7) { fomc = `In ${Math.ceil(diff)} days`; fomcSignal = "caution"; break; }
-  }
-  if (fomcSignal === "event-risk") macroScore = Math.max(0, macroScore - 20);
-
-  const fedStance = "Hold 4.25-4.50%"; // manually updated or could be derived
-
-  // ─── Execution Window ─────────────────────────────────────────────────
-  // Check if breakouts are working: SPX made new 5d high and held it
-  const spx5dHigh = spxCloses.length >= 5 ? Math.max(...spxCloses.slice(-5)) : spxPrice;
-  const breakoutsWorking = spxPrice >= spx5dHigh * 0.998;
-  const breakoutsSignal = breakoutsWorking ? "working" : "failing";
-
-  // Leaders holding: are top sectors maintaining gains?
-  const topSectors = sectorPerf.slice(0, 3);
-  const leadersHolding = topSectors.filter(s => s.change > 0).length >= 2;
-  const leadersSignal = leadersHolding ? "holding" : "fading";
-
-  // Pullbacks bought: check if SPX bounced from 20d MA
-  const pullbacksBought = spx20d && spxPrice > spx20d && Math.abs(spxVs20d) < 3;
-  const pullbacksSignal = pullbacksBought ? "support" : "failing";
-
-  // Follow through: volume trend approximation
-  const followThrough = trendScore > 60 && momentumScore > 50 ? "Strong" : trendScore > 40 ? "Weak" : "None";
-  const followThroughSignal = followThrough === "Strong" ? "conviction" : followThrough === "Weak" ? "low conviction" : "absent";
-
-  const execScore = Math.round(
-    (breakoutsWorking ? 25 : 0) +
-    (leadersHolding ? 25 : 0) +
-    (pullbacksBought ? 25 : 0) +
-    (followThrough === "Strong" ? 25 : followThrough === "Weak" ? 12 : 0)
-  );
-
-  // ─── Total score ──────────────────────────────────────────────────────
-  const volWeight = 0.20;
-  const trendWeight = 0.25;
-  const breadthWeight = 0.20;
-  const momWeight = 0.20;
-  const macroWeight = 0.15;
-
-  const totalScore = Math.round(
-    vixScore * volWeight +
-    trendScore * trendWeight +
-    breadthScore * breadthWeight +
-    momentumScore * momWeight +
-    macroScore * macroWeight
-  );
-
-  let shouldTrade = totalScore >= 60;
-  let decisionLabel = totalScore >= 60 ? "Trade" : totalScore >= 40 ? "Caution" : "Avoid Trading";
-
-  return {
-    ticker: tickerItems,
-    decision: { shouldTrade, score: totalScore, label: decisionLabel },
-    volatility: {
-      score: vixScore,
-      vixLevel: +vixLevel.toFixed(2),
-      vixTrend,
-      vixTrendSignal,
-      vixIvPercentile,
-      vixIvSignal,
-      putCallRatio,
-      putCallSignal,
-    },
-    trend: {
-      score: trendScore,
-      spxVs20d: { value: spxVs20d, signal: trendSignalFor(spxVs20d) },
-      spxVs50d: { value: spxVs50d, signal: trendSignalFor(spxVs50d) },
-      spxVs200d: { value: spxVs200d, signal: trendSignalFor(spxVs200d) },
-      qqqTrend,
-      regime,
-    },
-    breadth: {
-      score: breadthScore,
-      pctAbove50d,
-      pctAbove50dSignal,
-      pctAbove200d,
-      pctAbove200dSignal,
-      nyseAd,
-      nyseAdSignal,
-      newHighsLows,
-      newHighsLowsSignal,
-    },
-    momentum: {
-      score: momentumScore,
-      sectorsPositive,
-      sectorsTotal: 11,
-      sectorsSignal,
-      leader: { name: leader.name, change: leader.change },
-      laggard: { name: laggard.name, change: laggard.change },
-      participation,
-    },
-    macro: {
-      score: macroScore,
-      fomc,
-      fomcSignal,
-      tenYearYield: +tenYearYield.toFixed(2),
-      tenYearSignal,
-      dxy: +dxyPrice.toFixed(2),
-      dxySignal,
-      fedStance,
-      geopolitical: "Monitor global tensions",
-    },
-    executionWindow: {
-      score: execScore,
-      breakoutsWorking: { answer: breakoutsWorking ? "Yes" : "No", signal: breakoutsSignal },
-      leadersHolding: { answer: leadersHolding ? "Yes" : "No", signal: leadersSignal },
-      pullbacksBought: { answer: pullbacksBought ? "Yes" : "No", signal: pullbacksSignal },
-      followThrough: { answer: followThrough, signal: followThroughSignal },
-    },
-    sectors: sectorPerf,
-    scoringWeights: {
-      volatility: { weight: Math.round(vixScore * volWeight), label: `+${Math.round(vixScore * volWeight)}` },
-      momentum: { weight: Math.round(momentumScore * momWeight), label: `+${Math.round(momentumScore * momWeight)}` },
-      trend: { weight: Math.round(trendScore * trendWeight), label: `+${Math.round(trendScore * trendWeight)}` },
-      breadth: { weight: Math.round(breadthScore * breadthWeight), label: `+${Math.round(breadthScore * breadthWeight)}` },
-      macro: { weight: Math.round(macroScore * macroWeight), label: `+${Math.round(macroScore * macroWeight)}` },
-    },
-    updatedAt: new Date().toISOString(),
-  };
-}
-
-app.get("/api/terminal", async (_req, res) => {
-  if (terminalCache && Date.now() - terminalCache.ts < TERMINAL_TTL) {
-    return res.json(terminalCache.data);
-  }
-  try {
-    const data = await buildTerminalData();
-    terminalCache = { data, ts: Date.now() };
-    res.json(data);
-  } catch (err) {
-    console.error("[Terminal]", err);
-    res.status(500).json({ error: String(err) });
-  }
-});
-
-app.get("/api/terminal/analysis", async (_req, res) => {
-  if (terminalAnalysisCache && Date.now() - terminalAnalysisCache.ts < TERMINAL_ANALYSIS_TTL) {
-    return res.json({ text: terminalAnalysisCache.text, cached: true, generatedAt: new Date(terminalAnalysisCache.ts).toISOString() });
-  }
-  try {
-    // Get terminal data first
-    let data: any;
-    if (terminalCache && Date.now() - terminalCache.ts < TERMINAL_TTL) {
-      data = terminalCache.data;
-    } else {
-      data = await buildTerminalData();
-      terminalCache = { data, ts: Date.now() };
-    }
-
-    const prompt = `You are an elite trading floor strategist assessing market quality conditions. Today is ${new Date().toUTCString()}.
-
-Here is the current Market Quality Terminal data:
-- Overall Score: ${data.decision.score}/100 — Decision: ${data.decision.label}
-- VIX: ${data.volatility.vixLevel} (${data.volatility.vixTrend}), IV Percentile: ${data.volatility.vixIvPercentile}%
-- SPX vs 20d: ${data.trend.spxVs20d.value}%, vs 50d: ${data.trend.spxVs50d.value}%, vs 200d: ${data.trend.spxVs200d.value}%
-- Market Regime: ${data.trend.regime}
-- Breadth: ${data.breadth.pctAbove50d}% above 50d MA, ${data.breadth.pctAbove200d}% above 200d MA
-- Sector Momentum: ${data.momentum.sectorsPositive}/${data.momentum.sectorsTotal} positive, Leader: ${data.momentum.leader.name} (${data.momentum.leader.change}%), Laggard: ${data.momentum.laggard.name} (${data.momentum.laggard.change}%)
-- 10Y Yield: ${data.macro.tenYearYield}% (${data.macro.tenYearSignal}), DXY: ${data.macro.dxy} (${data.macro.dxySignal})
-- FOMC: ${data.macro.fomc}
-- Execution: Breakouts ${data.executionWindow.breakoutsWorking.answer}, Leaders ${data.executionWindow.leadersHolding.answer}, Pullbacks Bought ${data.executionWindow.pullbacksBought.answer}
-
-Sectors (5d change): ${data.sectors.map((s: any) => `${s.name}: ${s.change}%`).join(', ')}
-
-Write a 3-4 paragraph market quality assessment. Be direct and authoritative:
-1. Overall market quality verdict — should active traders be engaged or sitting out?
-2. Key factors driving this assessment — what specific conditions support or undermine trading?
-3. Tactical recommendations — what setups to look for, what to avoid, position sizing guidance.
-4. Key risk to monitor in the next 24-48 hours.
-
-Use plain text, no markdown headers. Be concise but thorough.`;
-
-    const anthropic = new (await import("@anthropic-ai/sdk")).default();
-    const msg = await anthropic.messages.create({
-      model: "claude-sonnet-4-6",
-      max_tokens: 800,
-      messages: [{ role: "user", content: prompt }],
-    });
-
-    const text = (msg.content[0] as any).text as string;
-    terminalAnalysisCache = { text, ts: Date.now() };
-    res.json({ text, cached: false, generatedAt: new Date().toISOString() });
-  } catch (err) {
-    console.error("[Terminal Analysis]", err);
-    res.status(500).json({ error: String(err) });
-  }
+// POST — ping a single service on demand
+app.post("/api/connections/ping/:provider", async (req, res) => {
+  const { provider } = req.params;
+  const def = CONNECTION_DEFS.find(d => d.id === provider);
+  if (!def) return res.status(400).json({ error: `Unknown: ${provider}` });
+  const ping = await pingService(provider);
+  res.json({ ...def, ...ping, rateLimits: ping.rateLimits || aiRateLimits[provider as keyof typeof aiRateLimits] || {}, checkedAt: new Date().toISOString() });
 });
 
 // ─── Vite / Static ─────────────────────────────────────────────────────────────
 
 async function startServer() {
+  installProcessHandlers();
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
     app.use(vite.middlewares);
@@ -2748,7 +2784,17 @@ async function startServer() {
     app.use(express.static(path.resolve("dist")));
     app.get("*", (req, res) => res.sendFile(path.resolve("dist/index.html")));
   }
-  app.listen(PORT, "0.0.0.0", () => console.log(`Server running on http://localhost:${PORT}`));
+  // Local mode has no auth, so refuse to listen on anything but loopback — otherwise
+  // anyone on the same network could post to X through this. LOCAL_MODE=false to open up.
+  if (LOCAL_MODE) {
+    // Bind BOTH loopback stacks: on macOS `localhost` resolves to ::1 first while
+    // `127.0.0.1` is IPv4, and binding only one makes the other host silently fail.
+    for (const host of ["127.0.0.1", "::1"]) {
+      app.listen(PORT, host, () => console.log(`Server running on http://${host === "::1" ? "localhost" : host}:${PORT} (loopback only, auth bypassed)`));
+    }
+  } else {
+    app.listen(PORT, "0.0.0.0", () => console.log(`Server running on http://localhost:${PORT}`));
+  }
 }
 
 startServer();
